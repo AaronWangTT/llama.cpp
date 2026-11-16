@@ -280,7 +280,17 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     });
                 }
             } else {
-                throw std::invalid_argument("Cannot determine type of 'item'");
+                // local patch: name the rejected item (type, role, key names) so that the
+                // request can be diagnosed from the log; validation itself is unchanged
+                std::string keys;
+                if (item.is_object()) {
+                    for (const auto & el : item.items()) {
+                        keys += (keys.empty() ? "" : ",") + el.key();
+                    }
+                }
+                throw std::invalid_argument("Cannot determine type of 'item' (type: '" +
+                    (exists_and_is_string(item, "type") ? item.at("type").get<std::string>() : std::string()) + "', role: '" +
+                    (exists_and_is_string(item, "role") ? item.at("role").get<std::string>() : std::string()) + "', keys: " + keys + ")");
             }
         }
     } else {
