@@ -255,13 +255,7 @@ void ggml_cuda_mul_mat_q(
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
 
-            // MoE: popular experts get far more tokens than the average, so a wider tile than the average needs pays off
-            // (gfx1103: Gemma 4 26B-A4B pp512 404 -> 608 t/s, Qwen3.6-35B-A3B 496 -> 531 t/s).
-            if (ncols_opt >= 16 && ncols_opt < 48) {
-                ncols_opt = 48;
-            }
-
-            // EXPERIMENT: override the column count the MoE tile width is chosen for
+            // Tuning aid: GGML_CUDA_MMQ_MOE_NCOLS overrides the column count the MoE tile width is chosen for (inert when unset).
             static const int moe_ncols_env = getenv("GGML_CUDA_MMQ_MOE_NCOLS") ? atoi(getenv("GGML_CUDA_MMQ_MOE_NCOLS")) : 0;
             if (moe_ncols_env > 0) {
                 ncols_opt = moe_ncols_env;
