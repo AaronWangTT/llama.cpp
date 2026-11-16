@@ -758,8 +758,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
+    // gfx1103: for head sizes <= 128 a half-filled 16-column WMMA tile already beats the tile kernel, e.g. single-token
+    // decode with a GQA ratio of 8 (gpt-oss-20b at 8192 tokens of context: 24.4 -> 26.2 t/s, unchanged at depth 0).
+    const int wmma_min_cols = Q->ne[0] <= 128 ? (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 ? 7 : 8) : 16;
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
-            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
+            Q->ne[1] * gqa_ratio_eff > wmma_min_cols) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
