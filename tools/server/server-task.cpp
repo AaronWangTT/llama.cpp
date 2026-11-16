@@ -1169,27 +1169,29 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     std::vector<json> events;
 
+    // local patch: strict Responses clients (e.g. the Vercel AI SDK) require
+    // created_at and model on response.created / response.in_progress
+    const json resp_in_progress = {
+        {"id",         oai_resp_id},
+        {"object",     "response"},
+        {"created_at", std::time(0)},
+        {"status",     "in_progress"},
+        {"model",      oaicompat_model},
+    };
+
     if (!oai_resp_created) {
         events.push_back(json {
             {"event", "response.created"},
             {"data", json {
                 {"type", "response.created"},
-                {"response", json {
-                    {"id",     oai_resp_id},
-                    {"object", "response"},
-                    {"status", "in_progress"},
-                }},
+                {"response", resp_in_progress},
             }},
         });
         events.push_back(json {
             {"event", "response.in_progress"},
             {"data", json {
                 {"type", "response.in_progress"},
-                {"response", json {
-                    {"id",     oai_resp_id},
-                    {"object", "response"},
-                    {"status", "in_progress"},
-                }},
+                {"response", resp_in_progress},
             }},
         });
     } else if (is_progress) {
@@ -1197,11 +1199,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             {"event", "response.in_progress"},
             {"data", json {
                 {"type", "response.in_progress"},
-                {"response", json {
-                    {"id",     oai_resp_id},
-                    {"object", "response"},
-                    {"status", "in_progress"},
-                }},
+                {"response", resp_in_progress},
             }},
         });
     }
