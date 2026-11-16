@@ -102,9 +102,10 @@ enum mmvq_parameter_table_id {
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
     return MMVQ_PARAMETERS_RDNA4;
-#elif defined(RDNA3_0)
+#elif defined(RDNA3_0) && !defined(__gfx1103__)
     return MMVQ_PARAMETERS_RDNA3_0;
-#elif defined(RDNA2) || defined(RDNA3_5) || defined(RDNA4_M)
+#elif defined(RDNA2) || defined(RDNA3_5) || defined(RDNA4_M) || defined(__gfx1103__)
+    // gfx1103 (780M-class APUs, <= 12 CUs, shared DDR5): the wide blocks of the RDNA3_0 table leave most lanes idle
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
@@ -121,10 +122,11 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
         return MMVQ_PARAMETERS_RDNA4;
     }
-    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+    const bool is_gfx1103 = cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103; // must match the __gfx1103__ check above
+    if (GGML_CUDA_CC_IS_RDNA3_0(cc) && !is_gfx1103) {
         return MMVQ_PARAMETERS_RDNA3_0;
     }
-    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || is_gfx1103) {
         return MMVQ_PARAMETERS_RDNA2;
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
