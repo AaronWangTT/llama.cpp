@@ -9136,11 +9136,13 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t nb;       // queries per slice
     const int64_t n_slices;
     const ggml_type type_KV;
+    const bool sinks;       // per-head attention sinks (gpt-oss)
+    const bool skew;        // slice s uses only kv >> s rows, so whole blocks lie past the end of its list
 
     std::vector<int32_t> rows;
 
     std::string vars() override {
-        return VARS_TO_STR8(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV);
+        return VARS_TO_STR10(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV, sinks, skew);
     }
 
     double max_nmse_err() override {
@@ -9148,8 +9150,10 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 
     test_flash_attn_ext_kv_rows(int64_t hs = 256, int64_t nh = 2, int64_t gqa = 8, int64_t n_cells = 2048, int64_t kv = 512,
-                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16)
-        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV) {}
+                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16,
+                                bool sinks = false, bool skew = false)
+        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV),
+          sinks(sinks), skew(skew) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_slices);
@@ -9171,6 +9175,11 @@ struct test_flash_attn_ext_kv_rows : public test_case {
         ggml_set_name(r, "r");
 
         ggml_tensor * out = ggml_flash_attn_ext_rows(ctx, q, k, v, m, r, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q->ne[2]);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
@@ -9188,7 +9197,8 @@ struct test_flash_attn_ext_kv_rows : public test_case {
                 order[i] = i;
             }
             std::shuffle(order.begin(), order.end(), gen);
-            const int64_t n_used = std::min<int64_t>(n_cells, kv - (s*37) % std::max<int64_t>(1, kv/2));
+            const int64_t n_used = skew ? std::min<int64_t>(n_cells, std::max<int64_t>(1, kv >> s)) :
+                std::min<int64_t>(n_cells, kv - (s*37) % std::max<int64_t>(1, kv/2));
             for (int64_t i = 0; i < n_used; ++i) {
                 rows[s*kv + i] = order[i];
             }
@@ -9215,6 +9225,9 @@ struct test_flash_attn_ext_kv_rows : public test_case {
                 std::vector<ggml_fp16_t> h(f.size());
                 ggml_fp32_to_fp16_row(f.data(), h.data(), f.size());
                 ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                // large sink values, so that a wrong sink treatment fails the test
+                init_tensor_uniform(t, -10.0f, 10.0f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -13038,7 +13051,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 3000, 768,  nb, n_slices, GGML_TYPE_Q8_0));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 4096, 1024, nb, n_slices));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
+            // gpt-oss: head size 64, 8 K/V heads, GQA 8, attention sinks
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 8, 8, 4096, 1024, nb, n_slices, GGML_TYPE_F16, true));
         }
+    }
+    // slices of very different lengths in one call, as with conversations of different size in a unified cache
+    for (int64_t nb : {1, 3}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(64, 8, 8, 32768, 8192, nb, 4, GGML_TYPE_F16, true, true));
     }
 
     // sparse mask with large batch size

@@ -682,8 +682,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // only the MMA kernel reads K/V through kv_rows
     if (kv_rows) {
-        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
-            BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        // AMD WMMA: the MMA kernel only has device code for ncols2 >= 2 (GQA optimization), >= 16 columns and DKQ <= 256,
+        // and for logit softcap only with DKQ 128/256 here; any other shape would run a trap stub (fattn-mma-f16.cuh).
+        if (amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256 && Q->ne[0] != 40 && Q->ne[0] != 72) {
+            float logit_softcap;
+            memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+            if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+        }
+        return BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
