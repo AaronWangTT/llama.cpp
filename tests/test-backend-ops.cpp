@@ -9235,6 +9235,37 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 };
 
+// Flat attention and constant V expose numerator overflow and loss of small additions.
+struct test_flash_attn_ext_kv_rows_constant : public test_flash_attn_ext_kv_rows {
+    const int64_t visible;
+    const float value;
+
+    test_flash_attn_ext_kv_rows_constant(int64_t nh, int64_t cells, int64_t visible, float value, int64_t slices, int64_t queries)
+        : test_flash_attn_ext_kv_rows(256, nh, 2, cells, cells, queries, slices), visible(visible), value(value) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_kv_rows::vars() + "," + VARS_TO_STR2(visible, value);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_kv_rows::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "q"), 0.0f, 0.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "k0"), 0.0f, 0.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "v0"), value, value);
+        for (int64_t s = 0; s < n_slices; ++s) {
+            for (int64_t i = 0; i < kv; ++i) {
+                rows[s*kv + i] = i;
+            }
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "r"), rows.data(), 0, rows.size()*sizeof(int32_t));
+        std::vector<ggml_fp16_t> mask(kv*nb*n_slices);
+        for (size_t i = 0; i < mask.size(); ++i) {
+            mask[i] = ggml_fp32_to_fp16(i % kv < (size_t) visible ? 0.0f : -INFINITY);
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "m"), mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13062,6 +13093,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 16384, 4096, nb, 4, GGML_TYPE_F16, false, true));
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 16384, 4096, nb, 4, GGML_TYPE_F16, false, true));
     }
+
+    // Gemma sliding-window kv_rows: small-query tile/MMA dispatch boundary and two slices.
+    for (int64_t nb : {1, 2, 4, 5, 7, 8, 9, 16}) {
+        for (int64_t n_slices : {1, 2, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4608, 1024, nb, n_slices, GGML_TYPE_F16, false, true));
+        }
+    }
+
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(1,   256,    32, 16384.0f,  1, 8));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(8, 32768, 32768,     1.0f, 12, 8));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));

@@ -688,6 +688,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (amd_wmma_available(cc) && gqa_opt_applies) {
             float logit_softcap;
             memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+            // gfx1103: use the tile kernel when GQA 2 leaves most of the WMMA columns idle.
+            if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+                    gqa_ratio == 2 && Q->ne[1] <= 8 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+                    logit_softcap == 0.0f) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
             // AMD WMMA: the MMA kernel only has device code for ncols2 >= 2 (GQA optimization), >= 16 columns and
             // DKQ <= 256, and for logit softcap only with DKQ 128/256 here; any other shape would run a trap stub.
             if (Q->ne[0] <= 256 && Q->ne[0] != 40 && Q->ne[0] != 72 &&

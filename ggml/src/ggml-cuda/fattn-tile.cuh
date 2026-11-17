@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#include <type_traits>
+
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
 
@@ -717,10 +719,18 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
 
 #ifdef FAST_FP16_AVAILABLE
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+            if constexpr (std::is_same_v<T_acc, half2>) {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                VKQ[jc*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ[jc*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                }
+            } else {
+#pragma unroll
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
+                    VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
+                }
             }
 #else
 #pragma unroll
@@ -786,7 +796,15 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    if constexpr (std::is_same_v<T_acc, half2>) {
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    } else {
+                        const float2 v = __half22float2(V_k[i0/warp_size]);
+                        const float kq = __low2float(KQ_k[jc_VKQ_0]);
+                        auto & acc = VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size];
+                        acc.x = fmaf(v.x, kq, acc.x);
+                        acc.y = fmaf(v.y, kq, acc.y);
+                    }
                 }
             }
         }
@@ -922,16 +940,20 @@ static __global__ void flash_attn_tile(
     // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
     // VKQ == Accumulators in registers for the final VKQ result.
 #ifdef FAST_FP16_AVAILABLE
+    // Row-list D256 numerators can overflow or lose small terms before normalization in half precision.
+    using T_acc = std::conditional_t<use_rows && DKQ == 256, float2, half2>;
+    constexpr size_t n_KV_tmp = nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV;
+    constexpr size_t n_VKQ_combine = np > 1 ? nwarps*(DVp/2)*sizeof(T_acc)/sizeof(half2) : 0;
     __shared__ half2 Q_tmp[ncols * DKQ/2];
-    __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
+    __shared__ __align__(16) half2 KV_tmp[n_KV_tmp > n_VKQ_combine ? n_KV_tmp : n_VKQ_combine];
     __shared__ half  KQ[ncols * nbatch_fa];
-    __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #else
+    using T_acc = float2;
     __shared__ float Q_tmp[ncols * DKQ];
     __shared__ float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
     __shared__ float KQ[ncols * nbatch_fa];
-    __align__(16) float2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #endif // FAST_FP16_AVAILABLE
+    __align__(16) T_acc VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 
     float KQ_max[cpw];
 #pragma unroll
@@ -1025,10 +1047,10 @@ static __global__ void flash_attn_tile(
 
     if constexpr (np > 1) {
         static_assert(cpw == 1, "bad cpw");
-        static_assert(nbatch_fa*nbatch_K >= nwarps*DVp, "KV_tmp too small");
+        static_assert(sizeof(KV_tmp) >= nwarps*(DVp/2)*sizeof(T_acc), "KV_tmp too small");
 
 #ifdef FAST_FP16_AVAILABLE
-        half2 * VKQ_combine    = (half2 *) KV_tmp;
+        T_acc * VKQ_combine    = (T_acc *) KV_tmp;
 #else
         float * VKQ_combine    = (float *) KV_tmp;
 #endif // FAST_FP16_AVAILABLE
@@ -1036,10 +1058,11 @@ static __global__ void flash_attn_tile(
 
         if (threadIdx.y % np != 0) {
 #ifdef FAST_FP16_AVAILABLE
-            constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
+            constexpr int cpy_ne_acc = cpy_nb / sizeof(T_acc);
+            constexpr int cpy_ne_D = cpy_ne_acc < (DVp/2)/warp_size ? cpy_ne_acc : (DVp/2)/warp_size;
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
-                ggml_cuda_memcpy_1<cpy_ne_D*4>(&VKQ_combine[threadIdx.y*(DVp/2) + i0 + threadIdx.x*cpy_ne_D], &VKQ[i0/warp_size]);
+                ggml_cuda_memcpy_1<cpy_ne_D*sizeof(T_acc)>(&VKQ_combine[threadIdx.y*(DVp/2) + i0 + threadIdx.x*cpy_ne_D], &VKQ[i0/warp_size]);
             }
 #else
             constexpr int cpy_ne_D = cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size;
@@ -1062,14 +1085,20 @@ static __global__ void flash_attn_tile(
 #pragma unroll
         for (int ip = 1; ip < np; ++ip) {
 #ifdef FAST_FP16_AVAILABLE
-            constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
+            constexpr int cpy_ne_acc = cpy_nb / sizeof(T_acc);
+            constexpr int cpy_ne_D = cpy_ne_acc < (DVp/2)/warp_size ? cpy_ne_acc : (DVp/2)/warp_size;
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
-                __align__(16) half2 tmp[cpy_ne_D];
-                ggml_cuda_memcpy_1<cpy_ne_D*4>(tmp, &VKQ_combine[(threadIdx.y + ip)*(DVp/2) + i0 + threadIdx.x*cpy_ne_D]);
+                __align__(16) T_acc tmp[cpy_ne_D];
+                ggml_cuda_memcpy_1<cpy_ne_D*sizeof(T_acc)>(tmp, &VKQ_combine[(threadIdx.y + ip)*(DVp/2) + i0 + threadIdx.x*cpy_ne_D]);
 #pragma unroll
                 for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
-                    VKQ[i0/warp_size + i1] += tmp[i1];
+                    if constexpr (std::is_same_v<T_acc, half2>) {
+                        VKQ[i0/warp_size + i1] += tmp[i1];
+                    } else {
+                        VKQ[i0/warp_size + i1].x += tmp[i1].x;
+                        VKQ[i0/warp_size + i1].y += tmp[i1].y;
+                    }
                 }
             }
 #else
@@ -1104,10 +1133,18 @@ static __global__ void flash_attn_tile(
             KQ_sum[jc0] = KQ_sum[jc0]*KQ_max_scale + val;
 
 #ifdef FAST_FP16_AVAILABLE
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+            if constexpr (std::is_same_v<T_acc, half2>) {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                }
+            } else {
+#pragma unroll
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
+                    VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
+                }
             }
 #else
 #pragma unroll
@@ -1142,7 +1179,11 @@ static __global__ void flash_attn_tile(
             __align__(16) float2 tmp[cpy_ne_D];
 #pragma unroll
             for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
-                tmp[i1] = __half22float2(VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size + i1]);
+                if constexpr (std::is_same_v<T_acc, half2>) {
+                    tmp[i1] = __half22float2(VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size + i1]);
+                } else {
+                    tmp[i1] = VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size + i1];
+                }
                 tmp[i1].x *= scale;
                 tmp[i1].y *= scale;
             }
@@ -1186,15 +1227,19 @@ static __global__ void flash_attn_tile(
 }
 
 // kv_rows (ggml_flash_attn_ext_rows): separate kernel variant that reads K/V through per-sequence row lists, compiled
-// only for head size 512, where the AMD WMMA MMA kernel has no device code.
+// for head sizes 256 and 512; dense variants do not include the row gather.
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
 static fattn_kernel_t ggml_cuda_fattn_tile_get_kernel(const ggml_tensor * dst) {
-    if constexpr (DKQ == 512 && DV == 512) {
+    if constexpr ((DKQ == 512 && DV == 512)
+#ifdef GGML_USE_HIP
+            || (DKQ == 256 && DV == 256 && ncols2 == 2 && ncols1 <= 8 && !use_logit_softcap)
+#endif
+    ) {
         if (dst->src[5]) {
             return flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
         }
     } else {
-        GGML_ASSERT(!dst->src[5] && "flash-attn tile: kv_rows only supported for head size 512");
+        GGML_ASSERT(!dst->src[5] && "flash-attn tile: unsupported kv_rows configuration");
     }
     return flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap>;
 }
