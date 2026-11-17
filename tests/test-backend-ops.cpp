@@ -13058,6 +13058,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // slices of very different lengths in one call, as with conversations of different size in a unified cache
     for (int64_t nb : {1, 3}) {
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows(64, 8, 8, 32768, 8192, nb, 4, GGML_TYPE_F16, true, true));
+        // Gemma 4: global layers (head size 512, GQA 8) and sliding-window layers (head size 256, GQA 2)
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 16384, 4096, nb, 4, GGML_TYPE_F16, false, true));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 16384, 4096, nb, 4, GGML_TYPE_F16, false, true));
     }
 
     // sparse mask with large batch size
