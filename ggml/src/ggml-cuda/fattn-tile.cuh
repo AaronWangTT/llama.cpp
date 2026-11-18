@@ -940,8 +940,8 @@ static __global__ void flash_attn_tile(
     // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
     // VKQ == Accumulators in registers for the final VKQ result.
 #ifdef FAST_FP16_AVAILABLE
-    // Row-list D256 numerators can overflow or lose small terms before normalization in half precision.
-    using T_acc = std::conditional_t<use_rows && DKQ == 256, float2, half2>;
+    // Row-list numerators can overflow or lose small terms before normalization in half precision.
+    using T_acc = std::conditional_t<use_rows, float2, half2>;
     constexpr size_t n_KV_tmp = nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV;
     constexpr size_t n_VKQ_combine = np > 1 ? nwarps*(DVp/2)*sizeof(T_acc)/sizeof(half2) : 0;
     __shared__ half2 Q_tmp[ncols * DKQ/2];

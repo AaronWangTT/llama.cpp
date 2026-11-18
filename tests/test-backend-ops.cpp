@@ -9301,8 +9301,8 @@ struct test_flash_attn_ext_kv_rows_constant : public test_flash_attn_ext_kv_rows
     const int64_t visible;
     const float value;
 
-    test_flash_attn_ext_kv_rows_constant(int64_t nh, int64_t cells, int64_t visible, float value, int64_t slices, int64_t queries)
-        : test_flash_attn_ext_kv_rows(256, nh, 2, cells, cells, queries, slices), visible(visible), value(value) {}
+    test_flash_attn_ext_kv_rows_constant(int64_t hs, int64_t nh, int64_t cells, int64_t visible, float value, int64_t slices, int64_t queries)
+        : test_flash_attn_ext_kv_rows(hs, nh, 2, cells, cells, queries, slices), visible(visible), value(value) {}
 
     std::string vars() override {
         return test_flash_attn_ext_kv_rows::vars() + "," + VARS_TO_STR2(visible, value);
@@ -13165,8 +13165,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(512, 32, 4, 32, 2));
 
-    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(1,   256,    32, 16384.0f,  1, 8));
-    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(8, 32768, 32768,     1.0f, 12, 8));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(256, 1,   256,    32, 16384.0f,  1, 8));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(256, 8, 32768, 32768,     1.0f, 12, 8));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(512, 1,   256,    32, 16384.0f,  1, 4));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
