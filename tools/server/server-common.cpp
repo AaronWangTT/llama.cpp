@@ -1579,7 +1579,24 @@ json oaicompat_chat_params_parse(
     // Apply chat template to the list of messages
     common_chat_session_params session_params;
     session_params.echo = json_value(body, "echo", false);
-    out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+    try {
+        out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+    } catch (const std::exception & e) {
+        // Some templates accept interleaved instructions. Only classify an actual template rejection.
+        if (string_ends_with(e.what(), "\nError: Jinja Exception: System message must be at the beginning.")) {
+            bool seen_turn = false;
+            for (const auto & msg : inputs.messages) {
+                if (msg.role == "system" || msg.role == "developer") {
+                    if (seen_turn) {
+                        throw std::invalid_argument("Unexpected role \"" + msg.role + "\" as an input message role after the initial instructions. This chat template requires system and developer messages at the beginning.");
+                    }
+                } else {
+                    seen_turn = true;
+                }
+            }
+        }
+        throw;
+    }
 
     llama_params["prompt"] = out_session.prompt().str();
 

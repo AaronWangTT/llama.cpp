@@ -90,6 +90,29 @@ def test_anthropic_messages_with_system():
     assert len(res.body["content"]) > 0
 
 
+@pytest.mark.parametrize("template", ["qwen", "chatml"])
+def test_anthropic_interleaved_instruction(template):
+    from pathlib import Path
+    if template == "qwen":
+        server.chat_template_file = str(Path(__file__).resolve().parents[4] / "models/templates/Qwen3.5-4B.jinja")
+    else:
+        server.chat_template = "chatml"
+    server.start()
+    user = {"role": "user", "content": "Hello"}
+    for path in ("/v1/messages", "/v1/messages/count_tokens"):
+        for role in ("system", "developer"):
+            instruction = {"role": role, "content": "Be brief"}
+            for messages in ([instruction, user], [user, instruction]):
+                res = server.make_request("POST", path, data={"model": "test", "max_tokens": 1, "messages": messages})
+                if template == "qwen" and messages[0] == user:
+                    assert res.status_code == 400
+                    assert res.body["error"]["type"] == "invalid_request_error"
+                    assert f'Unexpected role "{role}"' in res.body["error"]["message"]
+                    assert 'input message role' in res.body["error"]["message"]
+                else:
+                    assert res.status_code == 200
+
+
 def test_anthropic_messages_multipart_content():
     """Test messages with multipart content blocks"""
     server.start()
