@@ -9155,6 +9155,10 @@ struct test_flash_attn_ext_kv_rows : public test_case {
         : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV),
           sinks(sinks), skew(skew) {}
 
+    virtual ggml_tensor * build_mask(ggml_context * ctx) {
+        return ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, n_slices);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_slices);
         ggml_set_name(q, "q");
@@ -9168,7 +9172,7 @@ struct test_flash_attn_ext_kv_rows : public test_case {
         ggml_tensor * k = ggml_permute(ctx, k0, 0, 2, 1, 3);
         ggml_tensor * v = ggml_permute(ctx, v0, 0, 2, 1, 3);
 
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, n_slices);
+        ggml_tensor * m = build_mask(ctx);
         ggml_set_name(m, "m");
 
         ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, n_slices);
@@ -9228,6 +9232,63 @@ struct test_flash_attn_ext_kv_rows : public test_case {
             } else if (strcmp(t->name, "s") == 0) {
                 // large sink values, so that a wrong sink treatment fails the test
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Each slice has a disjoint row list, even when two slices use the same mask.
+struct test_flash_attn_ext_kv_rows_mask : public test_flash_attn_ext_kv_rows {
+    const int64_t mask_queries;
+    const int64_t mask_slices;
+
+    test_flash_attn_ext_kv_rows_mask(int64_t hs, int64_t queries, int64_t slices, int64_t mask_queries, int64_t mask_slices)
+        : test_flash_attn_ext_kv_rows(hs, 1, 2, 512*slices, 512, queries, slices),
+          mask_queries(mask_queries), mask_slices(mask_slices) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_kv_rows::vars() + "," + VARS_TO_STR2(mask_queries, mask_slices);
+    }
+
+    ggml_tensor * build_mask(ggml_context * ctx) override {
+        ggml_tensor * m0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, mask_queries, 1, n_slices);
+        ggml_set_name(m0, "m0");
+        return ggml_view_4d(ctx, m0, kv, mask_queries, 1, mask_slices, m0->nb[1], m0->nb[2], m0->nb[3], 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k0") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else if (strcmp(t->name, "r") == 0) {
+                rows.resize(kv*n_slices);
+                for (int64_t i = 0; i < kv*n_slices; ++i) {
+                    rows[i] = i;
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "v0") == 0) {
+                std::vector<ggml_fp16_t> v(ggml_nelements(t));
+                for (int64_t i = 0; i < n_cells; ++i) {
+                    std::fill_n(v.data() + i*hs, hs, ggml_fp32_to_fp16(1 + i/(kv/2)));
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m0") == 0) {
+                std::vector<ggml_fp16_t> mask(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                for (int64_t s = 0; s < n_slices; ++s) {
+                    for (int64_t j = 0; j < mask_queries; ++j) {
+                        auto * row = mask.data() + (s*mask_queries + j)*kv;
+                        row[0] = ggml_fp32_to_fp16(0.0f);
+                        if (s == 0 && (mask_slices < n_slices || j == nb - 1)) {
+                            row[kv - 1] = ggml_fp32_to_fp16(0.0f);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, mask.data(), 0, ggml_nbytes(t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -13100,6 +13161,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4608, 1024, nb, n_slices, GGML_TYPE_F16, false, true));
         }
     }
+
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(512, 32, 4, 32, 2));
 
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(1,   256,    32, 16384.0f,  1, 8));
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_constant(8, 32768, 32768,     1.0f, 12, 8));
