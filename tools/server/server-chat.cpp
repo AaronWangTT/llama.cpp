@@ -259,24 +259,45 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 item.at("type") == "reasoning") {
                 // #responses_create-input-input_item_list-item-reasoning
 
-                if (!exists_and_is_array(item, "content")) {
+                const json * content = item.contains("content") ? &item.at("content") : nullptr;
+                if (!content || content->is_null() || (content->is_array() && content->empty())) {
+                    // A replayed reasoning item may contain only an ID and empty metadata.
+                    if (!item.at("summary").empty()) {
+                        throw std::invalid_argument("Cannot replay a reasoning summary without reasoning text");
+                    }
+                    if (!exists_and_is_string(item, "id") || item.at("id") == "") {
+                        throw std::invalid_argument("A reasoning item without content requires a nonempty id");
+                    }
+                    for (const auto & [key, value] : item.items()) {
+                        if (key == "encrypted_content") {
+                            if (!value.is_null() && value != "") {
+                                throw std::invalid_argument("Cannot replay encrypted reasoning without reasoning text");
+                            }
+                        } else if (key == "status") {
+                            if (!value.is_null() && value != "completed" && value != "in_progress" && value != "incomplete") {
+                                throw std::invalid_argument("Invalid status on a reasoning item without content");
+                            }
+                        } else if (key != "type" && key != "id" && key != "summary" && key != "content") {
+                            throw std::invalid_argument("Unsupported field on a reasoning item without content");
+                        }
+                    }
+                    continue;
+                }
+                if (!content->is_array()) {
                     throw std::invalid_argument("item['content'] is not an array");
                 }
-                if (item.at("content").empty()) {
-                    throw std::invalid_argument("item['content'] is empty");
-                }
-                if (!exists_and_is_string(item.at("content")[0], "text")) {
+                const auto & part = content->front();
+                if (!exists_and_is_string(part, "text")) {
                     throw std::invalid_argument("item['content']['text'] is not a string");
                 }
 
                 if (merge_prev) {
-                    auto & prev_msg = chatcmpl_messages.back();
-                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                    chatcmpl_messages.back()["reasoning_content"] = part.at("text");
                 } else {
                     chatcmpl_messages.push_back(json {
                         {"role", "assistant"},
                         {"content", json::array()},
-                        {"reasoning_content", item.at("content")[0].at("text")},
+                        {"reasoning_content", part.at("text")},
                     });
                 }
             } else {

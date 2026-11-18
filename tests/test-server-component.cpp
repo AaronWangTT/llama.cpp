@@ -251,6 +251,85 @@ static void test_responses_created_at(testing & t) {
     t.assert_equal("non-streaming created_at", created_at, result.to_json().at("created_at").get<std::time_t>());
 }
 
+static void test_responses_reasoning_history(testing & t) {
+    const json history = json::parse(R"([
+        {"role": "user", "content": "Check stock."},
+        {"type": "message", "id": "msg_stock", "role": "assistant", "content": [{"type": "output_text", "text": "Checking."}]},
+        {"type": "function_call", "name": "inventory", "arguments": "{}", "call_id": "call_stock"},
+        {"type": "function_call_output", "call_id": "call_stock", "output": "Two."},
+        {"role": "user", "content": "Reserve one."}
+    ])");
+    const json placeholder = {{"type", "reasoning"}, {"id", "rs_empty"}, {"summary", json::array()}};
+    json plaintext = placeholder;
+    plaintext["id"] = "rs_text";
+    plaintext["content"] = json::array({json{{"type", "reasoning_text"}, {"text", "Use inventory."}}});
+
+    const json content_fields[]   = {json::object(), {{"content", nullptr}}, {{"content", json::array()}}};
+    const json encrypted_fields[] = {json::object(), {{"encrypted_content", nullptr}}, {{"encrypted_content", ""}}};
+    const json invalid_fields[] = {
+        {{"summary", json::array({json{{"type", "summary_text"}, {"text", "Stock note."}}})}},
+        {{"encrypted_content", "opaque"}, {"content", json::array()}},
+        {{"extra", "saved text"}},
+        {{"content", json::object()}},
+        {{"content", json::array({json{{"type", "reasoning_text"}}})}},
+        {{"id", ""}},
+        {{"status", "unknown"}},
+    };
+
+    for (const std::string model : {"gpt-oss-20b", "gemma-4-26b-a4b"}) {
+        const auto messages = [&](const json & input) {
+            return server_chat_convert_responses_to_chatcmpl({{"model", model}, {"input", input}}).at("messages");
+        };
+        const auto replay = [&](const json & items, size_t position = 2) {
+            json input = json::array();
+            for (size_t i = 0; i < history.size(); ++i) {
+                if (i == position) {
+                    input.insert(items);
+                }
+                input.push_back(history.at(i));
+            }
+            return messages(input);
+        };
+        const auto set_fields = [](json & item, const json & fields) {
+            for (const auto & [key, value] : fields.items()) {
+                item[key] = value;
+            }
+        };
+        const json expected = messages(history);
+        t.assert_true(model + " assistant ID", expected.at(1).at("id") == "msg_stock");
+        t.assert_true(model + " call ID", expected.at(1).at("tool_calls").at(0).at("id") == "call_stock");
+        t.assert_true(model + " tool result ID", expected.at(2).at("tool_call_id") == "call_stock");
+        for (const json & content : content_fields) {
+            for (const json & encrypted : encrypted_fields) {
+                json item = placeholder;
+                set_fields(item, content);
+                set_fields(item, encrypted);
+                t.assert_true(model + " ignores " + item.dump(), replay(json::array({item})) == expected);
+            }
+        }
+
+        const json with_plaintext = replay(json::array({plaintext}));
+        t.assert_true(model + " parses plaintext", with_plaintext.at(1).at("reasoning_content") == "Use inventory.");
+        t.assert_true(model + " preserves plaintext", replay(json::array({plaintext, placeholder})) == with_plaintext);
+
+        json leading = placeholder;
+        leading["status"] = "completed";
+        t.assert_true(model + " no leading assistant", replay(json::array({leading}), 0) == expected);
+
+        for (const json & fields : invalid_fields) {
+            json item = placeholder;
+            set_fields(item, fields);
+            bool rejected = false;
+            try {
+                replay(json::array({item}));
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            t.assert_true(model + " rejects " + item.dump(), rejected);
+        }
+    }
+}
+
 static void test_json_helpers(testing & t) {
     t.test("json_is_array_of_numbers", [](testing & t) {
         t.assert_true("ints",         json_is_array_of_numbers(json::array({1, 2, 3})));
@@ -788,6 +867,7 @@ int main(int argc, char ** argv) {
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);
     t.test("responses_created_at", test_responses_created_at);
+    t.test("responses_reasoning_history", test_responses_reasoning_history);
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);
