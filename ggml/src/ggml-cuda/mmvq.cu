@@ -635,16 +635,26 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    constexpr int nwarps_max = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps_max);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(__gfx11_generic__)
+    // The same image serves RDNA3.0 GPUs and APUs such as gfx1103 with narrower blocks.
+    constexpr int nwarps_apu = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_RDNA2, small_k, halve_iters);
+    static_assert(nwarps_apu <= nwarps_max);
+    static_assert(rows_per_cuda_block == calc_rows_per_block(type, ncols_dst, MMVQ_PARAMETERS_RDNA2, small_k, nwarps_apu));
+    const int nwarps = nwarps_apu == nwarps_max ? nwarps_max : (int) blockDim.y;
+#else
+    constexpr int nwarps = nwarps_max;
+#endif
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+    const     int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
@@ -782,8 +792,9 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    constexpr int nwarps_shared = nwarps_max > 1 ? nwarps_max-1 : 1;
+    __shared__ float tmp_shared[nwarps_shared][ncols_dst][rows_per_cuda_block][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[has_fusion ? nwarps_shared : 1][ncols_dst][rows_per_cuda_block][warp_size];
 
     if (threadIdx.y > 0) {
 #pragma unroll
@@ -812,7 +823,7 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
+            for (int l = 0; l < nwarps_max-1 && l < nwarps-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
                 if constexpr (has_fusion) {
                     if (use_gate) {
