@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <ctime>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -146,14 +147,15 @@ struct task_result_state {
     bool thinking_block_started = false;
     bool text_block_started = false;
 
-    // for OpenAI Responses streaming API
+    // for OpenAI Responses API
     bool oai_resp_created = false;
     const std::string oai_resp_id;
+    const std::time_t oai_resp_created_at;
     const std::string oai_resp_reasoning_id;
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
-    task_result_state(common_chat_session session = {});
+    task_result_state(common_chat_session session = {}, std::time_t created_at = std::time(nullptr));
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -441,6 +443,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     // for OpenAI Responses API
     std::string oai_resp_id;
+    std::time_t oai_resp_created_at = 0;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
 
@@ -455,6 +458,7 @@ struct server_task_result_cmpl_final : server_task_result {
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
 
         oai_resp_id = state.oai_resp_id;
+        oai_resp_created_at = state.oai_resp_created_at;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
         oai_resp_message_id = state.oai_resp_message_id;
     }
@@ -512,6 +516,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     // for OpenAI Responses API
     bool oai_resp_created = false;
     std::string oai_resp_id;
+    std::time_t oai_resp_created_at = 0;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
     std::string oai_resp_fc_id;

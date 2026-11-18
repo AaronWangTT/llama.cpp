@@ -148,10 +148,11 @@ json task_params::to_json(bool only_metrics) const {
 //
 // task_result_state
 //
-task_result_state::task_result_state(common_chat_session session)
+task_result_state::task_result_state(common_chat_session session, std::time_t created_at)
     : chat_session(std::move(session))
     , chat_msg(chat_session.msg())
     , oai_resp_id("resp_" + random_string())
+    , oai_resp_created_at(created_at)
     , oai_resp_reasoning_id("rs_" + random_string())
     , oai_resp_message_id("msg_" + random_string()) {
 }
@@ -568,10 +569,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         });
     }
 
-    std::time_t t = std::time(0);
     json res = {
-        {"completed_at", t},
-        {"created_at",   t},
+        {"completed_at", std::time(nullptr)},
+        {"created_at",   oai_resp_created_at},
         {"id",           oai_resp_id},
         {"model",        oaicompat_model},
         {"object",       "response"},
@@ -687,7 +687,6 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         output.push_back(output_item);
     }
 
-    std::time_t t = std::time(0);
     server_sent_events.push_back(json {
         {"event", "response.completed"},
         {"data", json {
@@ -695,7 +694,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"response", json {
                 {"id",         oai_resp_id},
                 {"object",     "response"},
-                {"created_at", t},
+                {"created_at", oai_resp_created_at},
                 {"status",     "completed"},
                 {"model",      oaicompat_model},
                 {"output",     output},
@@ -1001,6 +1000,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
 
     oai_resp_created       = state.oai_resp_created;
     oai_resp_id            = state.oai_resp_id;
+    oai_resp_created_at    = state.oai_resp_created_at;
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
     oai_resp_fc_id         = state.oai_resp_fc_id;
@@ -1171,30 +1171,23 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
 
     // local patch: strict Responses clients (e.g. the Vercel AI SDK) require
     // created_at and model on response.created / response.in_progress
-    const json resp_in_progress = {
-        {"id",         oai_resp_id},
-        {"object",     "response"},
-        {"created_at", std::time(0)},
-        {"status",     "in_progress"},
-        {"model",      oaicompat_model},
-    };
-
-    if (!oai_resp_created) {
-        events.push_back(json {
-            {"event", "response.created"},
-            {"data", json {
-                {"type", "response.created"},
-                {"response", resp_in_progress},
-            }},
-        });
-        events.push_back(json {
-            {"event", "response.in_progress"},
-            {"data", json {
-                {"type", "response.in_progress"},
-                {"response", resp_in_progress},
-            }},
-        });
-    } else if (is_progress) {
+    if (!oai_resp_created || is_progress) {
+        const json resp_in_progress = {
+            {"id",         oai_resp_id},
+            {"object",     "response"},
+            {"created_at", oai_resp_created_at},
+            {"status",     "in_progress"},
+            {"model",      oaicompat_model},
+        };
+        if (!oai_resp_created) {
+            events.push_back(json {
+                {"event", "response.created"},
+                {"data", json {
+                    {"type", "response.created"},
+                    {"response", resp_in_progress},
+                }},
+            });
+        }
         events.push_back(json {
             {"event", "response.in_progress"},
             {"data", json {

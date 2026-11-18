@@ -4,6 +4,7 @@
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
 #include "../tools/server/server-schema.h"
+#include "../tools/server/server-task.h"
 
 #include <algorithm>
 #include <cmath>
@@ -217,6 +218,37 @@ static void test_sse(testing & t) {
         t.assert_equal("with event", std::string("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"), format_anthropic_sse(ev));
         t.assert_equal("data only",  std::string("data: {\"type\":\"ping\"}\n\n"), format_anthropic_sse(json{{"type", "ping"}}));
     });
+}
+
+static void test_responses_created_at(testing & t) {
+    constexpr std::time_t created_at = 123456789;
+    task_result_state state({}, created_at);
+
+    const auto progress = [&]() {
+        server_task_result_cmpl_partial result{};
+        result.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+        result.is_progress = true;
+        result.update(state);
+        return result.to_json();
+    };
+    const auto check_event = [&](const std::string & type, const json & event) {
+        t.assert_equal("event", type, event.at("event").get<std::string>());
+        const auto & response = event.at("data").at("response");
+        t.assert_equal(type + " id", state.oai_resp_id, response.at("id").get<std::string>());
+        t.assert_equal(type + " created_at", created_at, response.at("created_at").get<std::time_t>());
+    };
+    const json first = progress();
+    check_event("response.created", first.at(0));
+    check_event("response.in_progress", first.at(1));
+    check_event("response.in_progress", progress().at(0));
+
+    server_task_result_cmpl_final result{};
+    result.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    result.update(state);
+    result.stream = true;
+    check_event("response.completed", result.to_json().back());
+    result.stream = false;
+    t.assert_equal("non-streaming created_at", created_at, result.to_json().at("created_at").get<std::time_t>());
 }
 
 static void test_json_helpers(testing & t) {
@@ -755,6 +787,7 @@ int main(int argc, char ** argv) {
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);
+    t.test("responses_created_at", test_responses_created_at);
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);
