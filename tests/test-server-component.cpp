@@ -3,6 +3,7 @@
 #include "../tools/server/server-chat.h"
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../tools/server/server-queue.h"
 #include "../tools/server/server-schema.h"
 #include "../tools/server/server-task.h"
 
@@ -851,6 +852,53 @@ static void test_pcm_f32_to_s16(testing & t) {
     t.assert_true ("empty",          pcm_f32_to_s16(nullptr, 0).empty());
 }
 
+static void test_queue_cancel_order(testing & t) {
+    auto dispatch_order = [](const std::vector<int> & posted) {
+        server_queue q;
+        std::vector<int> handled;
+        std::mutex mutex;
+        std::condition_variable cv;
+        int declined = -1;
+        constexpr int cancel = 30;
+        q.on_new_task([&](server_task && task, bool yielding) {
+            if (yielding) {
+                std::lock_guard<std::mutex> lock(mutex);
+                declined = task.id;
+                cv.notify_one();
+                return false;
+            }
+            handled.push_back(task.id);
+            if (handled.size() == posted.size()) {
+                q.terminate();
+            }
+            return true;
+        });
+        q.on_update_slots([&] {
+            q.yield_to_queue([&] {
+                for (int id : posted) {
+                    server_task task(id == cancel ? SERVER_TASK_TYPE_CANCEL : SERVER_TASK_TYPE_COMPLETION);
+                    task.id = id;
+                    task.id_target = id == cancel ? 10 : -1;
+                    q.post(std::move(task), id == cancel);
+                    // Make arrival order deterministic even when cancel is posted to the front.
+                    std::unique_lock<std::mutex> lock(mutex);
+                    if (!cv.wait_for(lock, std::chrono::seconds(5), [&] { return declined == id; })) {
+                        q.terminate();
+                        return;
+                    }
+                }
+            });
+        });
+        q.start_loop();
+        return handled;
+    };
+    const std::vector<int> cancel_first = {30, 21, 22};
+    const std::vector<int> no_cancel = {21, 22};
+    t.assert_true("retry before cancel", dispatch_order({21, 22, 30}) == cancel_first);
+    t.assert_true("cancel before retry", dispatch_order(cancel_first) == cancel_first);
+    t.assert_true("normal FIFO", dispatch_order(no_cancel) == no_cancel);
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -863,6 +911,7 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
+    t.test("queue_cancel_order", test_queue_cancel_order);
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);

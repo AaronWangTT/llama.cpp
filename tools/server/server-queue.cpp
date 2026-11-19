@@ -255,10 +255,16 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
             return !worker.busy;
         });
 
-        // put the declined tasks back, keeping their order
-        while (!queue_tasks_unhandled.empty()) {
-            queue_tasks.push_front(std::move(queue_tasks_unhandled.back()));
-            queue_tasks_unhandled.pop_back();
+        if (!queue_tasks_unhandled.empty()) {
+            // Restore declined requests, then honor pending cancellations before assigning slots.
+            while (!queue_tasks_unhandled.empty()) {
+                queue_tasks.push_front(std::move(queue_tasks_unhandled.back()));
+                queue_tasks_unhandled.pop_back();
+            }
+            const auto is_cancel = [](const server_task & task) { return task.type == SERVER_TASK_TYPE_CANCEL; };
+            if (!std::is_partitioned(queue_tasks.begin(), queue_tasks.end(), is_cancel)) {
+                std::stable_partition(queue_tasks.begin(), queue_tasks.end(), is_cancel);
+            }
         }
 
         // make sure to avoid idle timeout here
