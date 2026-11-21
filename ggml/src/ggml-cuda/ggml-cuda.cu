@@ -3240,13 +3240,40 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
+#ifdef GGML_USE_HIP
+static int inkling_situ_dispatch(ggml_backend_cuda_context &, ggml_cgraph *, int, bool);
+#endif
+
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (cgraph->uid != 0 &&
+#ifdef GGML_USE_HIP
+    // Parent graph uses are shared by split views, but are not in a tensor's properties.
+    // A replay must still write newly observed intermediates; the reverse transition may fuse again.
+    static const bool situ = [] { const char * p = getenv("GGML_INKLING_SITU"); return p && strcmp(p,"1") == 0; }();
+    if (situ) {
+        auto & sites = graph->inkling_situ_sites;
+        if (cgraph->uid && cgraph->uid == graph->uid && (int)graph->node_props.size() == cgraph->n_nodes) {
+            for (auto & site : sites) {
+                const int current = inkling_situ_dispatch(*cuda_ctx, cgraph, site.first, false);
+                if (site.second != current) { res = true; site.second = current; }
+            }
+        } else {
+            std::vector<std::pair<int,int>> next;
+            for (int i=0; i<cgraph->n_nodes; ++i) {
+                const auto * op=cgraph->nodes[i]; const auto * g=op->src[0];
+                if (op->op == GGML_OP_SCALE && g && g->op == GGML_OP_VIEW && g->ne[0] == 1152 && g->ne[1] == 8) {
+                    next.emplace_back(i, inkling_situ_dispatch(*cuda_ctx,cgraph,i,false));
+                }
+            }
+            if (next != sites) { res = true; sites.swap(next); }
+        }
+    }
+#endif
+    if (!res && cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         if (ggml_cuda_graph_debug_enabled()) {
             GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -4338,6 +4365,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 #include "inkling-gather-hip.cuh"
 #include "inkling-maskepi-hip.cuh"
 #include "inkling-rowclip-hip.cuh"
+#include "inkling-situ-hip.cuh"
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4349,6 +4377,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 #ifdef GGML_USE_HIP
+    if (node->op == GGML_OP_SCALE) {
+        const int skip = inkling_situ_dispatch(*cuda_ctx, cgraph, i, true);
+        if (skip) { return skip; }
+    }
     if (node->op == GGML_OP_SQR && inkling_clip_dispatch(*cuda_ctx, cgraph, i)) { return 7; }
     if (cuda_ctx->stream_context().concurrent_events.empty() && inkling_maskepi_match(cgraph,i)) {
         const auto * tab=node->src[0]; const auto * ids=node->src[1];
