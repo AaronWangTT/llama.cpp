@@ -4337,6 +4337,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 #ifdef GGML_USE_HIP
 #include "inkling-gather-hip.cuh"
 #include "inkling-maskepi-hip.cuh"
+#include "inkling-rowclip-hip.cuh"
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4348,6 +4349,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 #ifdef GGML_USE_HIP
+    if (node->op == GGML_OP_SQR && inkling_clip_dispatch(*cuda_ctx, cgraph, i)) { return 7; }
     if (cuda_ctx->stream_context().concurrent_events.empty() && inkling_maskepi_match(cgraph,i)) {
         const auto * tab=node->src[0]; const auto * ids=node->src[1];
         const auto * mask=cgraph->nodes[i+4]->src[0]; auto * out=cgraph->nodes[i+6];
