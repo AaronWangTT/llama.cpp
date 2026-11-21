@@ -842,7 +842,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool use_rows = false> // D == head size
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool use_rows = false, bool skip_empty_prefix = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
@@ -1017,6 +1017,35 @@ static __global__ void flash_attn_tile(
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
+#ifdef GGML_USE_HIP
+        if constexpr (skip_empty_prefix) {
+            static_assert(DKQ == 128 && DV == 128 && ncols1 == 64 && ncols2 == 1 && !use_rows && !use_logit_softcap);
+            // The host limits this specialization to gfx1103, full query tiles and aligned half pairs.
+            // Keep a partial last K tile on the ordinary bounds-checked path. Never infer
+            // emptiness from position, ring order, layer identity or one query/head's mask.
+            // Skip only leading tiles of this split: no existing FP16 numerator is touched
+            // (even a signed zero or subnormal). A sink is still handled by the original epilogue.
+            const int lane = threadIdx.y*warp_size + threadIdx.x;
+            const half * m = maskh + int64_t(col_Q_0)*stride_mask;
+            while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
+                // One witness can disprove emptiness, never prove it. Uniform across the CTA.
+                if (reinterpret_cast<const uint16_t *>(m)[k_VKQ_0] != 0xfc00u) { break; }
+                uint32_t diff = 0;
+                // Cooperatively compare every pair in every row, using the head/sequence address above.
+#pragma unroll
+                for (int off = 0; off < ncols1*(nbatch_fa/2); off += nwarps*warp_size) {
+                    const int i = off + lane;
+                    if (i < ncols1*(nbatch_fa/2)) {
+                        uint32_t pair;
+                        ggml_cuda_memcpy_1<4>(&pair, m + int64_t(i/(nbatch_fa/2))*stride_mask + k_VKQ_0 + 2*(i%(nbatch_fa/2)));
+                        diff |= pair ^ 0xfc00fc00u;
+                    }
+                }
+                if (__syncthreads_or(diff != 0)) { break; }
+                k_VKQ_0 += gridDim.y*nbatch_fa;
+            }
+        }
+#endif
         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, use_rows>
@@ -1244,6 +1273,11 @@ static fattn_kernel_t ggml_cuda_fattn_tile_get_kernel(const ggml_tensor * dst) {
     return flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap>;
 }
 
+#ifdef GGML_USE_HIP
+// Compile the experiment separately so LLVM does not reschedule the reference kernel.
+fattn_kernel_t ggml_hip_inkling_ppskip_kernel();
+#endif
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1261,6 +1295,26 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = ggml_cuda_fattn_tile_get_kernel<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>(dst);
+            if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1 && !use_logit_softcap) {
+                const auto * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
+                static const bool enable = [] { const char * s = getenv("GGML_INKLING_PPSKIP"); return s && strcmp(s, "1") == 0; }();
+                static const bool trace = getenv("GGML_INKLING_PPSKIP_TRACE") != nullptr;
+                if ((enable || trace) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && Q->ne[1] == 256 &&
+                    Q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 && dst->src[4] && !dst->src[5] &&
+                    k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && k->ne[1] >= 2048 && k->ne[1] <= 4352 &&
+                    v->ne[1] == k->ne[1] && mask && mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] &&
+                    mask->ne[1] == Q->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(half) &&
+                    (mask->nb[1] | mask->nb[2] | mask->nb[3] | uintptr_t(mask->data)) % 4 == 0 &&
+                    strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
+                    auto reference = fattn_kernel;
+                    if (enable) { fattn_kernel = ggml_hip_inkling_ppskip_kernel(); }
+                    if (trace) { GGML_LOG_INFO("INKLING_PPSKIP_SELECT %s K=%lld Q=%lld S=%lld enabled=%d\n",
+                        mask->name, (long long) k->ne[1], (long long) Q->ne[1], (long long) Q->ne[3], int(enable)); }
+                    launch_fattn<DV, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared,
+                        nbatch_fa, true, true, false, false, warp_size, false, reference, trace);
+                    return;
+                }
+            }
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
             return;

@@ -57,3 +57,9 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ABORT("Unsupported head size");
     }
 }
+
+#ifdef GGML_USE_HIP
+fattn_kernel_t ggml_hip_inkling_ppskip_kernel() {
+    return flash_attn_tile<128, 128, 64, 1, false, false, true>;
+}
+#endif
