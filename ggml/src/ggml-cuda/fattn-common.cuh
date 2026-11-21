@@ -1036,7 +1036,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
+    fattn_kernel_t split_reference = nullptr, const bool check_geometry = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1202,6 +1203,14 @@ void launch_fattn(
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
+    const int launch_occupancy = max_blocks_per_sm;
+    if (split_reference && split_reference != fattn_kernel) {
+        // Keep the baseline partition/reduction order. These are independent CTAs,
+        // not a cooperative launch: grid size is not a limit on resident CTAs.
+        GGML_ASSERT(!stream_k && !use_sparse);
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, split_reference, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+        GGML_ASSERT(max_blocks_per_sm > 0);
+    }
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : n_kv_cols;
@@ -1290,6 +1299,9 @@ void launch_fattn(
         }
     }
 
+    if (check_geometry) {
+        GGML_LOG_INFO("INKLING_MASKSKIP_GRID %s kv=%lld q=%lld s=%lld plan_occ=%d kernel_occ=%d grid=%u,%u,%u\n", mask->name, (long long)n_kv, (long long)Q->ne[1], (long long)Q->ne[3], max_blocks_per_sm, launch_occupancy, blocks_num.x, blocks_num.y, blocks_num.z);
+    }
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;

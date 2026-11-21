@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked_tile = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -277,6 +277,16 @@ static __global__ void flash_attn_ext_vec(
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+#if defined(GGML_USE_HIP)
+        if constexpr (skip_masked_tile) {
+            // Preserve the accumulator incl. its neutral empty state. Every thread must vote:
+            // the physical order may wrap and each head can have a different mask.
+            if (!__syncthreads_or(reinterpret_cast<const uint16_t *>(maskh)[tid] != uint16_t(0xfc00))) {
+                continue;
+            }
+        }
+#endif
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -560,10 +570,29 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    const fattn_kernel_t split_ref = fattn_kernel;
+    bool check_geometry = false;
+#if defined(GGML_USE_HIP)
+    if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap) {
+        const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
+        static const bool enable = [] { const char * s = getenv("GGML_INKLING_MASKSKIP"); return s && strcmp(s, "1") == 0; }();
+        if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && dst->src[4] && !dst->src[5] && mask &&
+            q->ne[1] == 1 && q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 &&
+            k->ne[0] == 128 && v->ne[0] == 128 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+            k->ne[1] >= 2048 && k->ne[1] % 128 == 0 && v->ne[1] == k->ne[1] &&
+            mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(uint16_t) &&
+            strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
+            static const bool trace = getenv("GGML_INKLING_MASKSKIP_TRACE") != nullptr;
+            check_geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
+            if (enable && trace) { GGML_LOG_INFO("INKLING_MASKSKIP_HIT %s kv=%lld\n", mask->name, (long long)k->ne[1]); }
+            if (enable) { fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>; }
+        }
+    }
+#endif
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, split_ref, check_geometry);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
