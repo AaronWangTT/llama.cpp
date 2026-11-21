@@ -4334,6 +4334,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#ifdef GGML_USE_HIP
+#include "inkling-gather-hip.cuh"
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4342,6 +4346,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+#ifdef GGML_USE_HIP
+    if (cuda_ctx->stream_context().concurrent_events.empty() && inkling_gather_match(cgraph, i)) {
+        const int oi = i + 3;
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &oi, 1)) {
+            const auto * tab = node->src[0]; const auto * ids = node->src[1]; auto * out = cgraph->nodes[oi];
+            static bool trace = getenv("GGML_INKLING_GATHER_TRACE") != nullptr;
+            if (trace) GGML_LOG_INFO("INKLING_GATHER_HIT K=%lld Q=%lld S=%lld\n", (long long)ids->ne[0], (long long)out->ne[1], (long long)out->ne[3]);
+            inkling_bias_gather_24<<<dim3((ids->ne[0]+31)/32,ids->ne[1]),128,0,cuda_ctx->stream()>>>(
+                    (const uint32_t *)tab->data, (const int32_t *)ids->data, (uint32_t *)out->data,
+                    (int)ids->ne[0], (int)tab->ne[1], (int)out->ne[1]);
+            CUDA_CHECK(cudaGetLastError());
+            return 3;
+        }
+    }
+#endif
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -5524,6 +5543,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     };
 
     if (!disable_fusion) {
+#ifdef GGML_USE_HIP
+        for (int i = 0; i + 3 < cgraph->n_nodes; ++i) {
+            if (inkling_gather_match(cgraph, i)) {
+                for (int j = 0; j < 2; ++j) {
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[j], cgraph->nodes[i+3]);
+                }
+                i += 3;
+            }
+        }
+#endif
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
