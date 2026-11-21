@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "inkling-headorder.cuh"
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -16,7 +17,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked_tile = false> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked_tile = false, bool head_order = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -105,8 +106,19 @@ static __global__ void flash_attn_ext_vec(
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
 
-    const int sequence = blockIdx.z / ne02;
-    const int head = blockIdx.z - sequence*ne02;
+    int sequence, head;
+    unsigned split;
+    if constexpr (head_order) {
+        static_assert(skip_masked_tile && D == 128 && ncols == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap);
+        const auto logical = inkling_headorder_coords(blockIdx.y, blockIdx.z, gridDim.y);
+        sequence = logical.sequence;
+        head     = logical.head;
+        split    = logical.split;
+    } else {
+        sequence = blockIdx.z / ne02;
+        head     = blockIdx.z - sequence*ne02;
+        split    = blockIdx.y;
+    }
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
@@ -271,10 +283,10 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
-    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+    K     += split*nthreads * nb11;
+    V     += split*nthreads * nb21;
+    maskh += split*nthreads;
+    for (int k_VKQ_0 = split*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
@@ -411,7 +423,7 @@ static __global__ void flash_attn_ext_vec(
         ggml_cuda_syncwarp(); // Needed for KQ synchronization.
     }
 
-    if (sinks && blockIdx.y == 0) {
+    if (sinks && split == 0) {
         const float sink = ((const float *) sinks)[head];
 
 #pragma unroll
@@ -533,7 +545,7 @@ static __global__ void flash_attn_ext_vec(
                 if (gridDim.y == 1) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + split)*D + i0 + tid] = dst_val;
             }
         }
 
@@ -544,7 +556,7 @@ static __global__ void flash_attn_ext_vec(
     }
 
     if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
-        dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+        dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + split] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -585,7 +597,22 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             static const bool trace = getenv("GGML_INKLING_MASKSKIP_TRACE") != nullptr;
             check_geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
             if (enable && trace) { GGML_LOG_INFO("INKLING_MASKSKIP_HIT %s kv=%lld\n", mask->name, (long long)k->ne[1]); }
-            if (enable) { fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>; }
+            if (enable) {
+                static const bool reorder = [] {
+                    const char * order = getenv("GGML_INKLING_HEADORDER");
+                    const char * epi   = getenv("GGML_INKLING_MASKEPI");
+                    return order && strcmp(order, "1") == 0 && epi && strcmp(epi, "1") == 0;
+                }();
+                if (reorder) {
+                    fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, true>;
+                    static const bool trace_order = getenv("GGML_INKLING_HEADORDER_TRACE") != nullptr;
+                    if (trace_order) {
+                        GGML_LOG_INFO("INKLING_HEADORDER_HIT %s kv=%lld s=%lld\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
+                    }
+                } else {
+                    fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>;
+                }
+            }
         }
     }
 #endif
