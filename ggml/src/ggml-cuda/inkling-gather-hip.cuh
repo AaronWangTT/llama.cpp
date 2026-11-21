@@ -20,9 +20,8 @@ static __global__ void inkling_bias_gather_24(const uint32_t * __restrict__ tabl
     }
 }
 
-static bool inkling_gather_match(ggml_cgraph * g, int i) {
-    static const bool enable = [] { const char * e = getenv("GGML_INKLING_GATHER"); return e && strcmp(e, "1") == 0; }();
-    if (!enable || g->nodes[i]->op != GGML_OP_GET_ROWS || i+3 >= g->n_nodes) { return false; }
+static bool inkling_gather_layout(ggml_cgraph * g, int i, int min_tokens) {
+    if (g->nodes[i]->op != GGML_OP_GET_ROWS || i+3 >= g->n_nodes) { return false; }
     const auto * get = g->nodes[i]; const auto * reshape = g->nodes[i+1]; const auto * perm = g->nodes[i+2];
     const auto * out = g->nodes[i+3]; const auto * tab = get->src[0]; const auto * ids = get->src[1];
     if (!ggml_can_fuse_subgraph(g, i, {GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT}, {i+3}) ||
@@ -33,11 +32,16 @@ static bool inkling_gather_match(ggml_cgraph * g, int i) {
         !ggml_is_contiguous(tab) || !ggml_is_contiguous(ids) || !ggml_is_contiguous(get) ||
         !ggml_is_contiguous(reshape) || !ggml_is_contiguous(out)) { return false; }
     const int64_t H=24, K=ids->ne[0], T=ids->ne[1], E=tab->ne[1], Q=out->ne[1], S=out->ne[3];
-    if (K < 1 || K > (1<<25) || T < 2 || T > 65535 || E < 1 || E > (1<<23) || Q<1 || S<1 || Q>T || S>T || Q*S!=T ||
+    if (K < 1 || K > (1<<25) || T < min_tokens || T > 65535 || E < 1 || E > (1<<23) || Q<1 || S<1 || Q>T || S>T || Q*S!=T ||
         ids->ne[2]!=1 || ids->ne[3]!=1 || tab->ne[0]!=H || tab->ne[2]!=T || tab->ne[3]!=1 ||
         get->ne[0]!=H || get->ne[1]!=K || get->ne[2]!=T || get->ne[3]!=1 ||
         reshape->ne[0]!=H || reshape->ne[1]!=K || reshape->ne[2]!=Q || reshape->ne[3]!=S ||
         out->ne[0]!=K || out->ne[2]!=H || !ggml_are_same_shape(out, perm)) { return false; }
     return perm->nb[0]==reshape->nb[1] && perm->nb[1]==reshape->nb[2] &&
            perm->nb[2]==reshape->nb[0] && perm->nb[3]==reshape->nb[3];
+}
+
+static bool inkling_gather_match(ggml_cgraph * g, int i) {
+    static const bool enable = [] { const char * e = getenv("GGML_INKLING_GATHER"); return e && strcmp(e, "1") == 0; }();
+    return enable && inkling_gather_layout(g, i, 2);
 }
