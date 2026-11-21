@@ -176,6 +176,17 @@ static bool ggml_cuda_fusion_disabled() {
     return disabled;
 }
 
+#ifdef GGML_USE_HIP
+static bool inkling_control_enabled() {
+    // Concurrent graph optimization can reorder sites between inspection and capture.
+    static const bool enabled = [] {
+        const char * p = getenv("GGML_INKLING_CTRL_TAIL");
+        return p && strcmp(p,"1") == 0 && !ggml_cuda_env_flag("GGML_CUDA_GRAPH_OPT") && !ggml_cuda_fusion_disabled();
+    }();
+    return enabled;
+}
+#endif
+
 static bool ggml_cuda_p2p_enabled() {
     static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
     return enabled;
@@ -3241,6 +3252,7 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 }
 
 #ifdef GGML_USE_HIP
+static int inkling_control_site(ggml_backend_cuda_context &, ggml_cgraph *, int, bool);
 static int inkling_situ_dispatch(ggml_backend_cuda_context &, ggml_cgraph *, int, bool);
 #endif
 
@@ -3254,6 +3266,34 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // Parent graph uses are shared by split views, but are not in a tensor's properties.
     // A replay must still write newly observed intermediates; the reverse transition may fuse again.
     static const bool situ = [] { const char * p = getenv("GGML_INKLING_SITU"); return p && strcmp(p,"1") == 0; }();
+    if (inkling_control_enabled()) {
+        auto & sites = graph->inkling_control_sites;
+        if (cgraph->uid && cgraph->uid == graph->uid && (int)graph->node_props.size() == cgraph->n_nodes) {
+            for (auto & site : sites) {
+                const int now = site.first >= 0 ? inkling_control_site(*cuda_ctx, cgraph, site.first, false) : int(ggml_node_has_n_uses(cgraph, -1 - site.first, 1));
+                if (now != site.second) { res = true; site.second = now; }
+            }
+        } else {
+            std::vector<std::pair<int,int>> next;
+            for (int i=0; i<cgraph->n_nodes; ++i) {
+                const auto * t = cgraph->nodes[i];
+                if (t->op == GGML_OP_UNARY && t->ne[0] == 2304 && ggml_get_unary_op(t) == GGML_UNARY_OP_TANH) {
+                    next.emplace_back(i, inkling_control_site(*cuda_ctx, cgraph, i, false));
+                    // If the control tail falls back, a subsequent generic multi-ADD may
+                    // still hide its result. Track the potential intermediate ADDs of that chain.
+                    if (i+2 < cgraph->n_nodes && cgraph->nodes[i+1]->op == GGML_OP_MUL &&
+                        cgraph->nodes[i+1]->src[0] == t && cgraph->nodes[i+2]->op == GGML_OP_ADD &&
+                        cgraph->nodes[i+2]->src[1] == cgraph->nodes[i+1]) {
+                        for (int j=i+2; j+1<cgraph->n_nodes && cgraph->nodes[j+1]->op == GGML_OP_ADD &&
+                                cgraph->nodes[j+1]->src[0] == cgraph->nodes[j]; ++j) {
+                            next.emplace_back(-1-j, int(ggml_node_has_n_uses(cgraph,j,1)));
+                        }
+                    }
+                }
+            }
+            if (sites != next) { res = true; sites.swap(next); }
+        }
+    }
     if (situ) {
         auto & sites = graph->inkling_situ_sites;
         if (cgraph->uid && cgraph->uid == graph->uid && (int)graph->node_props.size() == cgraph->n_nodes) {
@@ -4366,6 +4406,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 #include "inkling-maskepi-hip.cuh"
 #include "inkling-rowclip-hip.cuh"
 #include "inkling-situ-hip.cuh"
+#include "inkling-control-hip.cuh"
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4377,6 +4418,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 #ifdef GGML_USE_HIP
+    if (node->op == GGML_OP_UNARY && inkling_control_enabled() && inkling_control_site(*cuda_ctx, cgraph, i, true)) {
+        return 2; // exactly TANH, MUL, SUB/ADD
+    }
     if (node->op == GGML_OP_SCALE) {
         const int skip = inkling_situ_dispatch(*cuda_ctx, cgraph, i, true);
         if (skip) { return skip; }
