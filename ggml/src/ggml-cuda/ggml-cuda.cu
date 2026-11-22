@@ -18,6 +18,7 @@
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
 #include "ggml-cuda/inkling-concat4.cuh"
 #include "ggml-cuda/inkling-mix1.cuh"
+#include "ggml-cuda/inkling-conv1.cuh"
 #endif
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
@@ -2895,6 +2896,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 inkling_concat4_launch(ctx, dst);
             } else if (inkling_mix1_supported(ctx.device, dst)) {
                 inkling_mix1_launch(ctx, dst);
+            } else if (inkling_conv1_supported(ctx.device, dst)) {
+                inkling_conv1_launch(ctx, dst);
             } else {
                 return false;
             }
@@ -6684,7 +6687,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
         case GGML_OP_CUSTOM:
-            return inkling_concat4_supported(dev_ctx->device, op) || inkling_mix1_supported(dev_ctx->device, op);
+            return inkling_concat4_supported(dev_ctx->device, op) || inkling_mix1_supported(dev_ctx->device, op) ||
+                inkling_conv1_supported(dev_ctx->device, op);
 #endif
         case GGML_OP_CONCAT:
             {

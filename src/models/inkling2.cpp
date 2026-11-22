@@ -3,8 +3,21 @@
 #include "ggml-inkling-depthmix.h"
 #include "ggml-inkling-concat4.h"
 #include "ggml-inkling-mix1.h"
+#include "ggml-inkling-conv1.h"
 #endif
 #include "../llama-memory-hybrid-iswa.h"
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+// the one-token ops exist on a single ROCm device only; returns that device or nullptr
+static ggml_backend_dev_t inkling_one_token_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
+    if (cparams.cb_eval || cparams.optimizer_graph || !loras->empty() || model.devices.size() != 1 || model.devices.front().is_meta ||
+            (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
+        return nullptr;
+    }
+    const auto dev = model.devices.front().dev;
+    return std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0 ? dev : nullptr;
+}
+#endif
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -184,12 +197,8 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * states = nullptr;
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
     // one token: a single op replaces the concat, norm, score, softmax and sum chain
-    if (ggml_inkling_mix1_enabled() && n_tokens == 1 && blocks.size() < (size_t) ggml_inkling_mix1_max_states &&
-            !cparams.cb_eval && !cparams.optimizer_graph && loras->empty() &&
-            model.devices.size() == 1 && !model.devices.front().is_meta &&
-            (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER)) {
-        const auto dev = model.devices.front().dev;
-        if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+    if (ggml_inkling_mix1_enabled() && n_tokens == 1 && blocks.size() < (size_t) ggml_inkling_mix1_max_states) {
+        if (const auto dev = inkling_one_token_dev(cparams, model, loras)) {
             // row order of the stock concat: newest block first, cur last
             std::vector<ggml_tensor *> rows(blocks.rbegin(), blocks.rend());
             rows.push_back(cur);
@@ -289,6 +298,25 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seqs       = ubatch.n_seqs;
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    // one token: conv, residual, scale and the state update in one op
+    if (ggml_inkling_conv1_enabled() && !dynamic && n_seq_tokens == 1 && n_seqs == 1 && cparams.n_rs_seq == 0) {
+        if (const auto dev = inkling_one_token_dev(cparams, model, loras)) {
+            // same cell as build_conv_state_store
+            const size_t cell_offs = inp->mctx->get_head()*state->nb[1] + offset*(n_conv - 1)*ggml_element_size(state);
+            auto make = [&](ggml_context * ctx) {
+                ggml_tensor * cell = ggml_view_2d(ctx, state, (n_conv - 1)*n_channels, n_seqs, state->nb[1], cell_offs);
+                return ggml_inkling_try_conv1(ctx, cur, past, weight, cell);
+            };
+            ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+            auto * candidate = make(probe.get());
+            if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+                return make(ctx0);
+            }
+        }
+    }
+#endif
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);

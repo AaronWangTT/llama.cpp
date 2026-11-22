@@ -96,6 +96,7 @@ if (NOT CXX_IS_HIPCC AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1103")
     set_property(SOURCE "${INKLING_DISPATCH_SOURCE}" APPEND PROPERTY COMPILE_DEFINITIONS GGML_INKLING_DEPTHMIX_GFX1103)
     target_sources(ggml-base PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-inkling-concat4.cpp")
     target_sources(ggml-base PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-inkling-mix1.cpp")
+    target_sources(ggml-base PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-inkling-conv1.cpp")
     set_property(TARGET ggml-hip PROPERTY INKLING_DEPTHMIX_GFX1103 ON)
 endif()
 
