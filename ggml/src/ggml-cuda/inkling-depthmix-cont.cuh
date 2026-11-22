@@ -16,12 +16,9 @@ static __device__ __forceinline__ float depthmix_mad(float z, float a, float b) 
     return z;
 }
 
-template<int S, int Q>
-static __global__ void inkling_depthmix_cont(const float * __restrict__ packed, const float * __restrict__ scores, float * __restrict__ out) {
+template<int S, int Q, typename Pack>
+static __device__ __forceinline__ void depthmix_store(Pack v, const float * scores, float * out, int d, int t) {
     constexpr int D = 2304;
-    const int d = blockIdx.x * 128 + threadIdx.x, t = blockIdx.y;
-    using pack = std::conditional_t<S == 2, float2, float4>;
-    const pack v = reinterpret_cast<const pack *>(packed)[t*D + d];
 #pragma unroll
     for (int q = 0; q < Q; ++q) {
         const float * a = scores + (t*Q + q)*S;
@@ -35,6 +32,25 @@ static __global__ void inkling_depthmix_cont(const float * __restrict__ packed, 
         even = depthmix_add(even, 0.0f);
         out[(t*Q + q)*D + d] = (q & 1) ? depthmix_add(odd, even) : depthmix_add(even, odd);
     }
+}
+
+template<int S, int Q>
+static __global__ void inkling_depthmix_cont(const float * __restrict__ packed, const float * __restrict__ scores, float * __restrict__ out) {
+    constexpr int D = 2304;
+    const int d = blockIdx.x * 128 + threadIdx.x, t = blockIdx.y;
+    using pack = std::conditional_t<S == 2, float2, float4>;
+    depthmix_store<S,Q>(reinterpret_cast<const pack *>(packed)[t*D + d], scores, out, d, t);
+}
+
+template<int S, int Q>
+static __global__ void inkling_depthmix_raw_v2(const float * __restrict__ states, const float * __restrict__ scores, float * __restrict__ out) {
+    constexpr int D = 2304;
+    const int d = blockIdx.x * 128 + threadIdx.x, t = blockIdx.y;
+    const float * row = states + t*S*D + d;
+    std::conditional_t<S == 2, float2, float4> v;
+    v.x = row[0]; v.y = row[D];
+    if constexpr (S == 4) { v.z = row[2*D]; v.w = row[3*D]; }
+    depthmix_store<S,Q>(v, scores, out, d, t);
 }
 
 static bool depthmix_layout(const ggml_tensor * x, int a, int b, int c) {
@@ -51,7 +67,7 @@ static bool depthmix_mm(const ggml_tensor * x) {
     return f32(ggml_prec_get_acc(x)) && f32(ggml_prec_get_src(x, 1));
 }
 
-static bool inkling_depthmix_try(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, ggml_tensor * y) {
+static bool depthmix_pattern(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * y) {
     constexpr int D = 2304, T = 256;
     if ((x->ne[0] != 2 && x->ne[0] != 4) || (w->ne[1] != 1 && w->ne[1] != 3 && w->ne[1] != 4)) {
         return false;
@@ -79,15 +95,11 @@ static bool inkling_depthmix_try(ggml_backend_cuda_context & ctx, const ggml_ten
     if (!depthmix_layout(rep, D, q, T) || rep->op != GGML_OP_REPEAT || !depthmix_layout(rep->src[0], D, q, 1) || rep->src[0]->op != GGML_OP_NONE) {
         return false;
     }
-    // Ancestors above are metadata only. Pass only live MUL_MAT operands to the device.
-    const size_t alignment = s == 2 ? alignof(float2) : alignof(float4);
-    if (!x->data || !w->data || !y->data || uintptr_t(x->data) % alignment || uintptr_t(w->data) % 4 || uintptr_t(y->data) % 4) {
-        return false;
-    }
-    auto launch = [&](auto S, auto Q) {
-        inkling_depthmix_cont<S.value, Q.value><<<dim3(D/128, T), 128, 0, ctx.stream()>>>(
-                static_cast<const float *>(x->data), static_cast<const float *>(w->data), static_cast<float *>(y->data));
-    };
+    return true;
+}
+
+template<class Launch>
+static void depthmix_dispatch(int s, int q, Launch launch) {
     auto for_s = [&](auto S) {
         if (q == 1) { launch(S, std::integral_constant<int, 1>{}); }
         if (q == 3) { launch(S, std::integral_constant<int, 3>{}); }
@@ -95,5 +107,48 @@ static bool inkling_depthmix_try(ggml_backend_cuda_context & ctx, const ggml_ten
     };
     if (s == 2) { for_s(std::integral_constant<int, 2>{}); }
     else        { for_s(std::integral_constant<int, 4>{}); }
+}
+
+static bool inkling_depthmix_try(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, ggml_tensor * y) {
+    constexpr int D = 2304, T = 256;
+    if (!depthmix_pattern(x, w, y)) { return false; }
+    const int s = x->ne[0], q = w->ne[1];
+    // Ancestors above are metadata only. Pass only live MUL_MAT operands to the device.
+    const size_t alignment = s == 2 ? alignof(float2) : alignof(float4);
+    if (!x->data || !w->data || !y->data || uintptr_t(x->data) % alignment || uintptr_t(w->data) % 4 || uintptr_t(y->data) % 4) {
+        return false;
+    }
+    depthmix_dispatch(s, q, [&](auto S, auto Q) {
+        inkling_depthmix_cont<S.value, Q.value><<<dim3(D/128, T), 128, 0, ctx.stream()>>>(
+                static_cast<const float *>(x->data), static_cast<const float *>(w->data), static_cast<float *>(y->data));
+    });
+    return true;
+}
+
+bool ggml_cuda_depthmix_reference_site(int device, const ggml_tensor * ref) {
+    const auto & dev = ggml_cuda_info().devices[device];
+    if (dev.cc != GGML_CUDA_CC_OFFSET_AMD + 0x1103 || dev.warp_size != 32 || !ref || !ref->src[0] || !ref->src[1]) {
+        return false;
+    }
+    const auto * x = ref->src[0];
+    return depthmix_pattern(x, ref->src[1], ref) && ggml_cuda_should_use_mmvf(x, dev.cc, dev.warp_size, ref->src[1]->ne[1]);
+}
+
+bool ggml_cuda_depthmix_raw_v2(ggml_backend_cuda_context & ctx, ggml_tensor * out) {
+    constexpr int D = 2304, T = 256;
+    const auto & dev = ggml_cuda_info().devices[ctx.device];
+    const auto * n = out->src[0];
+    const auto * w = out->src[1]; // live operand, including when the scheduler has copied a view
+    if (dev.cc != GGML_CUDA_CC_OFFSET_AMD + 0x1103 || dev.warp_size != 32 || !n || !w ||
+            (n->ne[1] != 2 && n->ne[1] != 4) || (w->ne[0] != 1 && w->ne[0] != 3 && w->ne[0] != 4)) { return false; }
+    const int s = n->ne[1], q = w->ne[0];
+    if (!depthmix_layout(n, D, s, T) || !depthmix_layout(out, D, q, T) || w->type != GGML_TYPE_F32 ||
+            w->ne[1] != s || w->ne[2] != T || w->ne[3] != 1 || w->nb[0] != 4u*s || w->nb[1] != 4 ||
+            w->nb[2] != 4u*s*q || w->nb[3] != 4u*s*q*T) { return false; }
+    depthmix_dispatch(s, q, [&](auto S, auto Q) {
+        inkling_depthmix_raw_v2<S.value, Q.value><<<dim3(D/128, T), 128, 0, ctx.stream()>>>(
+                static_cast<const float *>(n->data), static_cast<const float *>(w->data), static_cast<float *>(out->data));
+    });
+    CUDA_CHECK(cudaGetLastError());
     return true;
 }

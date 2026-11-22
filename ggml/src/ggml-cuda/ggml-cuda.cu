@@ -2921,6 +2921,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+            if (dst->op_params[inkling_depthmix_slot] == inkling_depthmix_raw_v2_tag && ggml_cuda_depthmix_raw_v2(ctx, dst)) {
+                break;
+            }
+#endif
             ggml_cuda_out_prod(ctx, dst);
             break;
         case GGML_OP_SCALE:
@@ -7040,8 +7045,38 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+static ggml_tensor * inkling_depthmix_make_v2(ggml_context * ctx, ggml_backend_sched_t sched,
+        ggml_backend_t backend, ggml_tensor * ref) {
+    if (!inkling_depthmix_raw_v2_enabled() || ggml_cuda_fusion_disabled() || ggml_cuda_env_flag("GGML_CUDA_GRAPH_OPT") ||
+            ggml_cuda_unified_memory_enabled() || !ctx || !sched || !backend || !ggml_backend_is_cuda(backend) ||
+            backend != ggml_backend_sched_get_backend(sched, 0) || ggml_cuda_info().device_count != 1) {
+        return nullptr;
+    }
+    const int device = static_cast<ggml_backend_cuda_context *>(backend->context)->device;
+    if (!ggml_cuda_depthmix_reference_site(device, ref)) { return nullptr; }
+    auto * scores = ref->src[1];
+    auto * dot    = scores->src[0];
+    auto * states = dot->src[0];
+    auto * query  = dot->src[1]->src[0];
+    auto * buft   = ggml_backend_cuda_buffer_type(device);
+    if (!query->buffer || ggml_backend_buffer_get_type(query->buffer) != buft ||
+            ggml_backend_sched_get_buffer_type(sched, backend) != buft) { return nullptr; }
+    // Both operands are real edges. No scheduler rewrite, hidden lifetime or deferred store.
+    auto * out = ggml_out_prod(ctx, states, ggml_transpose(ctx, scores));
+    out->op_params[inkling_depthmix_slot] = inkling_depthmix_raw_v2_tag;
+    ggml_backend_sched_set_tensor_backend(sched, out, backend);
+    return out;
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+    if (strcmp(name, inkling_depthmix_make_v2_name) == 0) {
+        return (void *) static_cast<inkling_depthmix_make_v2_t>(inkling_depthmix_make_v2);
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

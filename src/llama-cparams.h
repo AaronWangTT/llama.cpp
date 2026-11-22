@@ -53,6 +53,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool optimizer_graph = false; // Includes partial-context optimizer runs, for inference-only operators.
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;

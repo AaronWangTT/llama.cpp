@@ -190,21 +190,45 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    auto * mixed = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    auto original = [&](ggml_context * ctx) {
+        return ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+    };
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
-    if (inkling_depthmix_enabled() && n_embd == 2304 && n_tokens == 256 &&
+    const bool raw = inkling_depthmix_raw_v2_enabled() && !cparams.cb_eval && !cparams.optimizer_graph && sched &&
+        model.n_devices() == 1 && !model.devices.front().is_meta && !model.has_tensor_overrides() &&
+        model.n_gpu_layers() > hparams.n_layer_all && cparams.offload_kqv && cparams.op_offload &&
+        (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER) &&
+        !cparams.ctx_other && !cparams.ctx_state_src && !cparams.pipeline_parallel && !cparams.moe_cache_size;
+    if ((raw || inkling_depthmix_enabled()) && n_embd == 2304 && n_tokens == 256 &&
             (states->ne[1] == 2 || states->ne[1] == 4) &&
             (query->ne[1] == 1 || query->ne[1] == 3 || query->ne[1] == 4) &&
             ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.n_seq_tokens == 256 && loras->empty()) {
         for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-            if (cvec->tensor_for(il)) {
-                return mixed;
+            if (cvec->tensor_for(il)) { return original(ctx0); }
+        }
+        if (raw) {
+            auto * backend = ggml_backend_sched_get_backend(sched, 0);
+            auto * dev = ggml_backend_get_device(backend);
+            if (dev && dev == model.devices.front().dev && dev == model.dev_output()) {
+                auto make = reinterpret_cast<inkling_depthmix_make_v2_t>(ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), inkling_depthmix_make_v2_name));
+                if (make) {
+                    // Validate the exact d82 site without spending the fixed graph arena on dead nodes.
+                    ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+                    if (probe) {
+                        if (auto * out = make(ctx0, sched, backend, original(probe.get()))) { return out; }
+                    }
+                }
             }
         }
-        mixed->op_params[inkling_depthmix_slot] = inkling_depthmix_tag;
+        if (inkling_depthmix_enabled()) {
+            auto * mixed = original(ctx0);
+            mixed->op_params[inkling_depthmix_slot] = inkling_depthmix_tag;
+            return mixed;
+        }
     }
 #endif
-    return mixed;
+    return original(ctx0);
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head

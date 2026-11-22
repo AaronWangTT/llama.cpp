@@ -944,6 +944,10 @@ struct llm_graph_params {
         }
 
         return
+            // An observer must see the original graph; rebuild and reinstall a changed callback.
+            cparams.cb_eval                 == other.cparams.cb_eval                 &&
+            cparams.cb_eval_user_data       == other.cparams.cb_eval_user_data       &&
+            cparams.optimizer_graph         == other.cparams.optimizer_graph                &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&

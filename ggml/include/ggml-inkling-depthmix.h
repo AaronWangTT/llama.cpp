@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ggml.h"
+#include "ggml-backend.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -10,6 +10,19 @@ constexpr int32_t inkling_depthmix_tag = 0x444d5831;
 static inline bool inkling_depthmix_enabled() {
     static const bool enabled = [] {
         const char * p = std::getenv("GGML_INKLING_DEPTHMIX_CONT");
+        return p && std::strcmp(p, "1") == 0;
+    }();
+    return enabled;
+}
+
+// Optional, versioned constructor exported only by the native gfx1103 HIP module.
+// A null result leaves the original MUL_MAT graph and scheduler untouched.
+using inkling_depthmix_make_v2_t = ggml_tensor * (*)(ggml_context *, ggml_backend_sched_t, ggml_backend_t, ggml_tensor *);
+constexpr char inkling_depthmix_make_v2_name[] = "ggml_backend_inkling_depthmix_make_v2";
+constexpr int32_t inkling_depthmix_raw_v2_tag = 0x444d5632; // OUT_PROD only
+static inline bool inkling_depthmix_raw_v2_enabled() {
+    static const bool enabled = [] {
+        const char * p = std::getenv("GGML_INKLING_DEPTHMIX_RAW_V2");
         return p && std::strcmp(p, "1") == 0;
     }();
     return enabled;

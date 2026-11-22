@@ -12,3 +12,9 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);
+
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+#include "ggml-inkling-depthmix.h"
+bool ggml_cuda_depthmix_reference_site(int device, const ggml_tensor * ref);
+bool ggml_cuda_depthmix_raw_v2(ggml_backend_cuda_context & ctx, ggml_tensor * out);
+#endif
