@@ -1,5 +1,9 @@
 #include "common.cuh"
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#define MMQ_PRIVATE_TAIL16_ROLL
+#endif
 #include "mmq.cuh"
+#undef MMQ_PRIVATE_TAIL16_ROLL
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -160,6 +164,65 @@ static int ggml_cuda_mmq_get_J_best(
     }
     return J_best;
 }
+
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
+#error This experiment must be built natively for gfx1103 only
+#endif
+
+// This direct, row-innermost kernel consumes the *original J32* mmid specs and packed Q8_1.
+// The width is only the compute body; no second partition or reinterpretation of ids.
+template<int W>
+static __device__ __forceinline__ void inkling_tail_body(const char * x, const int * y, const int * ids,
+        float * dst, int xoff, int sx, int sy, int sd, int imax, int useful, int nbk) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    constexpr auto c = ggml_cuda_mmq_get_config(GGML_TYPE_IQ4_NL, W, false, GGML_PREC_Q8);
+    static_assert(c.type == GGML_TYPE_IQ4_NL && c.J == W && (W == 16 || W == 32) && !c.fallback && !c.stream_k);
+    static_assert(c.I == 64 && c.nthreads == 128 && c.occupancy == 2 && ggml_cuda_get_physical_warp_size() == 32);
+    static_assert(c.rows_per_warp() == 16 && c.use_mma_data_layout() && c.sram_layout == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0);
+    static_assert(c.K_vram == 256 && ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk == 32 && QK8_1_MMQ == 128);
+    static_assert(MMQ_TILE_Y_K == 36 && sizeof(block_q8_1_mmq) == 144 && ggml_cuda_mmq_get_sram_stride(c.sram_layout) == 76);
+    static_assert((W + GGML_PAD(W*MMQ_TILE_Y_K,128) + 64*76)*sizeof(int) <= 24192);
+#endif
+    mul_mat_q_process_tile<GGML_TYPE_IQ4_NL, W, false, false, GGML_PREC_Q8, false>(
+        x, nullptr, xoff, y, ids, dst, nullptr, nullptr, GGML_GLU_OP_SWIGLU, 0.f, nullptr, nullptr,
+        sx, sy, sd, imax, useful, 0, nbk);
+}
+
+__launch_bounds__(128, 2)
+static __global__ void inkling_gate_j32_tail16(const char * __restrict__ x, const int * __restrict__ y,
+        const int * __restrict__ ids, const ggml_cuda_mm_id_tile_spec * __restrict__ specs, float * __restrict__ dst,
+        int sx, int sex, int sy, int sd, int nrow, int nbk) {
+    const auto spec = specs[blockIdx.y];
+    const int useful = spec.col_high - spec.col_low;
+    if (!useful) { return; } // same decision for all four waves
+    const int row = int(blockIdx.x)*64;
+    const int xoff = spec.expert*sex + row*sx;
+    y += spec.col_low*(sizeof(block_q8_1_mmq)/sizeof(int));
+    extern __shared__ int data_mul_mat_q[];
+    const int j = threadIdx.y*32 + threadIdx.x;
+    if (j < useful) { data_mul_mat_q[j] = ids[spec.col_low + j]; }
+    __syncthreads(); // J16 may reuse words [16,32) as tile_y; no outstanding writes
+    if (useful <= 16) {
+        inkling_tail_body<16>(x, y, data_mul_mat_q, dst + row, xoff, sx, sy, sd, nrow-row-1, useful, nbk);
+    } else {
+        inkling_tail_body<32>(x, y, data_mul_mat_q, dst + row, xoff, sx, sy, sd, nrow-row-1, useful, nbk);
+    }
+}
+
+static int inkling_tail_layer(const char * name, const char * prefix, const char * suffix) {
+    const size_t n = strlen(prefix);
+    if (strncmp(name, prefix, n) != 0) { return -1; }
+    const char * p = name + n;
+    if (*p < '0' || *p > '9') { return -1; }
+    int v = *p++ - '0';
+    if (*p >= '0' && *p <= '9') {
+        if (!v) { return -1; }
+        v = 10*v + (*p++ - '0');
+    }
+    return strcmp(p, suffix) == 0 ? v : -1;
+}
+#endif
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -395,6 +458,39 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ntj, J_best, fusion_device};
 
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+    static const bool tail16 = [] { const char * v = getenv("GGML_INKLING_GATE_TAIL16"); return v && !strcmp(v,"1"); }();
+    static const bool trace = [] { const char * v = getenv("GGML_INKLING_GATE_TAIL16_TRACE"); return v && !strcmp(v,"1"); }();
+    if ((tail16 || trace) && !fusion && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && J_best == 32 &&
+        !fallback && prec_src1 == GGML_PREC_Q8 && src0->type == GGML_TYPE_IQ4_NL &&
+        !src0->view_src && ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && dst->op == GGML_OP_MUL_MAT_ID &&
+        dst->src[0] == src0 && dst->src[1] == src1 && dst->src[2] == ids &&
+        ne00 == 2304 && ne01 == 2304 && ne02 == 128 && ne03 == 1 &&
+        ne10 == 2304 && ne11 == 1 && ne12 == 256 && ne13 == 1 &&
+        ids->ne[0] == 8 && ids->ne[1] == 256 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+        ne0 == 2304 && ne1 == 8 && ne2 == 256 && ne3 == 1) {
+        const int p = inkling_tail_layer(src0->name, "blk.", ".ffn_gate_up_exps.weight");
+        const int v = inkling_tail_layer(dst->name, "ffn_moe_gate_up-", "");
+        if (v >= 0 && v < 48 && p >= 0 && p < 20 && p == (v < 24 ? v : 6 + (v-24)%12)) {
+            const auto c = ggml_cuda_mmq_get_config(src0->type, 32, false, cc, prec_src1);
+            const auto n = ggml_cuda_mmq_get_config(src0->type, 16, false, cc, prec_src1);
+            const auto bytes = mmq_get_nbytes_shared(c, cc);
+            GGML_ASSERT(c.I == n.I && c.I == 64 && c.nthreads == n.nthreads && n.nthreads == 128 &&
+                        nthreads_best == 128 && !c.stream_k && !n.stream_k && !use_native_fp4 && dedup_bcast &&
+                        ggml_cuda_info().devices[id].warp_size == 32 && bytes == 24192 &&
+                        mmq_get_nbytes_shared(n,cc) == 22080 && bytes <= smpbo &&
+                        args.nchannels_y == 1 && args.nsamples_y == 1 && args.ntj == 192 &&
+                        args.ncols_y == 2048 && args.nrows_dst == 2304 && args.stride_row_x == 72 && args.stride_channel_x == 2304*72);
+            if (trace) { GGML_LOG_INFO("INKLING_GATE_TAIL16 phys=%d virt=%d on=%d J=32 ntj=192\n", p, v, int(tail16)); }
+            if (tail16) {
+                inkling_gate_j32_tail16<<<dim3(args.nrows_x/c.I, args.ntj),dim3(32,4),bytes,stream>>>(
+                    args.x, args.y, args.ids_dst, args.tile_spec, args.dst, args.stride_row_x, args.stride_channel_x,
+                    args.ncols_y, args.nrows_dst, args.nrows_x, args.ncols_x/ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk);
+                return;
+            }
+        }
+    }
+#endif
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 

@@ -165,7 +165,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 #if defined(RDNA3)
     // On RDNA3 a fully unrolled k01 loop at J == 32 keeps the A fragments of every iteration live: the kernel needs
     // 256 VGPRs and still spills to scratch. Keeping this loop rolled removes the spill; the other J are unchanged.
+#if defined(MMQ_PRIVATE_TAIL16_ROLL)
+    // Only the new direct kernel in mmq.cu: bound live A fragments for its narrow branch too.
+    constexpr bool keep_k01_rolled = J == 32 || (type == GGML_TYPE_IQ4_NL && J == 16);
+#else
     constexpr bool keep_k01_rolled = J == 32;
+#endif
 #else
     constexpr bool keep_k01_rolled = false;
 #endif // defined(RDNA3)

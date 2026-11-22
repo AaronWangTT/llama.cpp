@@ -85,6 +85,13 @@ endif()
 
 add_compile_definitions(GGML_USE_HIP)
 
+# Compile the opt-in short expert tile into native gfx1103 HIP builds only.
+# Keep this local to mmq.cu so the stock template instances remain unchanged.
+if (NOT CXX_IS_HIPCC AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1103")
+    get_filename_component(INKLING_MMQ_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/mmq.cu" ABSOLUTE)
+    set_property(SOURCE "${INKLING_MMQ_SOURCE}" APPEND PROPERTY COMPILE_DEFINITIONS GGML_INKLING_TAIL16_EXPERIMENT)
+endif()
+
 if (GGML_CUDA_FORCE_MMQ)
     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
 endif()
