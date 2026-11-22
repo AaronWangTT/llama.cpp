@@ -868,7 +868,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
+#ifdef GGML_USE_HIP
+    // A mask with tile flags is not complete, its attention op must have taken the flags.
+    GGML_ASSERT(ctx.inkling_pf_mask == nullptr);
+#endif
 }
+
+#ifdef GGML_USE_HIP
+bool ggml_cuda_flash_attn_ext_inkling_pf(int device, const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2];
+    // same path as launch_fattn_tile_switch_ncols1<128, 128, 1, false> takes for this shape
+    return q->ne[0] == 128 && v->ne[0] == 128 && k->ne[1] % 64 == 0 && ggml_get_op_params_f32(dst, 2) == 0.0f &&
+        ggml_hip_inkling_pf_shape(dst, ggml_cuda_info().devices[device].cc) &&
+        ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_TILE;
+}
+#endif
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;

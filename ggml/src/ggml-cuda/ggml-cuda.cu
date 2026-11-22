@@ -962,6 +962,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
 #endif
     }
+#ifdef GGML_USE_HIP
+    if (inkling_pf_aux != nullptr) {
+        CUDA_CHECK(cudaFree(inkling_pf_aux));
+    }
+#endif
 }
 
 

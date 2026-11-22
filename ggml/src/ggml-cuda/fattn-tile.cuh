@@ -1276,6 +1276,21 @@ static fattn_kernel_t ggml_cuda_fattn_tile_get_kernel(const ggml_tensor * dst) {
 #ifdef GGML_USE_HIP
 // Compile the experiment separately so LLVM does not reschedule the reference kernel.
 fattn_kernel_t ggml_hip_inkling_ppskip_kernel();
+// Inkling prefill kernel (inkling-pfattn.cuh). The mode is 0 when the op stays on the generic kernel.
+// aux is set when the mask kernel left the tile flags of this mask in the context.
+int ggml_hip_inkling_pfattn_mode(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const int ** aux);
+fattn_kernel_t ggml_hip_inkling_pfattn_kernel(bool skip_empty_prefix, int pf);
+
+// Inkling prefill on gfx1103: 256 queries, 24 heads on 8 KV heads, F16 K and V, a mask with one bias per head, no ALiBi.
+static bool ggml_hip_inkling_pf_shape(const ggml_tensor * dst, const int cc) {
+    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
+    return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && q->ne[1] == 256 &&
+        q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 && dst->src[4] && !dst->src[5] &&
+        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        v->ne[1] == k->ne[1] && mask && mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] &&
+        mask->ne[1] == q->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(half) &&
+        strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f;
+}
 #endif
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
@@ -1296,22 +1311,25 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = ggml_cuda_fattn_tile_get_kernel<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>(dst);
             if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1 && !use_logit_softcap) {
-                const auto * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
+                const auto * k = dst->src[1], * mask = dst->src[3];
                 static const bool enable = [] { const char * s = getenv("GGML_INKLING_PPSKIP"); return s && strcmp(s, "1") == 0; }();
                 static const bool trace = getenv("GGML_INKLING_PPSKIP_TRACE") != nullptr;
-                if ((enable || trace) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && Q->ne[1] == 256 &&
-                    Q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 && dst->src[4] && !dst->src[5] &&
-                    k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && k->ne[1] >= 2048 && k->ne[1] <= 4352 &&
-                    v->ne[1] == k->ne[1] && mask && mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] &&
-                    mask->ne[1] == Q->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(half) &&
-                    (mask->nb[1] | mask->nb[2] | mask->nb[3] | uintptr_t(mask->data)) % 4 == 0 &&
-                    strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
+                const bool shape = ggml_hip_inkling_pf_shape(dst, cc);
+                const bool skip = (enable || trace) && shape && k->ne[1] >= 2048 && k->ne[1] <= 4352 &&
+                    (mask->nb[1] | mask->nb[2] | mask->nb[3] | uintptr_t(mask->data)) % 4 == 0;
+                const int * aux = nullptr;
+                const int pf = shape && k->ne[1] % nbatch_fa == 0 ? ggml_hip_inkling_pfattn_mode(ctx, mask, &aux) : 0;
+                if (skip || pf) {
                     auto reference = fattn_kernel;
-                    if (enable) { fattn_kernel = ggml_hip_inkling_ppskip_kernel(); }
-                    if (trace) { GGML_LOG_INFO("INKLING_PPSKIP_SELECT %s K=%lld Q=%lld S=%lld enabled=%d\n",
+                    if (pf) {
+                        fattn_kernel = ggml_hip_inkling_pfattn_kernel(skip && enable, pf);
+                    } else if (enable) {
+                        fattn_kernel = ggml_hip_inkling_ppskip_kernel();
+                    }
+                    if (trace && skip) { GGML_LOG_INFO("INKLING_PPSKIP_SELECT %s K=%lld Q=%lld S=%lld enabled=%d\n",
                         mask->name, (long long) k->ne[1], (long long) Q->ne[1], (long long) Q->ne[3], int(enable)); }
                     launch_fattn<DV, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared,
-                        nbatch_fa, true, true, false, false, warp_size, false, reference, trace);
+                        nbatch_fa, true, true, false, false, warp_size, false, reference, trace && skip, false, aux);
                     return;
                 }
             }

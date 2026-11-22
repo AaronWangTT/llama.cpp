@@ -1364,6 +1364,12 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+#ifdef GGML_USE_HIP
+    // Inkling prefill: tile flags and far bias of the mask that the next attention op takes (inkling_pfmask_24).
+    int * inkling_pf_aux = nullptr;
+    const ggml_tensor * inkling_pf_mask = nullptr;
+#endif
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

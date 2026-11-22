@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-tile.cuh"
+#include "inkling-pfattn.cuh"
 
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
@@ -61,5 +62,38 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
 #ifdef GGML_USE_HIP
 fattn_kernel_t ggml_hip_inkling_ppskip_kernel() {
     return flash_attn_tile<128, 128, 64, 1, false, false, true>;
+}
+
+int ggml_hip_inkling_pfattn_mode(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const int ** aux) {
+    static const bool fast = [] { const char * s = getenv("GGML_INKLING_PFATTN"); return s && strcmp(s, "1") == 0; }();
+    static const bool zero = [] { const char * s = getenv("GGML_INKLING_PFZERO"); return s && strcmp(s, "1") == 0; }();
+    int pf = fast ? INKLING_PF_FAST : 0;
+    // The zero skip is compiled with the fast kernel only. Its empty tile test loads the mask in pairs.
+    if (fast && zero && (mask->nb[1] | mask->nb[2] | mask->nb[3] | uintptr_t(mask->data)) % 4 == 0) {
+        pf |= INKLING_PF_ZERO;
+    }
+    if (ctx.inkling_pf_mask == mask) {
+        pf |= INKLING_PF_FAR;
+        *aux = ctx.inkling_pf_aux;
+        ctx.inkling_pf_mask = nullptr;
+    }
+    static const bool trace = getenv("GGML_INKLING_PFATTN_TRACE") != nullptr;
+    if (trace && pf) {
+        GGML_LOG_INFO("INKLING_PFATTN_HIT %s K=%lld fast=%d flags=%d zero=%d\n", mask->name, (long long) mask->ne[0],
+            int((pf & INKLING_PF_FAST) != 0), int((pf & INKLING_PF_FAR) != 0), int((pf & INKLING_PF_ZERO) != 0));
+    }
+    return pf;
+}
+
+#define INKLING_PFATTN_CASE(pf_) case pf_: return skip_empty_prefix ? inkling_pfattn_tile<true, pf_> : inkling_pfattn_tile<false, pf_>;
+fattn_kernel_t ggml_hip_inkling_pfattn_kernel(const bool skip_empty_prefix, const int pf) {
+    switch (pf) {
+        INKLING_PFATTN_CASE(INKLING_PF_FAR)
+        INKLING_PFATTN_CASE(INKLING_PF_FAST)
+        INKLING_PFATTN_CASE(INKLING_PF_FAR | INKLING_PF_FAST)
+        INKLING_PFATTN_CASE(INKLING_PF_FAST | INKLING_PF_ZERO)
+        INKLING_PFATTN_CASE(INKLING_PF_FAR | INKLING_PF_FAST | INKLING_PF_ZERO)
+        default: GGML_ABORT("no Inkling prefill kernel for this mode");
+    }
 }
 #endif

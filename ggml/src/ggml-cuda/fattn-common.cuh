@@ -1037,7 +1037,8 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
-    fattn_kernel_t split_reference = nullptr, const bool check_geometry = false, const bool block_per_kv_head = false
+    fattn_kernel_t split_reference = nullptr, const bool check_geometry = false, const bool block_per_kv_head = false,
+    const int * kv_aux = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1055,6 +1056,7 @@ void launch_fattn(
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
     GGML_ASSERT(!kv_rows || !use_sparse);
     GGML_ASSERT(!block_per_kv_head || !stream_k);
+    GGML_ASSERT(!kv_aux || !kv_rows);
 
     ggml_tensor * KQV = dst;
 
@@ -1339,7 +1341,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        kv_rows ? (const int *) kv_rows->data : nullptr,
+        kv_rows ? (const int *) kv_rows->data : kv_aux,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
