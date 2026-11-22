@@ -611,6 +611,14 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
                 if (fagqa) {
                     // One block per KV head and split. It takes the 3 query heads from one load of each K and V row.
                     fattn_kernel = inkling_fagqa_vec<D, 3>;
+                    // GGML_INKLING_VSKIP=8, 10 or 12 leaves out V rows with a weight below 2^-n. The result is not the same.
+                    static const int vskip = [] { const char * s = getenv("GGML_INKLING_VSKIP"); return s ? atoi(s) : 0; }();
+                    switch (vskip) {
+                        case  8: fattn_kernel = inkling_fagqa_vec<D, 3,  8>; break;
+                        case 10: fattn_kernel = inkling_fagqa_vec<D, 3, 10>; break;
+                        case 12: fattn_kernel = inkling_fagqa_vec<D, 3, 12>; break;
+                        default: break;
+                    }
                     block_per_kv_head = true;
                     static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
                     if (trace_fagqa) {
