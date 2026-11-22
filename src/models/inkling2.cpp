@@ -5,6 +5,7 @@
 #include "ggml-inkling-mix1.h"
 #include "ggml-inkling-conv1.h"
 #include "ggml-inkling-bias1.h"
+#include "ggml-inkling-ctrl1.h"
 #endif
 #include "../llama-memory-hybrid-iswa.h"
 
@@ -350,6 +351,27 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    // one token: norms, concat, the three projections and the tail in one op
+    if (ggml_inkling_ctrl1_enabled() && n_tokens == 1) {
+        // a folded weight or a precision override changes the stock products
+        auto plain = [&](const ggml_tensor * w) {
+            return (!hdmd || !hdmd->rot.count(w)) && (!prec_policy || !prec_policy->prec_src1.count(w));
+        };
+        const auto dev = inkling_one_token_dev(cparams, model, loras);
+        if (dev && plain(loop.ctrl_down[ctrl]) && plain(loop.ctrl_gain[ctrl]) && plain(loop.ctrl_forget[ctrl])) {
+            auto make = [&](ggml_context * ctx) {
+                return ggml_inkling_try_ctrl1(ctx, cur, message, loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl]);
+            };
+            ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+            auto * candidate = make(probe.get());
+            if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+                return make(ctx0);
+            }
+        }
+    }
+#endif
+
     ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
