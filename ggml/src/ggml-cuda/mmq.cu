@@ -210,6 +210,8 @@ static __global__ void inkling_gate_j32_tail16(const char * __restrict__ x, cons
     }
 }
 
+#include "inkling-hotpair.cuh"
+
 static int inkling_tail_layer(const char * name, const char * prefix, const char * suffix) {
     const size_t n = strlen(prefix);
     if (strncmp(name, prefix, n) != 0) { return -1; }
@@ -496,6 +498,14 @@ void ggml_cuda_mul_mat_q(
                         args.ncols_y == 2048 && args.nrows_dst == 2304 && args.stride_row_x == ne00/32 && args.stride_channel_x == 2304*(ne00/32));
             if (report) { GGML_LOG_INFO("%s phys=%d virt=%d on=%d J=32 ntj=192\n", down ? "INKLING_DOWN_TAIL16" : "INKLING_GATE_TAIL16", p, v, int(active)); }
             if (active) {
+                static const bool hot_gate = [] { const char * e=getenv("GGML_INKLING_HOTPAIR_GATE"); return e && !strcmp(e,"1"); }();
+                static const bool hot_down = [] { const char * e=getenv("GGML_INKLING_HOTPAIR_DOWN"); return e && !strcmp(e,"1"); }();
+                if (down ? hot_down : hot_gate) {
+                    inkling_hotpair_j32<<<dim3(args.nrows_x/c.I, args.ntj),dim3(32,4),bytes,stream>>>(
+                        args.x, args.y, args.ids_dst, args.tile_spec, args.dst, args.stride_row_x, args.stride_channel_x,
+                        args.ncols_y, args.nrows_dst, args.nrows_x, args.ncols_x/ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk);
+                    return;
+                }
                 inkling_gate_j32_tail16<<<dim3(args.nrows_x/c.I, args.ntj),dim3(32,4),bytes,stream>>>(
                     args.x, args.y, args.ids_dst, args.tile_spec, args.dst, args.stride_row_x, args.stride_channel_x,
                     args.ncols_y, args.nrows_dst, args.nrows_x, args.ncols_x/ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk);
