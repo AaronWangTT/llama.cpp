@@ -7,12 +7,13 @@
 
 // one block of 1024 threads, thread t owns elements 4*t .. 4*t + 3
 static __global__ void inkling_mix1(const float * query, const float * s0, const float * s1, const float * s2, const float * s3,
-        float * dst, const int ns, const int nq, const int n_embd, const float kq) {
+        const float * s4, const float * s5, float * dst, const int ns, const int nq, const int n_embd, const float kq) {
     constexpr int max_s = ggml_inkling_mix1_max_states;
     constexpr int max_q = ggml_inkling_mix1_max_query;
     constexpr int n_red = max_s + max_s*max_q;
 
-    const float * st[max_s] = { s0, s1, s2, s3 };
+    const float * st[max_s] = { s0, s1, s2, s3, s4, s5 };
+    static_assert(max_s == 6, "one pointer argument per state");
     const int  tid  = threadIdx.x;
     const int  warp = tid / WARP_SIZE;
     const int  lane = tid % WARP_SIZE;
@@ -118,6 +119,6 @@ static void inkling_mix1_launch(ggml_backend_cuda_context & ctx, ggml_tensor * o
         s[ns] = static_cast<const float *>(op->src[ns + 1]->data);
     }
     const int n_embd = op->ne[0];
-    inkling_mix1<<<1, 1024, 0, ctx.stream()>>>(static_cast<const float *>(op->src[0]->data), s[0], s[1], s[2], s[3],
+    inkling_mix1<<<1, 1024, 0, ctx.stream()>>>(static_cast<const float *>(op->src[0]->data), s[0], s[1], s[2], s[3], s[4], s[5],
         static_cast<float *>(op->data), ns, (int) op->ne[1], n_embd, 1.0f/sqrtf(n_embd));
 }

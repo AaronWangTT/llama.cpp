@@ -13,6 +13,6 @@ GGML_API bool ggml_inkling_is_mix1(const ggml_tensor * op);
 GGML_API bool ggml_inkling_viewcol_enabled();
 }
 
-constexpr int   ggml_inkling_mix1_max_states = 4;
+constexpr int   ggml_inkling_mix1_max_states = 6;
 constexpr int   ggml_inkling_mix1_max_query  = 4;
 constexpr float ggml_inkling_mix1_eps        = 1e-6f;

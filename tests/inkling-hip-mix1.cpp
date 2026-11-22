@@ -63,7 +63,7 @@ int main(int argc, char ** argv) {
     std::normal_distribution<float> nd(0.0f, 1.0f);
     double worst = 0.0;
     for (int rep = 0; rep < 4; ++rep) {
-        for (int ns = 2; ns <= 4; ++ns) {
+        for (int ns = 2; ns <= ggml_inkling_mix1_max_states; ++ns) {
             for (int nq : {1, 3, 4}) {
                 std::vector<std::vector<float>> data(ns, std::vector<float>(D));
                 for (int s = 0; s < ns; ++s) {

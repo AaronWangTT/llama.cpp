@@ -48,6 +48,10 @@ static bool inkling_clip_origin(const ggml_tensor * x, const ggml_tensor * out) 
     // of inkling2.cpp::convolve: optional per-lag ADDs before the outer residual ADD.
     if (strncmp(out->name, "Kcur-", 5) || x->op != GGML_OP_RESHAPE) { return false; }
     const auto * scale = x->src[0];
+#if defined(GGML_INKLING_DEPTHMIX_GFX1103)
+    // the one-token conv op stands for the whole SSM_CONV, ADD, SCALE chain
+    if (ggml_inkling_is_conv1(scale)) { return inkling_clip_weight(scale->src[2], ".attn_k_conv.weight"); }
+#endif
     const auto * add = scale ? scale->src[0] : nullptr;
     if (!scale || scale->op != GGML_OP_SCALE || !add || add->op != GGML_OP_ADD) { return false; }
     const auto * v = add->src[1];
