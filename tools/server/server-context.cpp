@@ -1103,6 +1103,9 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // n_swa for the state reuse threshold: 0 with a recurrent state, which holds one position only
+    int32_t n_swa_reuse;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -1437,6 +1440,9 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        // the min position of a hybrid memory is the position of its recurrent state, not the start of the SWA window
+        n_swa_reuse = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) ? 0 : n_swa;
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -4216,7 +4222,7 @@ private:
                             const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
 
                             // a state or a checkpoint is useful when its pos_min is below this threshold
-                            const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+                            const auto pos_min_thold = std::max(0, n_swa_reuse > 0 ? pos_eval - n_swa_reuse + 2 : pos_eval);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
