@@ -4,6 +4,7 @@
 #include "ggml-inkling-concat4.h"
 #include "ggml-inkling-mix1.h"
 #include "ggml-inkling-conv1.h"
+#include "ggml-inkling-bias1.h"
 #endif
 #include "../llama-memory-hybrid-iswa.h"
 
@@ -476,11 +477,26 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        ggml_tensor * table = nullptr;
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+        // one token: pad, product, sink and permute in one op
+        if (ggml_inkling_bias1_enabled() && n_tokens == 1) {
+            if (const auto dev = inkling_one_token_dev(cparams, model, loras)) {
+                ggml_tensor * r2d = ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head);
+                ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+                auto * candidate = ggml_inkling_try_bias1(probe.get(), layer.attn_rel_bias, r2d, sinks);
+                if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+                    table = ggml_inkling_try_bias1(ctx0, layer.attn_rel_bias, r2d, sinks);
+                }
+            }
+        }
+#endif
+        if (!table) {
+            table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        }
 
         ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
