@@ -67,6 +67,12 @@ configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @O
 
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
+if (TARGET ggml-hip)
+    get_target_property(INKLING_DEPTHMIX_GFX1103 ggml-hip INKLING_DEPTHMIX_GFX1103)
+    if (INKLING_DEPTHMIX_GFX1103)
+        target_compile_definitions(llama PRIVATE GGML_INKLING_DEPTHMIX_GFX1103)
+    endif()
+endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 find_package(Threads REQUIRED)

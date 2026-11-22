@@ -1,4 +1,7 @@
 #include "models.h"
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+#include "ggml-inkling-depthmix.h"
+#endif
 #include "../llama-memory-hybrid-iswa.h"
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
@@ -187,7 +190,21 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    auto * mixed = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    if (inkling_depthmix_enabled() && n_embd == 2304 && n_tokens == 256 &&
+            (states->ne[1] == 2 || states->ne[1] == 4) &&
+            (query->ne[1] == 1 || query->ne[1] == 3 || query->ne[1] == 4) &&
+            ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.n_seq_tokens == 256 && loras->empty()) {
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (cvec->tensor_for(il)) {
+                return mixed;
+            }
+        }
+        mixed->op_params[inkling_depthmix_slot] = inkling_depthmix_tag;
+    }
+#endif
+    return mixed;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
