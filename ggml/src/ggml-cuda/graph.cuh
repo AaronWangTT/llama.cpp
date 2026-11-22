@@ -62,6 +62,7 @@ struct ggml_cuda_graph {
     };
     std::vector<node_properties> node_props;
 #ifdef GGML_USE_HIP
+    std::vector<std::pair<int, int>> inkling_mask_sites;
     std::vector<std::pair<int, int>> inkling_control_sites;
     std::vector<std::pair<int, int>> inkling_situ_sites;
 #endif

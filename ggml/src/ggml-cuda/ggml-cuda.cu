@@ -177,6 +177,13 @@ static bool ggml_cuda_fusion_disabled() {
 }
 
 #ifdef GGML_USE_HIP
+static bool inkling_rawmask_enabled() {
+    static const bool enabled = [] {
+        const char * p = getenv("GGML_INKLING_RAWMASK");
+        return p && strcmp(p,"1")==0 && !ggml_cuda_env_flag("GGML_CUDA_GRAPH_OPT") && !ggml_cuda_fusion_disabled();
+    }();
+    return enabled;
+}
 static bool inkling_control_enabled() {
     // Concurrent graph optimization can reorder sites between inspection and capture.
     static const bool enabled = [] {
@@ -3252,6 +3259,7 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 }
 
 #ifdef GGML_USE_HIP
+static int inkling_mask_replay_choice(ggml_backend_cuda_context &, ggml_cgraph *, int);
 static int inkling_control_site(ggml_backend_cuda_context &, ggml_cgraph *, int, bool);
 static int inkling_situ_dispatch(ggml_backend_cuda_context &, ggml_cgraph *, int, bool);
 #endif
@@ -3266,6 +3274,30 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // Parent graph uses are shared by split views, but are not in a tensor's properties.
     // A replay must still write newly observed intermediates; the reverse transition may fuse again.
     static const bool situ = [] { const char * p = getenv("GGML_INKLING_SITU"); return p && strcmp(p,"1") == 0; }();
+    // These shorter fusions still elide outputs when RAWMASK itself is disabled.
+    static const bool mask_replay = [] {
+        const auto enabled = [](const char * name) { const char * v = getenv(name); return v && strcmp(v, "1") == 0; };
+        return !ggml_cuda_fusion_disabled() && (enabled("GGML_INKLING_MASKEPI") || enabled("GGML_INKLING_GATHER"));
+    }();
+    if (mask_replay) {
+        auto & sites = graph->inkling_mask_sites;
+        if (cgraph->uid && cgraph->uid == graph->uid && (int)graph->node_props.size() == cgraph->n_nodes) {
+            for (auto & site : sites) {
+                const int now = inkling_mask_replay_choice(*cuda_ctx,cgraph,site.first);
+                if (now != site.second) { res = true; site.second = now; }
+            }
+        } else {
+            std::vector<std::pair<int,int>> next;
+            for (int i=0; i<cgraph->n_nodes; ++i) {
+                const auto * t = cgraph->nodes[i];
+                if ((inkling_rawmask_enabled() && t->op == GGML_OP_SUB && t->ne[0]==1025 && t->ne[1]==24) ||
+                    (t->op == GGML_OP_GET_ROWS && t->ne[0]==24)) {
+                    next.emplace_back(i, inkling_mask_replay_choice(*cuda_ctx,cgraph,i));
+                }
+            }
+            if (sites != next) { res = true; sites.swap(next); }
+        }
+    }
     if (inkling_control_enabled()) {
         auto & sites = graph->inkling_control_sites;
         if (cgraph->uid && cgraph->uid == graph->uid && (int)graph->node_props.size() == cgraph->n_nodes) {
@@ -4407,6 +4439,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 #include "inkling-rowclip-hip.cuh"
 #include "inkling-situ-hip.cuh"
 #include "inkling-control-hip.cuh"
+
+static bool inkling_epi_ready(ggml_cgraph * g, int i) {
+    if (!inkling_maskepi_match(g,i)) { return false; }
+    auto ** n=g->nodes+i;
+    return inkling_maskepi_separate(n[0]->src[0],n[6]) && inkling_maskepi_separate(n[0]->src[1],n[6]) &&
+           inkling_maskepi_separate(n[4]->src[0],n[6]);
+}
+// GET_ROWS IDs can be graph leaves, which the generic range check skips.
+static bool inkling_gather_disjoint(const ggml_tensor * get, const ggml_tensor * out) {
+    return inkling_maskepi_separate(get->src[0],out) && inkling_maskepi_separate(get->src[1],out);
+}
+static bool inkling_gather_ready(ggml_cgraph * g, int i) {
+    const int oi=i+3;
+    return inkling_gather_match(g,i) && inkling_gather_disjoint(g->nodes[i],g->nodes[oi]) &&
+           ggml_cuda_check_fusion_memory_ranges(g,i,4,&oi,1);
+}
+#include "inkling-rawmask.cuh"
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4426,11 +4475,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (skip) { return skip; }
     }
     if (node->op == GGML_OP_SQR && inkling_clip_dispatch(*cuda_ctx, cgraph, i)) { return 7; }
-    if (cuda_ctx->stream_context().concurrent_events.empty() && inkling_maskepi_match(cgraph,i)) {
+    if (node->op == GGML_OP_SUB && inkling_rawmask_site(*cuda_ctx,cgraph,i,true)) { return 9; }
+    if (cuda_ctx->stream_context().concurrent_events.empty() && inkling_epi_ready(cgraph,i)) {
         const auto * tab=node->src[0]; const auto * ids=node->src[1];
         const auto * mask=cgraph->nodes[i+4]->src[0]; auto * out=cgraph->nodes[i+6];
         // CPY's src[1] points to itself. Check the three real read ranges, including input leaves.
-        if (inkling_maskepi_separate(tab,out) && inkling_maskepi_separate(ids,out) && inkling_maskepi_separate(mask,out)) {
+        {
             static const bool trace=getenv("GGML_INKLING_MASKEPI_TRACE")!=nullptr;
             if (trace) GGML_LOG_INFO("INKLING_MASKEPI_HIT K=%lld Q=%lld S=%lld\n",(long long)ids->ne[0],(long long)out->ne[1],(long long)out->ne[3]);
             inkling_maskepi_24<<<dim3((ids->ne[0]+31)/32,ids->ne[1]),128,0,cuda_ctx->stream()>>>(
@@ -4439,9 +4489,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             CUDA_CHECK(cudaGetLastError()); return 6;
         }
     }
-    if (cuda_ctx->stream_context().concurrent_events.empty() && inkling_gather_match(cgraph, i)) {
+    if (cuda_ctx->stream_context().concurrent_events.empty() && inkling_gather_ready(cgraph, i)) {
         const int oi = i + 3;
-        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &oi, 1)) {
+        {
             const auto * tab = node->src[0]; const auto * ids = node->src[1]; auto * out = cgraph->nodes[oi];
             static bool trace = getenv("GGML_INKLING_GATHER_TRACE") != nullptr;
             if (trace) GGML_LOG_INFO("INKLING_GATHER_HIT K=%lld Q=%lld S=%lld\n", (long long)ids->ne[0], (long long)out->ne[1], (long long)out->ne[3]);
@@ -5637,6 +5687,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     if (!disable_fusion) {
 #ifdef GGML_USE_HIP
         for (int i = 0; i + 3 < cgraph->n_nodes; ++i) {
+            // These deps are storage lifetimes, not graph-use counts. Install them
+            // even on a tapped site: the same allocated split may later lose a tap.
+            auto ** n=cgraph->nodes+i;
+            if (inkling_rawmask_enabled() && i+9<cgraph->n_nodes && n[0]->op==GGML_OP_SUB &&
+                n[0]->ne[0]==1025 && n[0]->ne[1]==24 && n[0]->ne[2]>1 && n[0]->ne[2]<=256 && n[0]->ne[3]==1 &&
+                n[1]->op==GGML_OP_PERMUTE && n[2]->op==GGML_OP_CONT &&
+                n[3]->op==GGML_OP_GET_ROWS && n[7]->op==GGML_OP_CPY && n[9]->op==GGML_OP_CPY &&
+                n[1]->src[0]==n[0] && n[2]->src[0]==n[1] && n[3]->src[0]==n[2]) {
+                for (auto * x : {n[0]->src[0], n[0]->src[1], n[3]->src[1], n[7]->src[0]}) {
+                    params->add_alloc_dep(params->user_data,x,n[9]);
+                }
+            }
             if (inkling_maskepi_match(cgraph,i)) {
                 // Keep original gather inputs alive for the smaller fallback too.
                 for (int j=0;j<2;++j) {
