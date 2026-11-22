@@ -15,8 +15,8 @@
 #include <vector>
 static void need(bool ok, const char *msg) { if (!ok) { std::fprintf(stderr,"focused: %s\n",msg); std::exit(1); } }
 int main(int argc,char **argv) {
-    need(argc==6,"LIBDIR GGUF gate|real|down|q8|ub128|misnamed|wrongpair|decode OUT.f32 REPLAY_IDS");
-    const std::string lib=argv[1], mode=argv[3]; const bool down=mode=="down", q8=mode=="q8";
+    need(argc==6,"LIBDIR GGUF gate|real|down|downreal|q8|ub128|misnamed|wrongpair|decode OUT.f32 REPLAY_IDS");
+    const std::string lib=argv[1], mode=argv[3]; const bool down=(mode=="down" || mode=="downreal"), q8=mode=="q8";
     need(down || q8 || mode=="real" || mode=="gate" || mode=="ub128" || mode=="misnamed" || mode=="wrongpair" || mode=="decode","mode");
     const int k=down ? 1152 : 2304, t=mode=="decode" ? 1 : mode=="ub128" ? 128 : 256, channels=down ? 8 : 1;
     const std::string name="blk."+std::to_string(q8?20:6)+(down?".ffn_down_exps.weight":".ffn_gate_up_exps.weight");
@@ -43,7 +43,7 @@ int main(int argc,char **argv) {
     auto *out=std::fopen(argv[4],"wbx"); need(out,"output exists or is not writable");
     // Reuse allocations, change Q and routes, then poison and inspect EVERY write.
     std::vector<int> real(256*8); std::ifstream raw(argv[5]); for (int &e: real) { need(bool(raw>>e) && e>=0 && e<128,"bad replay"); } int extra;need(!(raw>>extra),"long replay");
-    for(int rep=0;rep<2;rep++) for(int skew=0;skew<((mode=="gate"||mode=="real")?3:2);skew++) {
+    for(int rep=0;rep<2;rep++) for(int skew=0;skew<((mode=="gate"||mode=="real"||mode=="downreal")?3:2);skew++) {
         for(auto &v:X) {seed=seed*1664525u+1013904223u;v=(int(seed>>16)-32768)/8192.f;}
         for (int row=0;row<t*channels;row++) X[size_t(row)*k]=float(row+1)/512.f;
         ggml_backend_tensor_set(x,X.data(),0,ggml_nbytes(x));

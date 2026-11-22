@@ -461,28 +461,41 @@ void ggml_cuda_mul_mat_q(
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
     static const bool tail16 = [] { const char * v = getenv("GGML_INKLING_GATE_TAIL16"); return v && !strcmp(v,"1"); }();
     static const bool trace = [] { const char * v = getenv("GGML_INKLING_GATE_TAIL16_TRACE"); return v && !strcmp(v,"1"); }();
-    if ((tail16 || trace) && !fusion && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && J_best == 32 &&
+    static const bool down_tail = [] { const char * v = getenv("GGML_INKLING_DOWN_TAIL16"); return v && !strcmp(v,"1"); }();
+    static const bool down_trace = [] { const char * v = getenv("GGML_INKLING_DOWN_TAIL16_TRACE"); return v && !strcmp(v,"1"); }();
+    const bool down = ne00 == 1152 && ne10 == 1152 && ne11 == 8;
+    const bool active = down ? down_tail : tail16;
+    const bool report = down ? down_trace : trace;
+    if ((active || report) && !fusion && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && J_best == 32 &&
         !fallback && prec_src1 == GGML_PREC_Q8 && src0->type == GGML_TYPE_IQ4_NL &&
         !src0->view_src && ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && dst->op == GGML_OP_MUL_MAT_ID &&
         dst->src[0] == src0 && dst->src[1] == src1 && dst->src[2] == ids &&
-        ne00 == 2304 && ne01 == 2304 && ne02 == 128 && ne03 == 1 &&
-        ne10 == 2304 && ne11 == 1 && ne12 == 256 && ne13 == 1 &&
+        (down || (ne00 == 2304 && ne10 == 2304 && ne11 == 1)) && ne01 == 2304 && ne02 == 128 && ne03 == 1 &&
+        ne12 == 256 && ne13 == 1 &&
         ids->ne[0] == 8 && ids->ne[1] == 256 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
         ne0 == 2304 && ne1 == 8 && ne2 == 256 && ne3 == 1) {
-        const int p = inkling_tail_layer(src0->name, "blk.", ".ffn_gate_up_exps.weight");
-        const int v = inkling_tail_layer(dst->name, "ffn_moe_gate_up-", "");
-        if (v >= 0 && v < 48 && p >= 0 && p < 20 && p == (v < 24 ? v : 6 + (v-24)%12)) {
+        const int p = inkling_tail_layer(src0->name, "blk.", down ? ".ffn_down_exps.weight" : ".ffn_gate_up_exps.weight");
+        const int v = inkling_tail_layer(dst->name, down ? "ffn_moe_down-" : "ffn_moe_gate_up-", "");
+        // K=1152 has one half tile at the end. Require standard padded GPU storage and the ordinary zero-padded Q8_1 input.
+        bool storage_ok = true;
+        if (down) {
+            auto * buft = ggml_backend_cuda_buffer_type(id);
+            storage_ok = src0->buffer && ggml_backend_buffer_get_type(src0->buffer) == buft &&
+                ggml_backend_buft_get_alloc_size(buft, src0) >= ggml_nbytes(src0) + ggml_row_size(src0->type, 128) &&
+                ggml_is_contiguous(src1) && src1->type == GGML_TYPE_F32 && ne10_padded >= 1280;
+        }
+        if (storage_ok && v >= 0 && v < 48 && p >= 0 && p < 20 && p == (v < 24 ? v : 6 + (v-24)%12)) {
             const auto c = ggml_cuda_mmq_get_config(src0->type, 32, false, cc, prec_src1);
             const auto n = ggml_cuda_mmq_get_config(src0->type, 16, false, cc, prec_src1);
             const auto bytes = mmq_get_nbytes_shared(c, cc);
             GGML_ASSERT(c.I == n.I && c.I == 64 && c.nthreads == n.nthreads && n.nthreads == 128 &&
-                        nthreads_best == 128 && !c.stream_k && !n.stream_k && !use_native_fp4 && dedup_bcast &&
+                        nthreads_best == 128 && !c.stream_k && !n.stream_k && !use_native_fp4 && dedup_bcast == !down &&
                         ggml_cuda_info().devices[id].warp_size == 32 && bytes == 24192 &&
                         mmq_get_nbytes_shared(n,cc) == 22080 && bytes <= smpbo &&
                         args.nchannels_y == 1 && args.nsamples_y == 1 && args.ntj == 192 &&
-                        args.ncols_y == 2048 && args.nrows_dst == 2304 && args.stride_row_x == 72 && args.stride_channel_x == 2304*72);
-            if (trace) { GGML_LOG_INFO("INKLING_GATE_TAIL16 phys=%d virt=%d on=%d J=32 ntj=192\n", p, v, int(tail16)); }
-            if (tail16) {
+                        args.ncols_y == 2048 && args.nrows_dst == 2304 && args.stride_row_x == ne00/32 && args.stride_channel_x == 2304*(ne00/32));
+            if (report) { GGML_LOG_INFO("%s phys=%d virt=%d on=%d J=32 ntj=192\n", down ? "INKLING_DOWN_TAIL16" : "INKLING_GATE_TAIL16", p, v, int(active)); }
+            if (active) {
                 inkling_gate_j32_tail16<<<dim3(args.nrows_x/c.I, args.ntj),dim3(32,4),bytes,stream>>>(
                     args.x, args.y, args.ids_dst, args.tile_spec, args.dst, args.stride_row_x, args.stride_channel_x,
                     args.ncols_y, args.nrows_dst, args.nrows_x, args.ncols_x/ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk);
