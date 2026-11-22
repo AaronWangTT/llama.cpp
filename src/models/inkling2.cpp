@@ -2,6 +2,7 @@
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 #include "ggml-inkling-depthmix.h"
 #include "ggml-inkling-concat4.h"
+#include "ggml-inkling-mix1.h"
 #endif
 #include "../llama-memory-hybrid-iswa.h"
 
@@ -182,6 +183,23 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     ggml_tensor * states = nullptr;
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    // one token: a single op replaces the concat, norm, score, softmax and sum chain
+    if (ggml_inkling_mix1_enabled() && n_tokens == 1 && blocks.size() < (size_t) ggml_inkling_mix1_max_states &&
+            !cparams.cb_eval && !cparams.optimizer_graph && loras->empty() &&
+            model.devices.size() == 1 && !model.devices.front().is_meta &&
+            (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER)) {
+        const auto dev = model.devices.front().dev;
+        if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+            // row order of the stock concat: newest block first, cur last
+            std::vector<ggml_tensor *> rows(blocks.rbegin(), blocks.rend());
+            rows.push_back(cur);
+            ggml_context_ptr probe{ggml_init({(rows.size() + 2)*ggml_tensor_overhead(), nullptr, true})};
+            auto * candidate = ggml_inkling_try_mix1(probe.get(), rows.data(), rows.size(), query);
+            if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+                return ggml_inkling_try_mix1(ctx0, rows.data(), rows.size(), query);
+            }
+        }
+    }
     const bool raw = inkling_depthmix_raw_v2_enabled() && !cparams.cb_eval && !cparams.optimizer_graph && sched &&
         model.n_devices() == 1 && !model.devices.front().is_meta && !model.has_tensor_overrides() &&
         model.n_gpu_layers() > hparams.n_layer_all && cparams.offload_kqv && cparams.op_offload &&
@@ -347,9 +365,20 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_head  = hparams.n_embd_head_k(il);
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
+    // column j of the mixed states t, [n_embd, n_tokens]
+    auto column = [&](ggml_tensor * t, int j) {
+        ggml_tensor * view = ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], j*t->nb[1]);
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+        if (ggml_inkling_viewcol_enabled() && ggml_is_contiguous(view)) {
+            return ggml_reshape_2d(ctx0, view, n_embd, n_tokens);
+        }
+#endif
+        return ggml_cont(ctx0, view);
+    };
+
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+        return column(messages, ctrl);
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -363,7 +392,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = column(mixed, is_swa ? 0 : j);
         }
     }
 
