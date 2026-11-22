@@ -65,12 +65,16 @@ void mix1_cpu(ggml_tensor * dst, int ith, int, void *) {
 }
 } // namespace
 
-bool ggml_inkling_mix1_enabled() {
-    static const bool enabled = [] {
+int ggml_inkling_mix1_mode() {
+    static const int mode = [] {
         const char * p = std::getenv("GGML_INKLING_MIX1");
-        return p && std::strcmp(p, "1") == 0;
+        return !p ? 0 : std::strcmp(p, "1") == 0 ? 1 : std::strcmp(p, "2") == 0 ? 2 : 0;
     }();
-    return enabled;
+    return mode;
+}
+
+bool ggml_inkling_mix1_enabled() {
+    return ggml_inkling_mix1_mode() != 0;
 }
 
 bool ggml_inkling_viewcol_enabled() {
