@@ -5,6 +5,7 @@
 #include "ggml-inkling-mix1.h"
 #include "ggml-inkling-conv1.h"
 #include "ggml-inkling-bias1.h"
+#include "ggml-inkling-mvstack.h"
 #endif
 #include "../llama-memory-hybrid-iswa.h"
 
@@ -445,14 +446,44 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
     }
 
+    // the projections of inputs[0]; a one-token graph can take them from one stacked op
+    std::vector<ggml_tensor *> stacked;
+    ggml_tensor * stack = nullptr;
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    if (ggml_inkling_mvstack_enabled() && n_tokens == 1 && !hdmd) {
+        if (const auto dev = inkling_one_token_dev(cparams, model, loras)) {
+            stacked = {layer.wq, layer.attn_rel, layer.attn_sink_proj, layer.wqkv_gate};
+            if (inputs[1] == inputs[0] && inputs[2] == inputs[0]) {
+                stacked.push_back(layer.wk);
+                stacked.push_back(layer.wv);
+            }
+            ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+            auto * candidate = ggml_inkling_try_mvstack(probe.get(), stacked.data(), stacked.size(), inputs[0]);
+            if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+                stack = ggml_inkling_try_mvstack(ctx0, stacked.data(), stacked.size(), inputs[0]);
+            }
+        }
+    }
+#endif
+    auto project = [&](ggml_tensor * w, ggml_tensor * x) {
+        size_t offs = 0;
+        for (ggml_tensor * m : stacked) {
+            if (stack && m == w) {
+                return ggml_view_1d(ctx0, stack, w->ne[1], offs);
+            }
+            offs += m->ne[1]*sizeof(float);
+        }
+        return build_lora_mm(w, x);
+    };
+
     // self-attention
     {
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
+        ggml_tensor * Qcur = project(layer.wq, inputs[0]);
+        ggml_tensor * Kcur = convolve(project(layer.wk, inputs[1]), layer.attn_k_conv,
                 is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
+        ggml_tensor * Vcur = convolve(project(layer.wv, inputs[2]), layer.attn_v_conv,
                 is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
-        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+        ggml_tensor * Rcur = project(layer.attn_rel, inputs[0]);
 
         Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
         Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
@@ -474,7 +505,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
         const int64_t n_kv     = rel_pos->ne[0];
 
-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        ggml_tensor * sinks = project(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
@@ -509,7 +540,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
 
-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, project(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
     }

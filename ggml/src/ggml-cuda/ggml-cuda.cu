@@ -20,6 +20,7 @@
 #include "ggml-cuda/inkling-mix1.cuh"
 #include "ggml-cuda/inkling-conv1.cuh"
 #include "ggml-cuda/inkling-bias1.cuh"
+#include "ggml-cuda/inkling-mvstack.cuh"
 #endif
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
@@ -2901,6 +2902,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 inkling_conv1_launch(ctx, dst);
             } else if (inkling_bias1_supported(ctx.device, dst)) {
                 inkling_bias1_launch(ctx, dst);
+            } else if (inkling_mvstack_supported(ctx.device, dst)) {
+                inkling_mvstack_launch(ctx, dst);
             } else {
                 return false;
             }
@@ -6691,7 +6694,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
         case GGML_OP_CUSTOM:
             return inkling_concat4_supported(dev_ctx->device, op) || inkling_mix1_supported(dev_ctx->device, op) ||
-                inkling_conv1_supported(dev_ctx->device, op) || inkling_bias1_supported(dev_ctx->device, op);
+                inkling_conv1_supported(dev_ctx->device, op) || inkling_bias1_supported(dev_ctx->device, op) ||
+                inkling_mvstack_supported(dev_ctx->device, op);
 #endif
         case GGML_OP_CONCAT:
             {
