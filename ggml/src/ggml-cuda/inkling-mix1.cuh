@@ -147,6 +147,7 @@ static __global__ void inkling_mix1x(const float * query, const inkling_mix1_sta
     __shared__ float red_norm[ns][WARP_SIZE];
     __shared__ float red_score[ns*nq][score_warps];
 
+    // all loads first, so that they overlap (loads in a chain took most of the kernel time)
     float x[ns][4];
 #pragma unroll
     for (int s = 0; s < ns; ++s) {
@@ -154,6 +155,31 @@ static __global__ void inkling_mix1x(const float * query, const inkling_mix1_sta
         for (int k = 0; k < 4; ++k) {
             x[s][k] = st.s[s][4*tid + k];
         }
+    }
+    // threads 0 .. 255 are the block of the stock score kernel, thread t owns the pairs t, t + 256, ...
+    float sq[nq][score_iter][2];
+    float sx[ns][score_iter][2];
+    if (tid < score_block) {
+#pragma unroll
+        for (int i = 0; i < score_iter; ++i) {
+            const int col = 2*(tid + i*score_block);
+            if (col < inkling_mix1x_embd) {
+#pragma unroll
+                for (int j = 0; j < nq; ++j) {
+                    sq[j][i][0] = query[j*n_embd + col];
+                    sq[j][i][1] = query[j*n_embd + col + 1];
+                }
+#pragma unroll
+                for (int s = 0; s < ns; ++s) {
+                    sx[s][i][0] = st.s[s][col];
+                    sx[s][i][1] = st.s[s][col + 1];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int s = 0; s < ns; ++s) {
         float tmp = fmaf(x[s][3], x[s][3], fmaf(x[s][2], x[s][2], fmaf(x[s][0], x[s][0], x[s][1]*x[s][1])));
         tmp = warp_reduce_sum(tmp);
         if (lane == 0) {
@@ -170,7 +196,6 @@ static __global__ void inkling_mix1x(const float * query, const inkling_mix1_sta
         scale[s] = rsqrtf(tmp / n_embd + ggml_inkling_mix1_eps);
     }
 
-    // threads 0 .. 255 are the block of the stock score kernel, thread t owns the pairs t, t + 256, ...
     if (tid < score_block) {
         float sum[ns][nq];
 #pragma unroll
@@ -186,12 +211,12 @@ static __global__ void inkling_mix1x(const float * query, const inkling_mix1_sta
             if (col < inkling_mix1x_embd) {
 #pragma unroll
                 for (int s = 0; s < ns; ++s) {
-                    const float x0 = scale[s]*st.s[s][col];
-                    const float x1 = scale[s]*st.s[s][col + 1];
+                    const float x0 = scale[s]*sx[s][i][0];
+                    const float x1 = scale[s]*sx[s][i][1];
 #pragma unroll
                     for (int j = 0; j < nq; ++j) {
-                        sum[s][j] = fmaf(x0, query[j*n_embd + col],     sum[s][j]);
-                        sum[s][j] = fmaf(x1, query[j*n_embd + col + 1], sum[s][j]);
+                        sum[s][j] = fmaf(x0, sq[j][i][0], sum[s][j]);
+                        sum[s][j] = fmaf(x1, sq[j][i][1], sum[s][j]);
                     }
                 }
             }
