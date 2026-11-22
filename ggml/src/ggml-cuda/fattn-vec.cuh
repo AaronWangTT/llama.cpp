@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "inkling-headorder.cuh"
+#include "inkling-fagqa.cuh"
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -584,6 +585,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
     const fattn_kernel_t split_ref = fattn_kernel;
     bool check_geometry = false;
+    bool block_per_kv_head = false;
 #if defined(GGML_USE_HIP)
     if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap) {
         const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
@@ -603,7 +605,16 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
                     const char * epi   = getenv("GGML_INKLING_MASKEPI");
                     return order && strcmp(order, "1") == 0 && epi && strcmp(epi, "1") == 0;
                 }();
-                if (reorder) {
+                static const bool fagqa = [] { const char * s = getenv("GGML_INKLING_FAGQA"); return s && strcmp(s, "1") == 0; }();
+                if (fagqa) {
+                    // One block per KV head and split. It takes the 3 query heads from one load of each K and V row.
+                    fattn_kernel = inkling_fagqa_vec<D, 3>;
+                    block_per_kv_head = true;
+                    static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
+                    if (trace_fagqa) {
+                        GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
+                    }
+                } else if (reorder) {
                     fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, true>;
                     static const bool trace_order = getenv("GGML_INKLING_HEADORDER_TRACE") != nullptr;
                     if (trace_order) {
@@ -619,7 +630,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, split_ref, check_geometry);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, split_ref, check_geometry, block_per_kv_head);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

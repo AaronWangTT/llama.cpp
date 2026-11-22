@@ -1037,7 +1037,7 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
-    fattn_kernel_t split_reference = nullptr, const bool check_geometry = false
+    fattn_kernel_t split_reference = nullptr, const bool check_geometry = false, const bool block_per_kv_head = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1054,6 +1054,7 @@ void launch_fattn(
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
     GGML_ASSERT(!kv_rows || !use_sparse);
+    GGML_ASSERT(!block_per_kv_head || !stream_k);
 
     ggml_tensor * KQV = dst;
 
@@ -1292,6 +1293,11 @@ void launch_fattn(
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+        if (block_per_kv_head) {
+            // The kernel takes all query heads of a KV head in one block. The split plan stays the one for one head per block.
+            GGML_ASSERT(ncols2 == 1);
+            blocks_num.z = K->ne[2]*Q->ne[3];
+        }
 
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
