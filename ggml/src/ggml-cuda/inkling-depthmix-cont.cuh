@@ -1,5 +1,6 @@
 #pragma once
 #include "ggml-inkling-depthmix.h"
+#include "ggml-inkling-concat4.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
 #error "Compile this private MMVF experiment for gfx1103 only"
@@ -81,7 +82,9 @@ static bool depthmix_pattern(const ggml_tensor * x, const ggml_tensor * w, const
     const auto * tr = x->src[0];
     const auto * n = tr ? tr->src[0] : nullptr;
     if (!depthmix_layout(n, D, s, T) || n->op != GGML_OP_RMS_NORM || ggml_get_op_params_f32(n, 0) != 1.e-6f ||
-            !depthmix_layout(n->src[0], D, s, T) || n->src[0]->op != GGML_OP_CONCAT || ggml_get_op_params_i32(n->src[0], 0) != 1 ||
+            !depthmix_layout(n->src[0], D, s, T) ||
+            !((n->src[0]->op == GGML_OP_CONCAT && ggml_get_op_params_i32(n->src[0], 0) == 1) ||
+              (s == 4 && ggml_inkling_is_concat4(n->src[0]))) ||
             tr->op != GGML_OP_TRANSPOSE || tr->type != GGML_TYPE_F32 || tr->view_src != n || tr->view_offs ||
             tr->ne[0] != s || tr->ne[1] != D || tr->ne[2] != T || tr->ne[3] != 1 ||
             tr->nb[0] != n->nb[1] || tr->nb[1] != n->nb[0] || tr->nb[2] != n->nb[2] || tr->nb[3] != n->nb[3]) {

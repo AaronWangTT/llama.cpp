@@ -15,6 +15,9 @@
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+#include "ggml-cuda/inkling-concat4.cuh"
+#endif
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
@@ -2884,6 +2887,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_L2_NORM:
             ggml_cuda_op_l2_norm(ctx, dst);
             break;
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+        case GGML_OP_CUSTOM:
+            if (!inkling_concat4_supported(ctx.device, dst)) {
+                return false;
+            }
+            inkling_concat4_launch(ctx, dst);
+            break;
+#endif
         case GGML_OP_CONCAT:
             ggml_cuda_op_concat(ctx, dst);
             break;
@@ -6666,6 +6677,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_REPEAT_BACK:
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+        case GGML_OP_CUSTOM:
+            return inkling_concat4_supported(dev_ctx->device, op);
+#endif
         case GGML_OP_CONCAT:
             {
                 ggml_type src0_type = op->src[0]->type;

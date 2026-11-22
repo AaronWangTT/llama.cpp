@@ -1,6 +1,7 @@
 #include "models.h"
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 #include "ggml-inkling-depthmix.h"
+#include "ggml-inkling-concat4.h"
 #endif
 #include "../llama-memory-hybrid-iswa.h"
 
@@ -179,9 +180,43 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+    ggml_tensor * states = nullptr;
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    const bool raw = inkling_depthmix_raw_v2_enabled() && !cparams.cb_eval && !cparams.optimizer_graph && sched &&
+        model.n_devices() == 1 && !model.devices.front().is_meta && !model.has_tensor_overrides() &&
+        model.n_gpu_layers() > hparams.n_layer_all && cparams.offload_kqv && cparams.op_offload &&
+        (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER) &&
+        !cparams.ctx_other && !cparams.ctx_state_src && !cparams.pipeline_parallel && !cparams.moe_cache_size;
+    const bool want_pack = ggml_inkling_concat4_enabled() && blocks.size() == 3 && !cparams.cb_eval && !cparams.optimizer_graph;
+    bool eligible = (inkling_depthmix_enabled() || want_pack || raw) && n_embd == 2304 && n_tokens == 256 &&
+        (blocks.size() == 1 || blocks.size() == 3) && (query->ne[1] == 1 || query->ne[1] == 3 || query->ne[1] == 4) &&
+        ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.n_seq_tokens == 256 && loras->empty();
+    for (uint32_t il = 0; eligible && il < hparams.n_layer(); ++il) {
+        eligible = !cvec->tensor_for(il);
+    }
+    if (eligible && want_pack && model.devices.size() == 1 && !model.devices.front().is_meta &&
+            (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER)) {
+        const auto dev = model.devices.front().dev;
+        if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+            // The intermediate concats are private temporaries of the loop below;
+            // don't create them in the first place. No scan or deletion of arbitrary graph nodes.
+            // A rejecting plugin must not spend any of the fixed graph metadata arena.
+            ggml_context_ptr probe{ggml_init({5*ggml_tensor_overhead(), nullptr, true})};
+            auto make_pack = [&](ggml_context * ctx) {
+                return ggml_inkling_try_concat4(ctx, blocks[0], blocks[1], blocks[2], cur);
+            };
+            auto * candidate = make_pack(probe.get());
+            if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+                states = make_pack(ctx0);
+            }
+        }
+    }
+#endif
+    if (!states) {
+        states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+        for (ggml_tensor * block : blocks) {
+            states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+        }
     }
     states = ggml_rms_norm(ctx0, states, 1e-6f);
 
@@ -194,18 +229,7 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
         return ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
     };
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
-    const bool raw = inkling_depthmix_raw_v2_enabled() && !cparams.cb_eval && !cparams.optimizer_graph && sched &&
-        model.n_devices() == 1 && !model.devices.front().is_meta && !model.has_tensor_overrides() &&
-        model.n_gpu_layers() > hparams.n_layer_all && cparams.offload_kqv && cparams.op_offload &&
-        (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER) &&
-        !cparams.ctx_other && !cparams.ctx_state_src && !cparams.pipeline_parallel && !cparams.moe_cache_size;
-    if ((raw || inkling_depthmix_enabled()) && n_embd == 2304 && n_tokens == 256 &&
-            (states->ne[1] == 2 || states->ne[1] == 4) &&
-            (query->ne[1] == 1 || query->ne[1] == 3 || query->ne[1] == 4) &&
-            ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.n_seq_tokens == 256 && loras->empty()) {
-        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-            if (cvec->tensor_for(il)) { return original(ctx0); }
-        }
+    if (eligible) {
         if (raw) {
             auto * backend = ggml_backend_sched_get_backend(sched, 0);
             auto * dev = ggml_backend_get_device(backend);
