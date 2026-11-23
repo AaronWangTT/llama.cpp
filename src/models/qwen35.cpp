@@ -2,13 +2,14 @@
 #include "llama-memory-recurrent.h"
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
+#include "ggml-qwen35-convpf.h"
 #include "ggml-qwen35-decode.h"
 
 #include <cstring>
 
-// the one-token ops exist on a single ROCm device only; returns that device or nullptr
+// the fused ops exist on a single ROCm device only; returns that device or nullptr
 // not with tensor overrides: an op next to a weight in host memory can go to the CPU backend, the new state is then lost
-static ggml_backend_dev_t qwen35_one_token_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
+static ggml_backend_dev_t qwen35_rocm_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
     if (cparams.cb_eval || cparams.optimizer_graph || !loras->empty() || model.devices.size() != 1 || model.devices.front().is_meta ||
             model.has_tensor_overrides() ||
             (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
@@ -409,7 +410,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * output = nullptr;
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
     const auto dev_one = n_seq_tokens == 1 && n_seqs == 1 && cparams.n_rs_seq == 0 && mctx_cur->get_n_rs() == 1 ?
-        qwen35_one_token_dev(cparams, model, loras) : nullptr;
+        qwen35_rocm_dev(cparams, model, loras) : nullptr;
     // a layer that is not on that device keeps the stock ops
     const auto dev = dev_one && model.dev_layer(il) == dev_one ? dev_one : nullptr;
     const size_t fs = sizeof(float);
@@ -518,7 +519,40 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
     }
 
-    ggml_tensor * conv_input = prep ? nullptr : build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    ggml_tensor * conv_output_silu = nullptr;
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    // many tokens of one sequence: one op reads the conv state and qkv_mixed, there is no concat tensor
+    if (!prep && ggml_qwen35_convpf_enabled() && n_seqs == 1 && n_seq_tokens >= ggml_qwen35_convpf_min_n_tokens && cparams.n_rs_seq == 0 &&
+            conv_kernel_size == ggml_qwen35_convpf_n_conv && qkv_mixed->ne[0] == conv_channels) {
+        // a layer that is not on that device keeps the stock ops
+        if (const auto dev_pf = qwen35_rocm_dev(cparams, model, loras); dev_pf && model.dev_layer(il) == dev_pf) {
+            ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+            ggml_tensor * past = ggml_new_tensor_2d(probe.get(), GGML_TYPE_F32, conv_kernel_size - 1, conv_channels);
+            auto * candidate = ggml_qwen35_try_convpf(probe.get(), qkv_mixed, past, conv_kernel);
+            if (candidate && ggml_backend_dev_supports_op(dev_pf, candidate)) {
+                ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+                cb(conv_states, "conv_states", il);
+
+                conv_states = ggml_reshape_2d(ctx0, conv_states, conv_kernel_size - 1, conv_channels);
+
+                conv_output_silu = ggml_qwen35_try_convpf(ctx0, qkv_mixed, conv_states, conv_kernel);
+                GGML_ASSERT(conv_output_silu != nullptr);
+                // the op reads the old state, so it goes into the graph before the store of the new state
+                ggml_build_forward_expand(gf, conv_output_silu);
+
+                // new state: the last tokens of qkv_mixed, the same values as the tail of the concat tensor
+                ggml_tensor * last = ggml_view_3d(ctx0, qkv_mixed, conv_channels, conv_kernel_size - 1, n_seqs,
+                        qkv_mixed->nb[1], qkv_mixed->nb[2], (n_seq_tokens - (conv_kernel_size - 1))*qkv_mixed->nb[1]);
+                ggml_tensor * cell = ggml_view_2d(ctx0, conv_states_all, (conv_kernel_size - 1)*conv_channels, n_seqs,
+                        conv_states_all->nb[1], mctx_cur->get_head()*conv_states_all->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_transpose(ctx0, last), cell));
+            }
+        }
+    }
+#endif
+
+    ggml_tensor * conv_input = prep || conv_output_silu ? nullptr : build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
     // with the fused delta net the state stays in the cache: no copy of it here
@@ -535,10 +569,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     }
 
     if (!prep) {
-        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-        cb(conv_output_proper, "conv_output_raw", il);
+        if (!conv_output_silu) {
+            ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+            cb(conv_output_proper, "conv_output_raw", il);
 
-        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+            conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        }
         cb(conv_output_silu, "conv_output_silu", il);
 
         ggml_tensor * conv_qkv_mix = conv_output_silu;

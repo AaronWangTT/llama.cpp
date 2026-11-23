@@ -2120,6 +2120,8 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
+#include "qwen35-pfattn.cuh"
+
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -2216,6 +2218,36 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             shared_memory_limit_raised[id] = true;
         }
     }
+
+#if defined(GGML_USE_HIP)
+    // GGML_QWEN35_PFATTN=1: prefill kernel for head size 256 with 4 query heads per KV head on gfx1103 (qwen35-pfattn.cuh), same results.
+    if constexpr (DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4) {
+        static const bool pf_enabled = [] { const char * s = getenv("GGML_QWEN35_PFATTN"); return s && atoi(s) == 1; }();
+        if (pf_enabled && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && logit_softcap == 0.0f && !use_sparse &&
+                KQV->src[3] != nullptr && KQV->src[4] == nullptr) {
+            const fattn_kernel_t pf_kernel = qwen35_pfattn_f16<DKQ, DV, ncols1, ncols2>;
+
+            // The work split of launch_fattn depends on the occupancy: take the kernel only if it splits like the generic one.
+            static int same_split[GGML_CUDA_MAX_DEVICES] = {0};
+            if (same_split[id] == 0) {
+                int occupancy_ref = 0;
+                int occupancy_pf  = 0;
+                CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy_ref, fattn_kernel, nthreads, nbytes_shared_total));
+                CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy_pf,  pf_kernel,    nthreads, QWEN35_PF_NBYTES_SHARED));
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(pf_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, QWEN35_PF_NBYTES_SHARED));
+                same_split[id] = occupancy_ref == occupancy_pf ? 1 : -1;
+                if (same_split[id] < 0) {
+                    GGML_LOG_WARN("%s: GGML_QWEN35_PFATTN is not used, occupancy %d instead of %d\n", __func__, occupancy_pf, occupancy_ref);
+                }
+            }
+            if (same_split[id] > 0) {
+                launch_fattn<DV, ncols1, ncols2>
+                    (ctx, dst, pf_kernel, nwarps, QWEN35_PF_NBYTES_SHARED, nbatch_fa, true, true, true, false, warp_size_host, false);
+                return;
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     const bool async_kv_preload = nstages == 2 && !use_sparse;
     launch_fattn<DV, ncols1, ncols2>

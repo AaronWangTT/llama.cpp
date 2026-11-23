@@ -23,6 +23,7 @@
 #include "ggml-cuda/inkling-mvstack.cuh"
 #include "ggml-cuda/inkling-ctrl1.cuh"
 #include "ggml-cuda/inkling-pfmm.cuh"
+#include "ggml-cuda/qwen35-convpf.cuh"
 #endif
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
@@ -2435,8 +2436,17 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
         return false;
     }
 
+    const int cc = ggml_cuda_info().devices[device].cc;
+#if defined(GGML_USE_HIP)
+    // GGML_QWEN35_GLUFUSE=1: fused dense gate/up/GLU on gfx1103. Its WMMA accumulators pair up the rows r and r + 8 like the MMA ones (same results).
+    if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && up->op == GGML_OP_MUL_MAT && !up_scale && !gate_scale) {
+        static const bool glu_fuse = [] { const char * s = getenv("GGML_QWEN35_GLUFUSE"); return s && atoi(s) == 1; }();
+        return glu_fuse;
+    }
+#endif // defined(GGML_USE_HIP)
+
     // NVIDIA only: the fused write-back relies on the MMA accumulator layout.
-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
+    return turing_mma_available(cc);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu,
@@ -2941,6 +2951,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 qwen35_gdn1_launch(ctx, dst);
             } else if (qwen35_post1_supported(ctx.device, dst)) {
                 qwen35_post1_launch(ctx, dst);
+            } else if (qwen35_convpf_supported(ctx.device, dst)) {
+                qwen35_convpf_launch(ctx, dst);
             } else {
                 return false;
             }
@@ -6734,7 +6746,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 inkling_conv1_supported(dev_ctx->device, op) || inkling_bias1_supported(dev_ctx->device, op) ||
                 inkling_mvstack_supported(dev_ctx->device, op) || inkling_ctrl1_supported(dev_ctx->device, op) ||
                 qwen35_mvshare_supported(dev_ctx->device, op) || qwen35_prep1_supported(dev_ctx->device, op) ||
-                qwen35_gdn1_supported(dev_ctx->device, op) || qwen35_post1_supported(dev_ctx->device, op);
+                qwen35_gdn1_supported(dev_ctx->device, op) || qwen35_post1_supported(dev_ctx->device, op) ||
+                qwen35_convpf_supported(dev_ctx->device, op);
 #endif
         case GGML_OP_CONCAT:
             {

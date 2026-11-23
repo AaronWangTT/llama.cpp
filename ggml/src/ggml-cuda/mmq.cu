@@ -608,6 +608,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (amd_wmma_available(cc)) {
+        // GGML_QWEN35_Q6K_MMQ=1: Q6_K takes MMQ at any batch size on gfx1103 (other numbers than dequantization + hipBLAS).
+        if (type == GGML_TYPE_Q6_K && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103) {
+            static const bool q6k_mmq = [] { const char * s = getenv("GGML_QWEN35_Q6K_MMQ"); return s && atoi(s) == 1; }();
+            if (q6k_mmq) {
+                return true;
+            }
+        }
         if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
             // High expert counts are almost always better on MMQ due to
             //     the synchronization overhead in the cuBLAS/hipBLAS path:
