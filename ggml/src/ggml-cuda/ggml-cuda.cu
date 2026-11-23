@@ -22,6 +22,7 @@
 #include "ggml-cuda/inkling-bias1.cuh"
 #include "ggml-cuda/inkling-mvstack.cuh"
 #include "ggml-cuda/inkling-ctrl1.cuh"
+#include "ggml-cuda/inkling-pfmm.cuh"
 #endif
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
@@ -2495,6 +2496,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+    if (inkling_pfmm_supported(ctx.device, src0, src1, dst)) {
+        inkling_pfmm_launch(ctx, src0, src1, dst);
+        return;
+    }
     // F32 accumulation of a BF16 weight takes the kernels of an F32 weight; MMF and the BF16 GEMM round src1
     if (src0->type == GGML_TYPE_BF16 && ggml_prec_get_acc(dst) == GGML_PREC_F32 && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103) {
         const size_t ts = ggml_type_size(src0->type);
