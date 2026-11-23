@@ -83,6 +83,9 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+#include "ggml-cuda/qwen35-decode.cuh"
+#endif
 #include "ggml.h"
 
 #include <algorithm>
@@ -2930,6 +2933,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 inkling_mvstack_launch(ctx, dst);
             } else if (inkling_ctrl1_supported(ctx.device, dst)) {
                 inkling_ctrl1_launch(ctx, dst);
+            } else if (qwen35_mvshare_supported(ctx.device, dst)) {
+                qwen35_mvshare_launch(ctx, dst);
+            } else if (qwen35_prep1_supported(ctx.device, dst)) {
+                qwen35_prep1_launch(ctx, dst);
+            } else if (qwen35_gdn1_supported(ctx.device, dst)) {
+                qwen35_gdn1_launch(ctx, dst);
+            } else if (qwen35_post1_supported(ctx.device, dst)) {
+                qwen35_post1_launch(ctx, dst);
             } else {
                 return false;
             }
@@ -6721,7 +6732,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CUSTOM:
             return inkling_concat4_supported(dev_ctx->device, op) || inkling_mix1_supported(dev_ctx->device, op) ||
                 inkling_conv1_supported(dev_ctx->device, op) || inkling_bias1_supported(dev_ctx->device, op) ||
-                inkling_mvstack_supported(dev_ctx->device, op) || inkling_ctrl1_supported(dev_ctx->device, op);
+                inkling_mvstack_supported(dev_ctx->device, op) || inkling_ctrl1_supported(dev_ctx->device, op) ||
+                qwen35_mvshare_supported(dev_ctx->device, op) || qwen35_prep1_supported(dev_ctx->device, op) ||
+                qwen35_gdn1_supported(dev_ctx->device, op) || qwen35_post1_supported(dev_ctx->device, op);
 #endif
         case GGML_OP_CONCAT:
             {

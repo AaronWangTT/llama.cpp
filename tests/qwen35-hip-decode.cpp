@@ -1,0 +1,334 @@
+// Fixture for the one-token ops of the gated delta net blocks (ggml-qwen35-decode.h).
+// Each fused op on ROCm0 must match the stock ops it replaces bit for bit, also when the state row of the sequence
+// is not the cell that gets the new state. The CPU callbacks must stay close to the stock ops on CPU.
+//   GGML_QWEN35_MVSHARE=1 GGML_QWEN35_PREP1=1 GGML_QWEN35_GDN1=1 GGML_QWEN35_POST1=1 qwen35-hip-decode ABS_LIBDIR
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-qwen35-decode.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <vector>
+
+// sizes of qwen3.5-4b
+constexpr int N       = 2560;
+constexpr int S       = ggml_qwen35_head_dim;
+constexpr int H_K     = 16;
+constexpr int H       = 32;
+constexpr int KEY     = S*H_K;
+constexpr int VAL     = S*H;
+constexpr int C       = 2*KEY + VAL;
+constexpr int N_CONV  = ggml_qwen35_n_conv;
+constexpr int N_CELLS = 3;
+constexpr int D_R     = (N_CONV - 1)*C;
+constexpr int D_S     = S*S*H;
+constexpr float EPS   = 1e-6f;
+
+enum { FUSE_MVSHARE = 1, FUSE_PREP1 = 2, FUSE_GDN1 = 4, FUSE_POST1 = 8, FUSE_ALL = 15 };
+
+static void check(bool ok, const char * what) {
+    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); std::exit(1); }
+}
+
+// weights and state caches of one backend
+struct model {
+    ggml_backend_t  be;
+    ggml_context *  ctx_w;
+    ggml_context *  ctx_s;
+    ggml_tensor *   w[4]; // qkv, z, beta, alpha
+    ggml_tensor *   conv_w, * dt, * a, * norm_w;
+    ggml_tensor *   r, * s;
+};
+
+struct inputs {
+    std::vector<float> x, r, s;
+    int row;  // state row of the sequence
+    int cell; // row that gets the new state
+};
+
+// one result vector: products, q and k, v, beta, gate, attention output, gated norm, conv state row, delta net state row
+constexpr int N_SEG = 9;
+constexpr int SEG_N[N_SEG] = { C + VAL + 2*H, 2*KEY, VAL, H, H, VAL, VAL, D_R, D_S };
+static const char * const SEG_NAME[N_SEG] = { "products", "qk", "v", "beta", "gate", "attn", "post", "conv state", "state" };
+
+static std::vector<float> run(const model & m, int fuse, const inputs & in) {
+    ggml_backend_t be = m.be;
+    ggml_context * c  = ggml_init({128*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+    ggml_cgraph *  gf = ggml_new_graph(c);
+    const size_t   fs = sizeof(float);
+
+    ggml_tensor * x   = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, 1); ggml_set_input(x);
+    ggml_tensor * ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);    ggml_set_input(ids);
+
+    auto cell_of = [&](ggml_tensor * states) {
+        return ggml_view_2d(c, states, states->ne[0], 1, states->nb[1], in.cell*states->nb[1]);
+    };
+    auto fused_op = [&](ggml_tensor * op, bool is_op) {
+        check(op && is_op && ggml_backend_supports_op(be, op), "the backend must take the fused op");
+        ggml_set_output(op);
+        return op;
+    };
+
+    // products, as in build_qkvz() and build_layer_attn_linear()
+    std::vector<ggml_tensor *> prod;
+    ggml_tensor * qkv, * z, * beta, * alpha;
+    if (fuse & FUSE_MVSHARE) {
+        ggml_tensor * w[4] = { m.w[0], m.w[1], m.w[2], m.w[3] };
+        ggml_tensor * shared = ggml_qwen35_try_mvshare(c, w, 4, x);
+        prod  = { fused_op(shared, ggml_qwen35_is_mvshare(shared)) };
+        qkv   = ggml_view_3d(c, shared, C, 1, 1, C*fs, C*fs, 0);
+        z     = ggml_view_2d(c, shared, VAL, 1, VAL*fs, C*fs);
+        beta  = ggml_view_4d(c, shared, 1, H, 1, 1, fs, H*fs, H*fs, (C + VAL)*fs);
+        alpha = ggml_view_3d(c, shared, H, 1, 1, H*fs, H*fs, (C + VAL + H)*fs);
+    } else {
+        for (int j = 0; j < 4; ++j) {
+            prod.push_back(ggml_mul_mat(c, m.w[j], x));
+            ggml_set_output(prod.back());
+        }
+        qkv   = ggml_reshape_3d(c, prod[0], C, 1, 1);
+        z     = prod[1];
+        beta  = ggml_reshape_4d(c, prod[2], 1, H, 1, 1);
+        alpha = ggml_reshape_3d(c, prod[3], H, 1, 1);
+    }
+    ggml_build_forward_expand(gf, z);
+
+    // inputs of the delta net
+    std::vector<ggml_tensor *> prep;
+    ggml_tensor * q, * k, * v, * gate;
+    if (fuse & FUSE_PREP1) {
+        ggml_tensor * op = ggml_qwen35_try_prep1(c, qkv, beta, alpha, m.conv_w, m.dt, m.a, m.r, ids, cell_of(m.r),
+                2*KEY, EPS/(float) S, 1.0f/sqrtf((float) S));
+        prep = { fused_op(op, ggml_qwen35_is_prep1(op)) };
+        q    = ggml_view_4d(c, op, S, H_K, 1, 1, S*fs, KEY*fs, KEY*fs, 0);
+        k    = ggml_view_4d(c, op, S, H_K, 1, 1, S*fs, KEY*fs, KEY*fs, KEY*fs);
+        v    = ggml_view_4d(c, op, S, H,   1, 1, S*fs, VAL*fs, VAL*fs, 2*KEY*fs);
+        beta = ggml_view_4d(c, op, 1, H, 1, 1, fs, H*fs, H*fs, C*fs);
+        gate = ggml_view_4d(c, op, 1, H, 1, 1, fs, H*fs, H*fs, (C + H)*fs);
+    } else {
+        beta = ggml_sigmoid(c, beta);
+        gate = ggml_mul(c, ggml_softplus(c, ggml_add(c, alpha, m.dt)), m.a);
+        ggml_tensor * gate_out = gate;
+        gate = ggml_reshape_4d(c, gate, 1, H, 1, 1);
+
+        // build_conv_state()
+        ggml_tensor * past = ggml_get_rows(c, m.r, ids);
+        ggml_build_forward_expand(gf, past);
+        past = ggml_reshape_3d(c, past, N_CONV - 1, C, 1);
+        ggml_tensor * conv_x = ggml_concat(c, past, ggml_transpose(c, qkv), 0);
+        ggml_tensor * last   = ggml_view_3d(c, conv_x, N_CONV - 1, C, 1, conv_x->nb[1], conv_x->nb[2], fs);
+        ggml_build_forward_expand(gf, ggml_cpy(c, last, cell_of(m.r)));
+
+        ggml_tensor * conv = ggml_silu(c, ggml_ssm_conv(c, conv_x, m.conv_w));
+        q = ggml_view_4d(c, conv, S, H_K, 1, 1, S*fs, C*fs, C*fs, 0);
+        k = ggml_view_4d(c, conv, S, H_K, 1, 1, S*fs, C*fs, C*fs, KEY*fs);
+        v = ggml_view_4d(c, conv, S, H,   1, 1, S*fs, C*fs, C*fs, 2*KEY*fs);
+        q = ggml_scale(c, ggml_rms_norm(c, q, EPS/(float) S), 1.0f/sqrtf((float) S));
+        k = ggml_scale(c, ggml_rms_norm(c, k, EPS/(float) S), 1.0f/sqrtf((float) S));
+        // only the last node of each backend fusion is an output
+        prep = { q, k, conv, beta, gate_out };
+        for (ggml_tensor * t : prep) {
+            ggml_set_output(t);
+        }
+    }
+
+    // delta net
+    ggml_tensor * out;
+    if (fuse & FUSE_GDN1) {
+        out = ggml_qwen35_try_gdn1(c, q, k, v, gate, beta, m.s, ids, cell_of(m.s));
+        fused_op(out, ggml_qwen35_is_gdn1(out));
+    } else {
+        // build_rs() and build_recurrent_attn()
+        ggml_tensor * state = ggml_get_rows(c, m.s, ids);
+        ggml_build_forward_expand(gf, state);
+        state = ggml_reshape_4d(c, state, S, S, H, 1);
+        ggml_tensor * res = ggml_gated_delta_net(c, q, k, v, gate, beta, state, 1);
+        ggml_tensor * new_state = ggml_view_4d(c, res, S, S, H, 1, S*fs, S*S*fs, D_S*fs, VAL*fs);
+        ggml_build_forward_expand(gf, ggml_cpy(c, new_state, cell_of(m.s)));
+        out = ggml_view_4d(c, res, S, H, 1, 1, S*fs, VAL*fs, VAL*fs, 0);
+    }
+
+    // gated norm, as in build_norm_gated()
+    ggml_tensor * z_2d = ggml_view_4d(c, z, S, H, 1, 1, S*fs, VAL*fs, VAL*fs, 0);
+    ggml_tensor * post;
+    if (fuse & FUSE_POST1) {
+        post = ggml_qwen35_try_post1(c, out, m.norm_w, z_2d, EPS);
+        fused_op(post, ggml_qwen35_is_post1(post));
+    } else {
+        post = ggml_mul(c, ggml_mul(c, ggml_rms_norm(c, out, EPS), m.norm_w), ggml_silu(c, z_2d));
+        ggml_set_output(post);
+    }
+    ggml_build_forward_expand(gf, post);
+    // the delta net output is a view of the op result in the stock graph: read it through a copy
+    ggml_tensor * out_copy = ggml_cont(c, out);
+    ggml_set_output(out_copy);
+    ggml_build_forward_expand(gf, out_copy);
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+    check(ggml_gallocr_alloc_graph(ga, gf), "alloc");
+    const int32_t row = in.row;
+    ggml_backend_tensor_set(x,   in.x.data(), 0, N*fs);
+    ggml_backend_tensor_set(ids, &row,        0, sizeof(row));
+    ggml_backend_tensor_set(m.r, in.r.data(), 0, in.r.size()*fs);
+    ggml_backend_tensor_set(m.s, in.s.data(), 0, in.s.size()*fs);
+    check(ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS, "compute");
+
+    std::vector<float> res;
+    auto append = [&](const ggml_tensor * t, size_t offs, size_t n) {
+        res.resize(res.size() + n);
+        ggml_backend_tensor_get(t, res.data() + res.size() - n, offs*fs, n*fs);
+    };
+    for (const ggml_tensor * t : prod) {
+        append(t, 0, ggml_nelements(t));
+    }
+    if (fuse & FUSE_PREP1) {
+        append(prep[0], 0, C + 2*H);
+    } else {
+        append(prep[0], 0,     KEY);
+        append(prep[1], 0,     KEY);
+        append(prep[2], 2*KEY, VAL);
+        append(prep[3], 0,     H);
+        append(prep[4], 0,     H);
+    }
+    append(out_copy, 0,         VAL);
+    append(post, 0,             VAL);
+    append(m.r, in.cell*D_R,    D_R);
+    append(m.s, (size_t) in.cell*D_S, D_S);
+
+    ggml_gallocr_free(ga);
+    ggml_free(c);
+    return res;
+}
+
+static model make_model(ggml_backend_t be, std::mt19937 & rng) {
+    static const ggml_type types[4] = { GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0 };
+    static const int       rows[4]  = { C, VAL, H, H };
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    model m;
+    m.be    = be;
+    m.ctx_w = ggml_init({16*ggml_tensor_overhead(), nullptr, true});
+    m.ctx_s = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
+    for (int j = 0; j < 4; ++j) {
+        m.w[j] = ggml_new_tensor_2d(m.ctx_w, types[j], N, rows[j]);
+    }
+    m.conv_w = ggml_new_tensor_2d(m.ctx_w, GGML_TYPE_F32, N_CONV, C);
+    m.dt     = ggml_new_tensor_1d(m.ctx_w, GGML_TYPE_F32, H);
+    m.a      = ggml_new_tensor_1d(m.ctx_w, GGML_TYPE_F32, H);
+    m.norm_w = ggml_new_tensor_1d(m.ctx_w, GGML_TYPE_F32, S);
+    m.r      = ggml_new_tensor_2d(m.ctx_s, GGML_TYPE_F32, D_R, N_CELLS);
+    m.s      = ggml_new_tensor_2d(m.ctx_s, GGML_TYPE_F32, D_S, N_CELLS);
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(m.ctx_w, be);
+    ggml_backend_buffer_t buf_s = ggml_backend_alloc_ctx_tensors(m.ctx_s, be);
+    check(buf_w && buf_s, "allocation");
+    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::mt19937 wrng(rng()); // the same weights on every backend need the same seed, see main()
+    for (int j = 0; j < 4; ++j) {
+        std::vector<float> f((size_t) N*rows[j]);
+        for (auto & val : f) { val = 0.03f*nd(wrng); }
+        std::vector<char> qd(ggml_nbytes(m.w[j]));
+        check(ggml_quantize_chunk(types[j], f.data(), qd.data(), 0, rows[j], N, nullptr) == qd.size(), "quantize");
+        ggml_backend_tensor_set(m.w[j], qd.data(), 0, qd.size());
+    }
+    std::vector<float> f(N_CONV*C);
+    for (auto & val : f) { val = 0.5f*nd(wrng); }
+    ggml_backend_tensor_set(m.conv_w, f.data(), 0, f.size()*sizeof(float));
+    float dt[H], a[H];
+    for (int h = 0; h < H; ++h) {
+        dt[h] = nd(wrng);
+        a[h]  = -std::exp(0.5f*nd(wrng));
+    }
+    // one head on the linear branch of softplus
+    dt[H - 1] = 40.0f;
+    ggml_backend_tensor_set(m.dt, dt, 0, sizeof(dt));
+    ggml_backend_tensor_set(m.a,  a,  0, sizeof(a));
+    float norm_w[S];
+    for (auto & val : norm_w) { val = 1.0f + 0.3f*nd(wrng); }
+    ggml_backend_tensor_set(m.norm_w, norm_w, 0, sizeof(norm_w));
+    return m;
+}
+
+int main(int argc, char ** argv) {
+    check(argc == 2, "usage: qwen35-hip-decode ABS_LIBDIR");
+    check(ggml_qwen35_mvshare_enabled() && ggml_qwen35_prep1_enabled() && ggml_qwen35_gdn1_enabled() && ggml_qwen35_post1_enabled(),
+          "set GGML_QWEN35_MVSHARE=1 GGML_QWEN35_PREP1=1 GGML_QWEN35_GDN1=1 GGML_QWEN35_POST1=1");
+    ggml_backend_load_all_from_path(argv[1]);
+    ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
+    ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
+    check(hip && cpu, "backends");
+
+    std::mt19937 rng(8192);
+    std::mt19937 rng_cpu = rng;
+    const model m_hip = make_model(hip, rng);
+    const model m_cpu = make_model(cpu, rng_cpu);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    static const int rows[][2] = { {1, 1}, {0, 0}, {0, 2}, {2, 1} }; // {state row, cell}
+    static const int modes[]   = { FUSE_MVSHARE, FUSE_PREP1, FUSE_GDN1, FUSE_POST1, FUSE_ALL };
+    long   n_diff    = 0;
+    double worst_cpu = 0.0;
+    for (int rep = 0; rep < 8; ++rep) {
+        inputs in;
+        in.x.resize(N); in.r.resize((size_t) D_R*N_CELLS); in.s.resize((size_t) D_S*N_CELLS);
+        in.row  = rows[rep % 4][0];
+        in.cell = rows[rep % 4][1];
+        const float amp_s = 0.05f*std::exp(nd(rng));
+        for (auto & val : in.x) { val = nd(rng); }
+        for (auto & val : in.r) { val = nd(rng); }
+        for (auto & val : in.s) { val = amp_s*nd(rng); }
+
+        const auto ref = run(m_hip, 0, in);
+        for (int mode : modes) {
+            const auto res = run(m_hip, mode, in);
+            check(res.size() == ref.size(), "result size");
+            size_t offs = 0;
+            std::printf("rep %d row %d cell %d fused %d:", rep, in.row, in.cell, mode);
+            for (int seg = 0; seg < N_SEG; ++seg) {
+                int diff = 0;
+                for (int i = 0; i < SEG_N[seg]; ++i) {
+                    check(std::isfinite(ref[offs + i]) && std::isfinite(res[offs + i]), "finite");
+                    diff += std::memcmp(&ref[offs + i], &res[offs + i], sizeof(float)) != 0;
+                }
+                std::printf(" %s %d/%d", SEG_NAME[seg], diff, SEG_N[seg]);
+                n_diff += diff;
+                offs   += SEG_N[seg];
+            }
+            std::printf("\n");
+        }
+
+        // CPU: the callbacks of prep1, gdn1 and post1 against the stock ops with the same products
+        if (rep < 2) {
+            const auto ref_cpu = run(m_cpu, 0, in);
+            const auto res_cpu = run(m_cpu, FUSE_PREP1 | FUSE_GDN1 | FUSE_POST1, in);
+            size_t offs = SEG_N[0];
+            for (int seg = 1; seg < N_SEG; ++seg) {
+                double amax = 0.0, dmax = 0.0;
+                for (int i = 0; i < SEG_N[seg]; ++i) {
+                    amax = std::max(amax, (double) std::fabs(ref_cpu[offs + i]));
+                    dmax = std::max(dmax, (double) std::fabs(ref_cpu[offs + i] - res_cpu[offs + i]));
+                }
+                std::printf("rep %d cpu callbacks, %s: max|ref| %.4f, max diff %.3e\n", rep, SEG_NAME[seg], amax, dmax);
+                worst_cpu = std::max(worst_cpu, dmax/amax);
+                offs += SEG_N[seg];
+            }
+            // the mvshare callback takes the unquantized input, the stock CPU product quantizes it
+            const auto mv_cpu = run(m_cpu, FUSE_MVSHARE, in);
+            double amax = 0.0, dmax = 0.0;
+            for (int i = 0; i < SEG_N[0]; ++i) {
+                amax = std::max(amax, (double) std::fabs(ref_cpu[i]));
+                dmax = std::max(dmax, (double) std::fabs(ref_cpu[i] - mv_cpu[i]));
+            }
+            std::printf("rep %d cpu callback, products: max|ref| %.4f, max diff %.3e\n", rep, amax, dmax);
+            check(dmax/amax < 5e-2, "cpu reference of mvshare is off");
+        }
+    }
+    check(n_diff == 0, "a fused op is not bit-exact");
+    check(worst_cpu < 1e-3, "cpu reference error above 1e-3");
+    std::printf("PASS bit-exact, worst cpu reference error %.2e\n", worst_cpu);
+    ggml_backend_free(hip);
+    ggml_backend_free(cpu);
+    return 0;
+}

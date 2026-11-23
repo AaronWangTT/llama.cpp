@@ -1,6 +1,22 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+#include "ggml-qwen35-decode.h"
+
+#include <cstring>
+
+// the one-token ops exist on a single ROCm device only; returns that device or nullptr
+static ggml_backend_dev_t qwen35_one_token_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
+    if (cparams.cb_eval || cparams.optimizer_graph || !loras->empty() || model.devices.size() != 1 || model.devices.front().is_meta ||
+            (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
+        return nullptr;
+    }
+    const auto dev = model.devices.front().dev;
+    return std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0 ? dev : nullptr;
+}
+#endif
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -372,42 +388,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    // Input projections
-    auto qkvz = build_qkvz(cur, il);
-    ggml_tensor * qkv_mixed = qkvz.first;
-    ggml_tensor * z         = qkvz.second;
-
-    ggml_tensor * beta  = nullptr;
-    ggml_tensor * alpha = nullptr;
-    if (model.layers[il].ssm_beta_alpha_cat) {
-        ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
-        cb(ba, "beta_alpha", il);
-
-        beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
-                ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
-        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
-                ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
-    } else {
-        beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
-
-        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
-    }
-    cb(beta, "beta", il);
-    cb(alpha, "alpha", il);
-
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
-
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
-
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
-    cb(gate, "gate", il);
-
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * qkv_mixed = nullptr;
+    ggml_tensor * z         = nullptr;
+    ggml_tensor * beta      = nullptr;
+    ggml_tensor * alpha     = nullptr;
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -416,69 +400,222 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
-
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
-
-    // Calculate the total conv dimension
-    int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
-    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
-
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
-
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_v_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
-
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
-    cb(v_conv, "v_conv", il);
-
-
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // one token of one sequence on a single ROCm device takes the fused ops of ggml-qwen35-decode.h
+    ggml_tensor * prep   = nullptr; // [q, k, v, beta, gate]
+    ggml_tensor * output = nullptr;
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    const auto dev = n_seq_tokens == 1 && n_seqs == 1 && cparams.n_rs_seq == 0 && mctx_cur->get_n_rs() == 1 ?
+        qwen35_one_token_dev(cparams, model, loras) : nullptr;
+    const size_t fs = sizeof(float);
 
-    //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    // the zero state of build_rs(); the fused ops read the state row of the sequence from the cache
+    auto clear_zero_state = [&](ggml_tensor * states) {
+        const int32_t rs_zero = mctx_cur->get_rs_z();
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, states->ne[0]*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
+    };
+    auto cell_of = [&](ggml_context * ctx, ggml_tensor * states) {
+        return ggml_view_2d(ctx, states, states->ne[0], n_seqs, states->nb[1], mctx_cur->get_head()*states->nb[1]);
+    };
+
+    // the four products of cur share one quantized input
+    if (dev && ggml_qwen35_mvshare_enabled() && !model.layers[il].wqkv_z && !model.layers[il].ssm_beta_alpha_cat) {
+        const auto & layer = model.layers[il];
+        std::vector<ggml_tensor *> w = { layer.wqkv, layer.wqkv_gate, layer.ssm_beta, layer.ssm_alpha };
+        bool plain = !layer.wqkv_s && !layer.wqkv_gate_s && !layer.ssm_beta_s && !layer.ssm_alpha_s;
+        for (const ggml_tensor * m : w) {
+            plain = plain && m && (!hdmd || !hdmd->rot.count(m)) && (!prec_policy || !prec_policy->prec_src1.count(m));
+        }
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        auto * candidate = plain ? ggml_qwen35_try_mvshare(probe.get(), w.data(), w.size(), cur) : nullptr;
+        if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+            ggml_tensor * shared = ggml_qwen35_try_mvshare(ctx0, w.data(), w.size(), cur);
+            cb(shared, "linear_attn_shared", il);
+
+            const int64_t n_qkv = layer.wqkv->ne[1];
+            const int64_t n_z   = layer.wqkv_gate->ne[1];
+
+            qkv_mixed = ggml_view_3d(ctx0, shared, n_qkv, n_seq_tokens, n_seqs, n_qkv*fs, n_qkv*fs, 0);
+            z         = ggml_view_2d(ctx0, shared, n_z, n_seq_tokens * n_seqs, n_z*fs, n_qkv*fs);
+            beta      = ggml_view_4d(ctx0, shared, 1, num_v_heads, n_seq_tokens, n_seqs, fs, num_v_heads*fs, num_v_heads*fs, (n_qkv + n_z)*fs);
+            alpha     = ggml_view_3d(ctx0, shared, num_v_heads, n_seq_tokens, n_seqs, num_v_heads*fs, num_v_heads*fs, (n_qkv + n_z + num_v_heads)*fs);
+        }
+    }
+#endif
+
+    if (!qkv_mixed) {
+        // Input projections
+        auto qkvz = build_qkvz(cur, il);
+        qkv_mixed = qkvz.first;
+        z         = qkvz.second;
+
+        if (model.layers[il].ssm_beta_alpha_cat) {
+            ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+            cb(ba, "beta_alpha", il);
+
+            beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                    ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
+            alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
+                    ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
+        } else {
+            beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+            beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+
+            alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+            alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+        }
+    }
+    cb(beta, "beta", il);
+    cb(alpha, "alpha", il);
+
+    ggml_tensor * gate   = nullptr;
+    ggml_tensor * q_conv = nullptr;
+    ggml_tensor * k_conv = nullptr;
+    ggml_tensor * v_conv = nullptr;
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    // conv, SiLU, L2 norm, beta and gate in one op, which also updates the conv state
+    if (dev && ggml_qwen35_prep1_enabled() && head_k_dim == ggml_qwen35_head_dim && head_v_dim == head_k_dim) {
+        const int64_t key_dim = head_k_dim * num_k_heads;
+        auto make = [&](ggml_context * ctx) {
+            return ggml_qwen35_try_prep1(ctx, qkv_mixed, beta, alpha, conv_kernel, model.layers[il].ssm_dt, model.layers[il].ssm_a,
+                    conv_states_all, inp->s_copy_main, cell_of(ctx, conv_states_all),
+                    2*key_dim, eps_norm/(float) head_k_dim, 1.0f/sqrtf((float) head_k_dim));
+        };
+        ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+        auto * candidate = conv_channels == qkv_mixed->ne[0] ? make(probe.get()) : nullptr;
+        if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+            clear_zero_state(conv_states_all);
+            prep = make(ctx0);
+            cb(prep, "linear_attn_prep", il);
+
+            q_conv = ggml_view_4d(ctx0, prep, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, head_k_dim*fs, key_dim*fs, key_dim*fs, 0);
+            k_conv = ggml_view_4d(ctx0, prep, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, head_k_dim*fs, key_dim*fs, key_dim*fs, key_dim*fs);
+            v_conv = ggml_view_4d(ctx0, prep, head_v_dim, num_v_heads, n_seq_tokens, n_seqs, head_v_dim*fs, d_inner*fs, d_inner*fs, 2*key_dim*fs);
+            beta   = ggml_view_4d(ctx0, prep, 1, num_v_heads, n_seq_tokens, n_seqs, fs, num_v_heads*fs, num_v_heads*fs, conv_channels*fs);
+            gate   = ggml_view_4d(ctx0, prep, 1, num_v_heads, n_seq_tokens, n_seqs, fs, num_v_heads*fs, num_v_heads*fs, (conv_channels + num_v_heads)*fs);
+        }
+    }
+#endif
+
+    if (!prep) {
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
+
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
+
+        gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
+
+    ggml_tensor * conv_input = prep ? nullptr : build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    // with the fused delta net the state stays in the cache: no copy of it here
+    const bool gdn_one = dev && ggml_qwen35_gdn1_enabled() && head_k_dim == ggml_qwen35_head_dim && head_v_dim == head_k_dim;
+#else
+    const bool gdn_one = false;
+#endif
+
+    ggml_tensor * state = nullptr;
+    if (!gdn_one) {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
+
+    if (!prep) {
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        ggml_tensor * conv_qkv_mix = conv_output_silu;
+
+        // Calculate the total conv dimension
+        int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+        int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+
+        // Extract the convolved Q, K, V from conv_output
+        q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                0);
+
+        k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+
+        v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_v_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
+
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    if (gdn_one) {
+        auto make = [&](ggml_context * ctx) {
+            return ggml_qwen35_try_gdn1(ctx, q_conv, k_conv, v_conv, gate, beta, ssm_states_all, inp->s_copy_main, cell_of(ctx, ssm_states_all));
+        };
+        ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+        auto * candidate = make(probe.get());
+        if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+            clear_zero_state(ssm_states_all);
+            output = make(ctx0);
+            cb(output, "attn_output", il);
+        }
+    }
+#endif
+
+    if (!output) {
+        if (!state) {
+            state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+            state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+            cb(state, "state_predelta", il);
+        }
+        output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
             ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0);
 
     // Apply gated normalization: self.norm(core_attn_out, z)
-    ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    ggml_tensor * attn_out_norm = nullptr;
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    if (dev && ggml_qwen35_post1_enabled() && head_v_dim == ggml_qwen35_head_dim) {
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        auto * candidate = ggml_qwen35_try_post1(probe.get(), output, model.layers[il].ssm_norm, z_2d, eps_norm);
+        if (candidate && ggml_backend_dev_supports_op(dev, candidate)) {
+            attn_out_norm = ggml_qwen35_try_post1(ctx0, output, model.layers[il].ssm_norm, z_2d, eps_norm);
+        }
+    }
+#endif
+    if (!attn_out_norm) {
+        attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    }
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);

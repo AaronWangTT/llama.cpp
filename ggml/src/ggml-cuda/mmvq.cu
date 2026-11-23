@@ -1596,6 +1596,48 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
+void ggml_cuda_mul_mat_vec_q_shared(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * const * w, const int n_w, const ggml_tensor * src1, float * dst) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10        = src1->ne[0];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        const int64_t s12 = src1->nb[2] / sizeof(float);
+        const int64_t s13 = src1->nb[3] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, 1, 1, 1, stream);
+    }
+
+    const ggml_cuda_mm_fusion_args_device fusion_local{};
+    const int64_t s11 = ne10_padded / QK8_1;
+
+    for (int j = 0; j < n_w; ++j) {
+        const ggml_tensor * src0 = w[j];
+        GGML_ASSERT(src0->ne[0] == ne10 && src0->ne[2] == 1 && src0->ne[3] == 1);
+        GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
+
+        const size_t  ts_src0 = ggml_type_size(src0->type);
+        const int64_t ne01    = src0->ne[1];
+        const int64_t s01     = src0->nb[1] / ts_src0;
+        const int64_t s02     = src0->nb[2] / ts_src0;
+        const int64_t s03     = src0->nb[3] / ts_src0;
+
+        // the strides of a [ne01, 1] dst and of a one-column src1, as in ggml_cuda_mul_mat_vec_q
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get(), nullptr, fusion_local, dst, ne10,
+            ne01, 1, s01, s11, ne01,
+            1,    1, 1, s02, s11, ne01,
+            1,       1, s03, s11, ne01, 0, stream);
+
+        dst += ne01;
+    }
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

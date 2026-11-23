@@ -11,6 +11,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// n_w weight matrices times the same F32 vector: src1 is quantized once, the rows of w[j] follow those of w[j - 1] in dst.
+// Each product is the one of ggml_cuda_mul_mat_vec_q.
+void ggml_cuda_mul_mat_vec_q_shared(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * const * w, int n_w, const ggml_tensor * src1, float * dst);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
