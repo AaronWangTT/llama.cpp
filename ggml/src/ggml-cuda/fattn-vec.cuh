@@ -585,7 +585,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
     const fattn_kernel_t split_ref = fattn_kernel;
     bool check_geometry = false;
-    bool block_per_kv_head = false;
+    int kv_heads_per_block = 0; // 0: one block per query head
 #if defined(GGML_USE_HIP)
     if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap) {
         const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
@@ -619,7 +619,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
                         case 12: fattn_kernel = inkling_fagqa_vec<D, 3, 12>; break;
                         default: break;
                     }
-                    block_per_kv_head = true;
+                    kv_heads_per_block = 1;
                     static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
                     if (trace_fagqa) {
                         GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
@@ -636,11 +636,36 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             }
         }
     }
+    if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0 && !use_logit_softcap) {
+        const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
+        static const bool fagqa = [] {
+            const char * skip = getenv("GGML_INKLING_MASKSKIP");
+            const char * s    = getenv("GGML_INKLING_FAGQA");
+            return skip && strcmp(skip, "1") == 0 && s && strcmp(s, "1") == 0;
+        }();
+        // Same conditions as for F16 K and V.
+        if (fagqa && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && dst->src[4] && !dst->src[5] && mask &&
+            q->ne[1] == 1 && q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 &&
+            k->ne[0] == 128 && v->ne[0] == 128 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
+            k->ne[1] >= 1024 && k->ne[1] % 128 == 0 && v->ne[1] == k->ne[1] &&
+            k->nb[1] == k->ne[2]*ggml_row_size(k->type, k->ne[0]) && v->nb[1] == v->ne[2]*ggml_row_size(v->type, v->ne[0]) &&
+            mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(uint16_t) &&
+            strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
+            // One block per 4 KV heads and split. It takes the 3 query heads of each KV head from one load of each K and V row.
+            fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 4>;
+            kv_heads_per_block = 4;
+            static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
+            if (trace_fagqa) {
+                GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld q8\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
+            }
+            check_geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
+        }
+    }
 #endif
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, split_ref, check_geometry, block_per_kv_head);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, split_ref, check_geometry, kv_heads_per_block);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

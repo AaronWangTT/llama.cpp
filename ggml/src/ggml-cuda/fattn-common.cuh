@@ -1037,7 +1037,7 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
-    fattn_kernel_t split_reference = nullptr, const bool check_geometry = false, const bool block_per_kv_head = false,
+    fattn_kernel_t split_reference = nullptr, const bool check_geometry = false, const int kv_heads_per_block = 0,
     const int * kv_aux = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
@@ -1055,7 +1055,7 @@ void launch_fattn(
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
     GGML_ASSERT(!kv_rows || !use_sparse);
-    GGML_ASSERT(!block_per_kv_head || !stream_k);
+    GGML_ASSERT(kv_heads_per_block == 0 || !stream_k);
     GGML_ASSERT(!kv_aux || !kv_rows);
 
     ggml_tensor * KQV = dst;
@@ -1202,7 +1202,8 @@ void launch_fattn(
         nb23 = 0;
     }
 
-    const dim3 block_dim(warp_size, nwarps, 1);
+    // With kv_heads_per_block > 1 one block has nwarps warps for each of its KV heads.
+    const dim3 block_dim(warp_size, nwarps*std::max(1, kv_heads_per_block), 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
@@ -1211,7 +1212,7 @@ void launch_fattn(
         // Keep the baseline partition/reduction order. These are independent CTAs,
         // not a cooperative launch: grid size is not a limit on resident CTAs.
         GGML_ASSERT(!stream_k && !use_sparse);
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, split_reference, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, split_reference, warp_size * nwarps, nbytes_shared));
         GGML_ASSERT(max_blocks_per_sm > 0);
     }
     int parallel_blocks = max_blocks_per_sm;
@@ -1295,10 +1296,10 @@ void launch_fattn(
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
-        if (block_per_kv_head) {
-            // The kernel takes all query heads of a KV head in one block. The split plan stays the one for one head per block.
-            GGML_ASSERT(ncols2 == 1);
-            blocks_num.z = K->ne[2]*Q->ne[3];
+        if (kv_heads_per_block > 0) {
+            // The kernel takes all query heads of kv_heads_per_block KV heads in one block. The split plan stays the one for one head per block.
+            GGML_ASSERT(ncols2 == 1 && K->ne[2] % kv_heads_per_block == 0);
+            blocks_num.z = K->ne[2]/kv_heads_per_block*Q->ne[3];
         }
 
         if (parallel_blocks > 1) {
