@@ -1,6 +1,24 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+#include "ggml-qwen35-decode.h"
+
+#include <cstring>
+
+// the fused one-token ops exist on a single ROCm device only; returns that device or nullptr
+// not with tensor overrides: an op next to a weight in host memory can go to the CPU backend, the new state is then lost
+static ggml_backend_dev_t q35moe_rec_rocm_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
+    if (cparams.cb_eval || cparams.optimizer_graph || !loras->empty() || model.devices.size() != 1 || model.devices.front().is_meta ||
+            model.has_tensor_overrides() ||
+            (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
+        return nullptr;
+    }
+    const auto dev = model.devices.front().dev;
+    return std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0 ? dev : nullptr;
+}
+#endif
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -359,6 +377,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    if (ggml_tensor * one = build_layer_attn_linear_one(inp, cur, il)) {
+        return one;
+    }
+#endif
+
     // Input projections
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
@@ -463,6 +487,249 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     return cur;
 }
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+// build_layer_attn_linear() for one token of one sequence on a single ROCm device, with the ops of ggml-qwen35-decode.h
+// each op has its own GGML_Q35MOE_* switch; a part whose op is off or not usable gets the stock nodes
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        cur,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+    const auto & layer    = model.layers[il];
+
+    if (!ggml_q35moe_mvshare_enabled() && !ggml_q35moe_ba1_enabled() && !ggml_q35moe_prep1_enabled() && !ggml_q35moe_gdn1_enabled() &&
+            !ggml_q35moe_post1_enabled()) {
+        return nullptr;
+    }
+    if (ubatch.n_seq_tokens != 1 || ubatch.n_seqs != 1 || cparams.n_rs_seq != 0 || mctx_cur->get_n_rs() != 1) {
+        return nullptr;
+    }
+    // a layer that is not on that device keeps the stock ops
+    const auto dev = q35moe_rec_rocm_dev(cparams, model, loras);
+    if (!dev || model.dev_layer(il) != dev) {
+        return nullptr;
+    }
+
+    const int64_t d_inner       = hparams.ssm_d_inner;
+    const int64_t head_k_dim    = hparams.ssm_d_state;
+    const int64_t num_k_heads   = hparams.ssm_n_group;
+    const int64_t num_v_heads   = hparams.ssm_dt_rank;
+    const int64_t head_v_dim    = d_inner / num_v_heads;
+    const int64_t key_dim       = head_k_dim * num_k_heads;
+    const int64_t conv_channels = d_inner + 2 * key_dim;
+
+    // the kernels replay the stock kernels of this head size only
+    if (head_k_dim != ggml_qwen35_head_dim || head_v_dim != head_k_dim || d_inner != head_v_dim * num_v_heads) {
+        return nullptr;
+    }
+
+    const size_t fs = sizeof(float);
+
+    // a weight that build_lora_mm() gives to one plain MUL_MAT
+    auto plain = [&](const ggml_tensor * w, const ggml_tensor * w_s) {
+        return w && !w_s && (!hdmd || !hdmd->rot.count(w)) && (!prec_policy || !prec_policy->prec_src1.count(w));
+    };
+    auto usable = [&](const ggml_tensor * candidate) {
+        return candidate && ggml_backend_dev_supports_op(dev, candidate);
+    };
+    // the zero state of build_rs(); the fused ops read the state row of the sequence from the cache
+    auto clear_zero_state = [&](ggml_tensor * states) {
+        const int32_t rs_zero = mctx_cur->get_rs_z();
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, states->ne[0]*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
+    };
+    auto cell_of = [&](ggml_context * ctx, ggml_tensor * states) {
+        return ggml_view_2d(ctx, states, states->ne[0], 1, states->nb[1], mctx_cur->get_head()*states->nb[1]);
+    };
+
+    ggml_tensor * qkv_mixed = nullptr;
+    ggml_tensor * z         = nullptr;
+    ggml_tensor * beta      = nullptr;
+    ggml_tensor * alpha     = nullptr;
+
+    const bool ba_plain = plain(layer.ssm_beta, layer.ssm_beta_s) && plain(layer.ssm_alpha, layer.ssm_alpha_s) &&
+        layer.ssm_beta->ne[1] == num_v_heads && layer.ssm_alpha->ne[1] == num_v_heads;
+    const bool ba_quant = ba_plain && ggml_is_quantized(layer.ssm_beta->type) && ggml_is_quantized(layer.ssm_alpha->type);
+
+    // the quantized products of cur share one quantized input
+    if (ggml_q35moe_mvshare_enabled() && plain(layer.wqkv, layer.wqkv_s) && plain(layer.wqkv_gate, layer.wqkv_gate_s)) {
+        std::vector<ggml_tensor *> w = { layer.wqkv, layer.wqkv_gate };
+        if (ba_quant) {
+            w.push_back(layer.ssm_beta);
+            w.push_back(layer.ssm_alpha);
+        }
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(ggml_qwen35_try_mvshare(probe.get(), w.data(), w.size(), cur))) {
+            ggml_tensor * shared = ggml_qwen35_try_mvshare(ctx0, w.data(), w.size(), cur);
+            cb(shared, "linear_attn_shared", il);
+
+            const int64_t n_qkv = layer.wqkv->ne[1];
+            const int64_t n_z   = layer.wqkv_gate->ne[1];
+
+            qkv_mixed = ggml_view_3d(ctx0, shared, n_qkv, 1, 1, n_qkv*fs, n_qkv*fs, 0);
+            z         = ggml_view_2d(ctx0, shared, n_z, 1, n_z*fs, n_qkv*fs);
+            if (ba_quant) {
+                beta  = ggml_view_4d(ctx0, shared, 1, num_v_heads, 1, 1, fs, num_v_heads*fs, num_v_heads*fs, (n_qkv + n_z)*fs);
+                alpha = ggml_view_3d(ctx0, shared, num_v_heads, 1, 1, num_v_heads*fs, num_v_heads*fs, (n_qkv + n_z + num_v_heads)*fs);
+            }
+        }
+    }
+    if (!qkv_mixed) {
+        auto qkvz = build_qkvz(cur, il);
+        qkv_mixed = qkvz.first;
+        z         = qkvz.second;
+    }
+
+    // the two F32 products of cur in one launch
+    if (!beta && ggml_q35moe_ba1_enabled() && ba_plain) {
+        ggml_tensor * w[] = { layer.ssm_beta, layer.ssm_alpha };
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(ggml_q35moe_try_mvf(probe.get(), w, 2, cur))) {
+            ggml_tensor * ba = ggml_q35moe_try_mvf(ctx0, w, 2, cur);
+            cb(ba, "beta_alpha", il);
+
+            beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, 1, 1, fs, num_v_heads*fs, num_v_heads*fs, 0);
+            alpha = ggml_view_3d(ctx0, ba, num_v_heads, 1, 1, num_v_heads*fs, num_v_heads*fs, num_v_heads*fs);
+        }
+    }
+    if (!beta) {
+        beta = build_lora_mm(layer.ssm_beta, cur, layer.ssm_beta_s);
+        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, 1, 1);
+
+        alpha = build_lora_mm(layer.ssm_alpha, cur, layer.ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, 1, 1);
+    }
+    cb(beta, "beta", il);
+    cb(alpha, "alpha", il);
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+    ggml_tensor * conv_kernel     = layer.ssm_conv1d;
+
+    const float eps_norm = hparams.f_norm_rms_eps;
+
+    ggml_tensor * gate   = nullptr;
+    ggml_tensor * q_conv = nullptr;
+    ggml_tensor * k_conv = nullptr;
+    ggml_tensor * v_conv = nullptr;
+
+    // conv, SiLU, L2 norm, beta and gate in one op, which also updates the conv state
+    if (ggml_q35moe_prep1_enabled() && conv_channels == qkv_mixed->ne[0]) {
+        auto make = [&](ggml_context * ctx) {
+            return ggml_qwen35_try_prep1(ctx, qkv_mixed, beta, alpha, conv_kernel, layer.ssm_dt, layer.ssm_a,
+                    conv_states_all, inp->s_copy_main, cell_of(ctx, conv_states_all),
+                    2*key_dim, eps_norm/(float) head_k_dim, 1.0f/sqrtf((float) head_k_dim));
+        };
+        ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(make(probe.get()))) {
+            clear_zero_state(conv_states_all);
+            ggml_tensor * prep = make(ctx0);
+            cb(prep, "linear_attn_prep", il);
+
+            q_conv = ggml_view_4d(ctx0, prep, head_k_dim, num_k_heads, 1, 1, head_k_dim*fs, key_dim*fs, key_dim*fs, 0);
+            k_conv = ggml_view_4d(ctx0, prep, head_k_dim, num_k_heads, 1, 1, head_k_dim*fs, key_dim*fs, key_dim*fs, key_dim*fs);
+            v_conv = ggml_view_4d(ctx0, prep, head_v_dim, num_v_heads, 1, 1, head_v_dim*fs, d_inner*fs, d_inner*fs, 2*key_dim*fs);
+            beta   = ggml_view_4d(ctx0, prep, 1, num_v_heads, 1, 1, fs, num_v_heads*fs, num_v_heads*fs, conv_channels*fs);
+            gate   = ggml_view_4d(ctx0, prep, 1, num_v_heads, 1, 1, fs, num_v_heads*fs, num_v_heads*fs, (conv_channels + num_v_heads)*fs);
+        }
+    }
+
+    // with the fused delta net the state stays in the cache: no copy of it here
+    const bool gdn_one = ggml_q35moe_gdn1_enabled();
+
+    ggml_tensor * state = nullptr;
+    if (!q_conv) {
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
+
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, layer.ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
+
+        gate = ggml_mul(ctx0, alpha_softplus, layer.ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, 1, 1);
+
+        ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel->ne[0], conv_channels, il);
+
+        if (!gdn_one) {
+            state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), 1);
+            state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, 1);
+            cb(state, "state_predelta", il);
+        }
+
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        const int64_t nb1_qkv = ggml_row_size(conv_output_silu->type, conv_channels);
+
+        q_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, 1, 1, head_k_dim*fs, nb1_qkv, nb1_qkv, 0);
+        k_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, 1, 1, head_k_dim*fs, nb1_qkv, nb1_qkv, key_dim*fs);
+        v_conv = ggml_view_4d(ctx0, conv_output_silu, head_v_dim, num_v_heads, 1, 1, head_v_dim*fs, nb1_qkv, nb1_qkv, 2*key_dim*fs);
+
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
+
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
+
+    cb(q_conv, "q_conv_predelta", il);
+    cb(k_conv, "k_conv_predelta", il);
+    cb(v_conv, "v_conv_predelta", il);
+
+    ggml_tensor * output = nullptr;
+    if (gdn_one) {
+        auto make = [&](ggml_context * ctx) {
+            return ggml_qwen35_try_gdn1(ctx, q_conv, k_conv, v_conv, gate, beta, ssm_states_all, inp->s_copy_main, cell_of(ctx, ssm_states_all));
+        };
+        ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(make(probe.get()))) {
+            clear_zero_state(ssm_states_all);
+            output = make(ctx0);
+            cb(output, "attn_output", il);
+        }
+    }
+    if (!output) {
+        if (!state) {
+            state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), 1);
+            state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, 1);
+            cb(state, "state_predelta", il);
+        }
+        output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    }
+
+    // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
+    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, 1, 1);
+
+    // Apply gated normalization: self.norm(core_attn_out, z)
+    ggml_tensor * attn_out_norm = nullptr;
+    if (ggml_q35moe_post1_enabled()) {
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(ggml_qwen35_try_post1(probe.get(), output, layer.ssm_norm, z_2d, eps_norm))) {
+            attn_out_norm = ggml_qwen35_try_post1(ctx0, output, layer.ssm_norm, z_2d, eps_norm);
+        }
+    }
+    if (!attn_out_norm) {
+        attn_out_norm = build_norm_gated(output, layer.ssm_norm, z_2d, il);
+    }
+
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, 1);
+
+    // Output projection
+    cur = build_lora_mm(layer.ssm_out, final_output, layer.ssm_out_s);
+    cb(cur, "linear_attn_out", il);
+
+    return cur;
+}
+#endif
 
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Check if this is an MoE layer

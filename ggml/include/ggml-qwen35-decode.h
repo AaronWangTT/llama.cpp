@@ -2,7 +2,8 @@
 
 #include "ggml.h"
 
-// Private to the native gfx1103 build. One-token ops of the gated delta net blocks (qwen35), one switch per op.
+// Private to the native gfx1103 build. One-token ops of the gated delta net blocks (qwen35, qwen35moe), one switch per op.
+// A GGML_QWEN35_* switch turns an op on in the qwen35 graph, the GGML_Q35MOE_* switch of the same name in the qwen35moe graph.
 extern "C" {
 // GGML_QWEN35_MVSHARE=1: several quantized matrices times the same vector, the vector is quantized once.
 // x: n_cols F32, w[i]: [n_cols, n_rows_i] quantized weight leafs; result: [w[0]*x, w[1]*x, ...], sum of n_rows_i F32
@@ -35,9 +36,22 @@ GGML_API bool ggml_qwen35_is_gdn1(const ggml_tensor * op);
 GGML_API bool ggml_qwen35_post1_enabled();
 GGML_API ggml_tensor * ggml_qwen35_try_post1(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * z, float eps);
 GGML_API bool ggml_qwen35_is_post1(const ggml_tensor * op);
+
+// GGML_Q35MOE_MVSHARE=1, GGML_Q35MOE_PREP1=1, GGML_Q35MOE_GDN1=1, GGML_Q35MOE_POST1=1: the four ops above in the qwen35moe graph
+GGML_API bool ggml_q35moe_mvshare_enabled();
+GGML_API bool ggml_q35moe_prep1_enabled();
+GGML_API bool ggml_q35moe_gdn1_enabled();
+GGML_API bool ggml_q35moe_post1_enabled();
+
+// GGML_Q35MOE_BA1=1: several F32 matrices times the same vector in one launch (the beta and alpha products of qwen35moe).
+// x: n_cols F32, w[i]: [n_cols, n_rows_i] F32 weight leafs; result: [w[0]*x, w[1]*x, ...], sum of n_rows_i F32
+GGML_API bool ggml_q35moe_ba1_enabled();
+GGML_API ggml_tensor * ggml_q35moe_try_mvf(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x);
+GGML_API bool ggml_q35moe_is_mvf(const ggml_tensor * op);
 }
 
 constexpr int ggml_qwen35_mvshare_max = 8;
+constexpr int ggml_q35moe_mvf_max     = 4;
 // the kernels replay the stock kernels of these sizes only
 constexpr int ggml_qwen35_head_dim = 128;
 constexpr int ggml_qwen35_n_conv   = 4;

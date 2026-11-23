@@ -2901,6 +2901,12 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // one token of one sequence with the fused ops of the native gfx1103 build; nullptr when no op is on or usable
+        ggml_tensor * build_layer_attn_linear_one(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * cur,
+                            int   il);
+
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
                             int   il);
