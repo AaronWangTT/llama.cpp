@@ -1281,12 +1281,13 @@ fattn_kernel_t ggml_hip_inkling_ppskip_kernel();
 int ggml_hip_inkling_pfattn_mode(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const int ** aux);
 fattn_kernel_t ggml_hip_inkling_pfattn_kernel(bool skip_empty_prefix, int pf);
 
-// Inkling prefill on gfx1103: 256 queries, 24 heads on 8 KV heads, F16 K and V, a mask with one bias per head, no ALiBi.
+// Inkling prefill on gfx1103: 256 queries, 24 heads on 8 KV heads, a mask with one bias per head, no ALiBi.
+// K and V are F16, or both Q8_0: launch_fattn gives the tile kernels an F16 copy of quantized K and V.
 static bool ggml_hip_inkling_pf_shape(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
     return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && q->ne[1] == 256 &&
         q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 && dst->src[4] && !dst->src[5] &&
-        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && v->type == k->type &&
         v->ne[1] == k->ne[1] && mask && mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] &&
         mask->ne[1] == q->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(half) &&
         strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f;
