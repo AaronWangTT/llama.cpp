@@ -197,7 +197,9 @@ void llama_grammar_accept_token(
 
 // the text that every stack requires next, at most n_max bytes; the grammar state is not changed
 // is_end is set when the grammar is complete after this text
+// is_cut is set when the grammar forces more text than n_max bytes
 std::string llama_grammar_forced_str(
         const struct llama_grammar & grammar,
                             size_t   n_max,
-                              bool & is_end);
+                              bool & is_end,
+                              bool & is_cut);

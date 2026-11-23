@@ -2825,19 +2825,23 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
-std::string llama_sampler_grammar_forced_str(const struct llama_sampler * smpl, size_t n_max, bool * is_end) {
+std::string llama_sampler_grammar_forced_str(const struct llama_sampler * smpl, size_t n_max, bool * is_end, bool * is_cut) {
     bool end = false;
+    bool cut = false;
     std::string result;
 
     if (smpl != nullptr && smpl->iface == &llama_sampler_grammar_i) {
         const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
         if (ctx->grammar) {
-            result = llama_grammar_forced_str(*ctx->grammar, n_max, end);
+            result = llama_grammar_forced_str(*ctx->grammar, n_max, end, cut);
         }
     }
 
     if (is_end != nullptr) {
         *is_end = end;
+    }
+    if (is_cut != nullptr) {
+        *is_cut = cut;
     }
 
     return result;

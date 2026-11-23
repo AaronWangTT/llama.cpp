@@ -53,6 +53,8 @@ void                    common_sampler_copy  (const struct common_sampler * src,
 // they are the tokenization of the text that every path of the grammar requires next, without its last token:
 // the model chooses the token that joins the end of this text with the text that follows
 // when the grammar is complete after the text, all its tokens and the end-of-generation token are returned
+// the tokens end in front of a control token and in front of a text that can be the start of a special token
+// no token is forced when a logit bias bans a token
 llama_tokens common_sampler_forced(struct common_sampler * gsmpl, const struct llama_vocab * vocab, size_t n_max);
 
 // arguments can be nullptr to skip printing

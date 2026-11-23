@@ -1510,7 +1510,7 @@ static void test_json_schema() {
 }
 
 // the text that the grammar forces after it accepted the input
-static void test_forced(const std::string & grammar_str, const std::string & input, size_t n_max, const std::string & expected, bool expected_end) {
+static void test_forced(const std::string & grammar_str, const std::string & input, size_t n_max, const std::string & expected, bool expected_end, bool expected_cut = false) {
     fprintf(stderr, "  input '%s', forced '%s'\n", input.c_str(), expected.c_str());
 
     llama_grammar * grammar = build_grammar(grammar_str);
@@ -1521,10 +1521,12 @@ static void test_forced(const std::string & grammar_str, const std::string & inp
     const llama_grammar_stacks stacks_org = llama_grammar_get_stacks(grammar);
 
     bool is_end = !expected_end;
-    const std::string forced = llama_grammar_forced_str(*grammar, n_max, is_end);
+    bool is_cut = !expected_cut;
+    const std::string forced = llama_grammar_forced_str(*grammar, n_max, is_end, is_cut);
 
     assert(forced == expected);
     assert(is_end == expected_end);
+    assert(is_cut == expected_cut);
     assert(llama_grammar_get_stacks(grammar) == stacks_org);
 
     llama_grammar_free_impl(grammar);
@@ -1542,7 +1544,7 @@ static void test_forced_text() {
     test_forced(grammar_str, "{\"i",                   100, "d\": ",          false);
     test_forced(grammar_str, "{\"id\": ",              100, "",               false);
     test_forced(grammar_str, "{\"id\": t",             100, "rue, \"why\": \"", false);
-    test_forced(grammar_str, "{\"id\": t",             5,   "rue, ",          false);
+    test_forced(grammar_str, "{\"id\": t",             5,   "rue, ",          false, true);
     test_forced(grammar_str, "{\"id\": true, \"why\": \"ab", 100, "",       false);
     test_forced(grammar_str, "{\"id\": true, \"why\": \"ab\"", 100, "}",    true);
     test_forced(grammar_str, "{\"id\": true, \"why\": \"ab\"}", 100, "",    true);
@@ -1555,9 +1557,25 @@ static void test_forced_text() {
     // two paths with the same start
     test_forced("root ::= \"abc\" | \"abd\"", "", 100, "ab", false);
 
+    // the bound cuts the text only when the next char is forced too
+    test_forced("root ::= \"abc\" | \"abd\"", "", 2, "ab", false);
+    test_forced("root ::= \"abc\" | \"abd\"", "", 1, "a",  false, true);
+
+    // two markers with the same start: the text ends inside a marker, common_sampler_forced() cuts it there
+    test_forced("root ::= \"<|model|>\" (\"<|content_text|>\" | \"<|content_thinking|>\")", "", 100, "<|model|><|content_t", false);
+
+    // a right-recursive rule ends at the bound
+    test_forced("root ::= \"a\" root", "",    10, "aaaaaaaaaa", false, true);
+    test_forced("root ::= \"a\" root", "aaa", 4,  "aaaa",       false, true);
+
     // multi-byte chars are not cut
-    test_forced("root ::= \"\u00e9\u00e9\"", "", 3, "\xc3\xa9", false);
+    test_forced("root ::= \"\u00e9\u00e9\"", "", 3, "\xc3\xa9", false, true);
     test_forced("root ::= \"\u00e9\u00e9\"", "", 4, "\xc3\xa9\xc3\xa9", true);
+
+    // a code point above 0x10FFFF has no UTF-8 form: the text stops in front of it
+    test_forced("root ::= \"ab\\U00110000\"", "", 100, "ab", false);
+    test_forced("root ::= \"\\U00110000\"",   "", 100, "",   false);
+    test_forced("root ::= \"\\U0010FFFF\"",   "", 100, "\xf4\x8f\xbf\xbf", true);
 
     // an optional space in front of every literal, as in the grammars from a JSON schema
     test_forced("root ::= \"{\" space \"\\\"a\\\"\" space \":\"\nspace ::= | \" \"", "",      100, "{",    false);

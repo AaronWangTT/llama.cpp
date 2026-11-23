@@ -168,4 +168,5 @@ LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * m
 
 // The text that a grammar sampler requires next on every path, at most n_max bytes. Empty if smpl is not a GBNF grammar sampler.
 // is_end is set when the grammar is complete after this text, only an end-of-generation token can follow.
-LLAMA_API std::string llama_sampler_grammar_forced_str(const struct llama_sampler * smpl, size_t n_max, bool * is_end);
+// is_cut is set when the grammar forces more text than n_max bytes.
+LLAMA_API std::string llama_sampler_grammar_forced_str(const struct llama_sampler * smpl, size_t n_max, bool * is_end, bool * is_cut);

@@ -4573,12 +4573,14 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
                             static const std::vector<int32_t> offsets_default = {4 + n_ubatch, 4};
-                            const auto & checkpoint_offsets = params_base.checkpoint_offsets.empty() ? offsets_default : params_base.checkpoint_offsets;
+                            const bool is_default = params_base.checkpoint_offsets.empty();
+                            const auto & checkpoint_offsets = is_default ? offsets_default : params_base.checkpoint_offsets;
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                // the offsets of --checkpoint-offsets can be larger than the batch
+                                const int n_last = is_default ? std::min(n_batch, offset) : offset;
+                                if (slot.task->n_tokens() - slot.prompt.n_tokens() == n_last) {
                                     should_break = true;
                                     break;
                                 }
@@ -4599,7 +4601,7 @@ private:
                     // the batch starts at one of the --checkpoint-offsets
                     bool is_offset_start = false;
                     for (int offset : params_base.checkpoint_offsets) {
-                        is_offset_start = is_offset_start || slot.task->n_tokens() == n_tokens_start + std::min(n_batch, offset);
+                        is_offset_start = is_offset_start || slot.task->n_tokens() - n_tokens_start == offset;
                     }
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
@@ -4881,7 +4883,14 @@ private:
 
     // accept the tokens that the grammar forces after the tokens accepted so far
     llama_tokens accept_forced_tokens(server_slot & slot, int32_t n_max) {
-        const llama_tokens ids = common_sampler_forced(slot.smpl.get(), vocab, n_max);
+        llama_tokens ids;
+        try {
+            ids = common_sampler_forced(slot.smpl.get(), vocab, n_max);
+        } catch (const std::exception & e) {
+            // the sampler state is not changed, the slot samples this step
+            SLT_WRN(slot, "failed to get the forced tokens: %s\n", e.what());
+            ids.clear();
+        }
         for (const llama_token id : ids) {
             common_sampler_accept(slot.smpl.get(), id, true);
         }

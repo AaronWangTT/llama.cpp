@@ -1687,13 +1687,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--checkpoint-offsets"}, "N0,N1,...",
         "create the context checkpoints near the end of the prompt that many tokens before its end (default: ubatch size + 4, 4)",
         [](common_params & params, const std::string & value) {
-            const auto offsets = string_split<int>(value, ',');
-            for (const int offset : offsets) {
-                if (offset <= 0) {
-                    throw std::invalid_argument("checkpoint-offsets must be positive");
+            // an empty value gives one empty field, it is rejected too
+            std::vector<int32_t> offsets;
+            for (const auto & field : string_split<std::string>(value, ',')) {
+                size_t n_read = 0;
+                int offset = 0;
+                try {
+                    offset = std::stoi(field, &n_read);
+                } catch (const std::exception &) {
+                    // not a number or too large: the offset stays 0 and is rejected below
                 }
+                if (offset <= 0 || n_read != field.size()) {
+                    throw std::invalid_argument("checkpoint-offsets must be a list of positive integers, invalid value: \"" + field + "\"");
+                }
+                offsets.push_back(offset);
             }
-            params.checkpoint_offsets.assign(offsets.begin(), offsets.end());
+            params.checkpoint_offsets = offsets;
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_OFFSETS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

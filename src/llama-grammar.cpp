@@ -1603,8 +1603,9 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
     }
 }
 
-std::string llama_grammar_forced_str(const struct llama_grammar & grammar, size_t n_max, bool & is_end) {
+std::string llama_grammar_forced_str(const struct llama_grammar & grammar, size_t n_max, bool & is_end, bool & is_cut) {
     is_end = false;
+    is_cut = false;
 
     std::string result;
 
@@ -1627,7 +1628,8 @@ std::string llama_grammar_forced_str(const struct llama_grammar & grammar, size_
             const llama_grammar_element * pos = stack.back();
 
             // one exact char: not a token, a range, a set or an inverse set
-            if (pos->type != LLAMA_GRETYPE_CHAR || pos->value == 0 ||
+            // a value above 0x10FFFF has no UTF-8 form
+            if (pos->type != LLAMA_GRETYPE_CHAR || pos->value == 0 || pos->value > 0x10FFFF ||
                     pos[1].type == LLAMA_GRETYPE_CHAR_RNG_UPPER ||
                     pos[1].type == LLAMA_GRETYPE_CHAR_ALT ||
                     (chr != 0 && chr != pos->value)) {
@@ -1649,6 +1651,7 @@ std::string llama_grammar_forced_str(const struct llama_grammar & grammar, size_
 
         const std::string utf8 = unicode_cpt_to_utf8(chr);
         if (result.size() + utf8.size() > n_max) {
+            is_cut = true;
             break;
         }
 

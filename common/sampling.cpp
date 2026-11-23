@@ -172,6 +172,10 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    // for common_sampler_forced(): the texts of the special tokens of forced_vocab, collected at the first use
+    const llama_vocab * forced_vocab = nullptr;
+    std::vector<std::string> forced_specials = {};
 };
 
 std::string common_params_sampling::print() const {
@@ -509,6 +513,23 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+// the texts of the control and user-defined tokens that are longer than one byte
+static std::vector<std::string> special_token_texts(const struct llama_vocab * vocab) {
+    std::vector<std::string> result;
+
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    for (llama_token id = 0; id < n_vocab; id++) {
+        if (llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+            std::string text = common_token_to_piece(vocab, id, true);
+            if (text.size() > 1) {
+                result.push_back(std::move(text));
+            }
+        }
+    }
+
+    return result;
+}
+
 llama_tokens common_sampler_forced(struct common_sampler * gsmpl, const struct llama_vocab * vocab, size_t n_max) {
     llama_tokens result;
 
@@ -524,13 +545,56 @@ llama_tokens common_sampler_forced(struct common_sampler * gsmpl, const struct l
         }
     }
 
-    const size_t n_text_max = 8 * n_max;
+    // a forced token does not pass the logit bias sampler: force nothing when a token is banned
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    if (n_suppress > 0) {
+        return result;
+    }
+    for (const auto & bias : gsmpl->params.logit_bias) {
+        if (bias.bias == -INFINITY) {
+            return result;
+        }
+    }
+
+    // a fixed bound: a bound from n_max cuts the text inside a word when n_max is small
+    const size_t n_text_max = 4096;
 
     bool is_end = false;
-    const std::string text = llama_sampler_grammar_forced_str(gsmpl->grmr, n_text_max, &is_end);
+    bool is_cut = false;
+    std::string text = llama_sampler_grammar_forced_str(gsmpl->grmr, n_text_max, &is_end, &is_cut);
+
+    if (is_cut) {
+        // the bound can cut a word, its tokens are then not the ones of the full text
+        // drop this word and the chars between it and the word in front of it (word: ASCII letters, digits and multi-byte chars)
+        const auto is_word = [](char c) { return (c & 0x80) != 0 || std::isalnum((unsigned char) c) != 0; };
+
+        size_t n_text = text.size();
+        while (n_text > 0 && is_word(text[n_text - 1])) {
+            n_text--;
+        }
+        while (n_text > 0 && !is_word(text[n_text - 1])) {
+            n_text--;
+        }
+        text.resize(n_text);
+    }
+
+    if (!is_end && !text.empty()) {
+        if (gsmpl->forced_vocab != vocab) {
+            gsmpl->forced_specials = special_token_texts(vocab);
+            gsmpl->forced_vocab    = vocab;
+        }
+
+        // a forced run must not end inside a special token: cut the text where its tail can be the start of one
+        size_t n_text = text.size();
+        for (const auto & special : gsmpl->forced_specials) {
+            n_text = std::min(n_text, string_find_partial_stop(text, std::string_view(special).substr(0, special.size() - 1)));
+        }
+        text.resize(n_text);
+    }
 
     if (!text.empty()) {
-        result = common_tokenize(vocab, text, false, false);
+        result = common_tokenize(vocab, text, false, true);
 
         // the tokenizer must not add or drop a char, the grammar reads the pieces
         std::string pieces;
@@ -542,10 +606,21 @@ llama_tokens common_sampler_forced(struct common_sampler * gsmpl, const struct l
             return result;
         }
 
+        // stop in front of a control token, the model emits it itself
+        // an end-of-generation token must not be accepted here: the grammar aborts when it is not complete
+        for (size_t i = 0; i < result.size(); i++) {
+            const auto attr = llama_vocab_get_attr(vocab, result[i]);
+            if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN)) || llama_vocab_is_eog(vocab, result[i])) {
+                result.resize(i);
+                is_end = false;
+                break;
+            }
+        }
+
         if (result.size() > n_max) {
             result.resize(n_max);
             is_end = false;
-        } else if (!is_end) {
+        } else if (!is_end && !result.empty()) {
             // the tokenizer joins the end of this text with the text that follows: ": " + "1" is ":", " 1"
             // the model chooses that token, a forced one in its place moves its next choice
             result.pop_back();
