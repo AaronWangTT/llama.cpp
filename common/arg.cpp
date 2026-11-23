@@ -1684,6 +1684,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-offsets"}, "N0,N1,...",
+        "create the context checkpoints near the end of the prompt that many tokens before its end (default: ubatch size + 4, 4)",
+        [](common_params & params, const std::string & value) {
+            const auto offsets = string_split<int>(value, ',');
+            for (const int offset : offsets) {
+                if (offset <= 0) {
+                    throw std::invalid_argument("checkpoint-offsets must be positive");
+                }
+            }
+            params.checkpoint_offsets.assign(offsets.begin(), offsets.end());
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_OFFSETS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-mid-prompt"},
+        {"--no-checkpoint-mid-prompt"},
+        "also create context checkpoints between the batches of a long prompt, at least --checkpoint-min-step tokens apart (default: disabled)",
+        [](common_params & params, bool value) {
+            params.checkpoint_mid_prompt = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_MID_PROMPT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

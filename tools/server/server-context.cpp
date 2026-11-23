@@ -1615,8 +1615,9 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d, custom offsets = %zu, mid prompt = %d\n",
+                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step,
+                    params_base.checkpoint_offsets.size(), params_base.checkpoint_mid_prompt);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2787,6 +2788,9 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        // note: the time includes the wait for the batches that are still queued on the device
+        const int64_t t_start = ggml_time_us();
+
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
@@ -2795,9 +2799,9 @@ private:
         slot.prompt.checkpoints.push_back(std::move(ckpt));
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, t = %.2f ms)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (ggml_time_us() - t_start) / 1000.0);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -4301,6 +4305,8 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    const int64_t t_start_restore = ggml_time_us();
+
                                     if (!do_reset) {
                                         const auto & cur = **it;
 
@@ -4324,7 +4330,7 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
+                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, n_prefix = %d, size = %.3f MiB, t = %.2f ms)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, n_prefix, (float) cur.size() / 1024 / 1024, (ggml_time_us() - t_start_restore) / 1000.0);
                                     }
 
                                     if (do_reset) {
@@ -4551,9 +4557,11 @@ private:
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
                         //  - 4
+                        // --checkpoint-offsets replaces this list
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            static const std::vector<int32_t> offsets_default = {4 + n_ubatch, 4};
+                            const auto & checkpoint_offsets = params_base.checkpoint_offsets.empty() ? offsets_default : params_base.checkpoint_offsets;
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -4576,6 +4584,12 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
+                    // the batch starts at one of the --checkpoint-offsets
+                    bool is_offset_start = false;
+                    for (int offset : params_base.checkpoint_offsets) {
+                        is_offset_start = is_offset_start || slot.task->n_tokens() == n_tokens_start + std::min(n_batch, offset);
+                    }
+
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
@@ -4595,7 +4609,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_offset_start && !params_base.checkpoint_mid_prompt) {
                             do_checkpoint = false;
                         }
                     }
@@ -4615,7 +4629,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_offset_start ||
                             n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
