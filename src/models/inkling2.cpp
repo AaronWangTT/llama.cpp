@@ -373,11 +373,20 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     }
 #endif
 
-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
-    gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+    // a BF16 controller weight holds F32 values: accumulate in F32, as with the F32 weight
+    auto project = [&](ggml_tensor * w, ggml_tensor * x) {
+        ggml_tensor * res = build_lora_mm(w, x);
+        if (w->type == GGML_TYPE_BF16) {
+            ggml_prec_set_acc(res, GGML_PREC_F32);
+        }
+        return res;
+    };
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+    gate = project(loop.ctrl_down[ctrl], gate);
+
+    ggml_tensor * gain   = ggml_tanh(ctx0, project(loop.ctrl_gain[ctrl],   gate));
+    ggml_tensor * forget = ggml_tanh(ctx0, project(loop.ctrl_forget[ctrl], gate));
 
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }

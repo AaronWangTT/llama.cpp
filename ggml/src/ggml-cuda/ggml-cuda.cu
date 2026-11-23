@@ -2494,6 +2494,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
+    // F32 accumulation of a BF16 weight takes the kernels of an F32 weight; MMF and the BF16 GEMM round src1
+    if (src0->type == GGML_TYPE_BF16 && ggml_prec_get_acc(dst) == GGML_PREC_F32 && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103) {
+        const size_t ts = ggml_type_size(src0->type);
+        if (ne11 <= MMVF_MAX_BATCH_SIZE && ne00 % 2 == 0 && nb00 == ts && ggml_cuda_is_aligned(src0, 2*ts)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        } else {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
+        return;
+    }
+#endif
+
     if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)) {
         // The custom vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)

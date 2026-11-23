@@ -18,11 +18,23 @@ bool norm_input(const ggml_tensor * x) {
     return f32_block(x, n_embd) && x->view_offs % 16 == 0;
 }
 
+// a BF16 weight holds the high half of each F32 value
+bool weight_block(const ggml_tensor * w, int64_t n) {
+    return w && (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_BF16) && ggml_is_contiguous(w) && ggml_nelements(w) == n;
+}
+
 bool layout(const ggml_tensor * cur, const ggml_tensor * message, const ggml_tensor * down, const ggml_tensor * gain, const ggml_tensor * forget) {
     return norm_input(cur) && norm_input(message) &&
-        f32_block(down, 2*n_embd*rank) && down->ne[0] == 2*n_embd && down->ne[1] == rank &&
-        f32_block(gain, rank*n_embd) && gain->ne[0] == rank && gain->ne[1] == n_embd &&
-        f32_block(forget, rank*n_embd) && forget->ne[0] == rank && forget->ne[1] == n_embd;
+        weight_block(down, 2*n_embd*rank) && down->ne[0] == 2*n_embd && down->ne[1] == rank &&
+        weight_block(gain, rank*n_embd) && gain->ne[0] == rank && gain->ne[1] == n_embd &&
+        weight_block(forget, rank*n_embd) && forget->ne[0] == rank && forget->ne[1] == n_embd && forget->type == gain->type;
+}
+
+float weight(const ggml_tensor * w, int64_t i) {
+    if (w->type == GGML_TYPE_BF16) {
+        return GGML_BF16_TO_FP32(static_cast<const ggml_bf16_t *>(w->data)[i]);
+    }
+    return static_cast<const float *>(w->data)[i];
 }
 
 // reference
@@ -31,9 +43,9 @@ void ctrl1_cpu(ggml_tensor * dst, int ith, int, void *) {
         return;
     }
     const float * in[2]  = { static_cast<const float *>(dst->src[0]->data), static_cast<const float *>(dst->src[1]->data) };
-    const float * down   = static_cast<const float *>(dst->src[2]->data);
-    const float * gain   = static_cast<const float *>(dst->src[3]->data);
-    const float * forget = static_cast<const float *>(dst->src[4]->data);
+    const ggml_tensor * down   = dst->src[2];
+    const ggml_tensor * gain   = dst->src[3];
+    const ggml_tensor * forget = dst->src[4];
     float *       out    = static_cast<float *>(dst->data);
 
     float scale[2];
@@ -49,7 +61,7 @@ void ctrl1_cpu(ggml_tensor * dst, int ith, int, void *) {
         float sum = 0.0f;
         for (int s = 0; s < 2; ++s) {
             for (int i = 0; i < n_embd; ++i) {
-                sum += down[(2*r + s)*n_embd + i]*(scale[s]*in[s][i]);
+                sum += weight(down, (2*r + s)*n_embd + i)*(scale[s]*in[s][i]);
             }
         }
         gate[r] = sum;
@@ -58,8 +70,8 @@ void ctrl1_cpu(ggml_tensor * dst, int ith, int, void *) {
         float g = 0.0f;
         float f = 0.0f;
         for (int r = 0; r < rank; ++r) {
-            g += gain[i*rank + r]*gate[r];
-            f += forget[i*rank + r]*gate[r];
+            g += weight(gain, i*rank + r)*gate[r];
+            f += weight(forget, i*rank + r)*gate[r];
         }
         out[i] = in[0][i] - tanhf(f)*in[0][i] + tanhf(g)*in[1][i];
     }

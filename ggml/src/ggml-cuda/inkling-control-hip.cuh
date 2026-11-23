@@ -16,8 +16,9 @@ static __global__ void inkling_control_three(const float * proj, const float * x
     out[j] = y;
 }
 
-static bool inkling_control_shape(const ggml_tensor * t, int w, int rows) {
-    return t && t->type == GGML_TYPE_F32 && t->ne[0] == w && t->ne[1] == rows &&
+static bool inkling_control_shape(const ggml_tensor * t, int w, int rows, bool weight = false) {
+    // The tail reads no weight, so a weight may also hold its F32 values as BF16.
+    return t && (t->type == GGML_TYPE_F32 || (weight && t->type == GGML_TYPE_BF16)) && t->ne[0] == w && t->ne[1] == rows &&
            t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t);
 }
 
@@ -55,10 +56,10 @@ static int inkling_control_site(ggml_backend_cuda_context & ctx, ggml_cgraph * g
         if (v->view_src || !(v->flags & GGML_TENSOR_FLAG_COMPUTE) ||
             (v->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS))) { return 0; }
     }
-    if (p->op != GGML_OP_MUL_MAT || !inkling_control_shape(p->src[0],64,2304) ||
+    if (p->op != GGML_OP_MUL_MAT || !inkling_control_shape(p->src[0],64,2304,true) ||
         !inkling_control_shape(p->src[1],64,rows)) { return 0; }
     auto * down = p->src[1];
-    if (down->op != GGML_OP_MUL_MAT || !inkling_control_shape(down->src[0],4608,64) ||
+    if (down->op != GGML_OP_MUL_MAT || !inkling_control_shape(down->src[0],4608,64,true) ||
         !inkling_control_shape(down->src[1],4608,rows)) { return 0; }
     const char * dw = down->src[0]->name;
     const int k = inkling_control_prefix(dw);
