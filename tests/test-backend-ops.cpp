@@ -13181,6 +13181,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // qwen35 one-token attention: head size 256, 4 K/V heads, GQA 4
+    for (int64_t n_slices : {1, 2, 4}) {
+        for (int64_t kv : {256, 512, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 4*kv, kv, 1, n_slices));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 16384, 4096, 1, n_slices, GGML_TYPE_F16, false, true));
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(512, 32, 4, 32, 2));
 
