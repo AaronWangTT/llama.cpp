@@ -9,9 +9,10 @@
 // One block takes one KV head and one KV split. It computes the G query heads of this KV head from one load of each K and V row.
 // For each head the float operations and their order are the same as in flash_attn_ext_vec<D, 1, F16, F16, false, true>.
 //
-// VSKIP == n > 0 does not load a V row if its weight is below 2^-n for all G heads, so the result is not the same.
-// The weight is relative to the running maximum. The V rows of a tile are then loaded one tile later, together with the K rows
-// of the next tile: the weights have to be known first, and V rows that wait for the weights of their own tile are slow.
+// VSKIP == n > 0 does not load a V row if its stored weight is below 2^-n for all G heads, so the result is not the same.
+// The stored weight is relative to the running maximum plus FATTN_KQ_MAX_OFFSET: the best row has 2^-3, the cutoff is 2^-(n-3) of the best row.
+// The V rows of a tile are then loaded one tile later, together with the K rows of the next tile.
+// The weights have to be known first, and V rows that wait for the weights of their own tile are slow.
 template<int D, int G, int VSKIP = 0> // D == head size, G == query heads per KV head
 __launch_bounds__(128, 1)
 static __global__ void inkling_fagqa_vec(
@@ -210,8 +211,8 @@ static __global__ void inkling_fagqa_vec(
                 ggml_cuda_memcpy_1<cpy_nb>(&K_reg[k_KQ_0/nthreads_KQ], K_h2 + k_KQ_0 + (threadIdx.x % nthreads_KQ)*cpy_ne);
             }
 
-            // VSKIP: one step of V rows of the tile before, loaded together with the K row. The first tile takes its own
-            // V rows with weights of zero.
+            // VSKIP: one step of V rows of the tile before, loaded together with the K row.
+            // The first tile takes its own V rows with weights of zero.
             [[maybe_unused]] half2 V_reg[ne_VKQ_thread];
             [[maybe_unused]] half2 KQ_V[G];
             if constexpr (VSKIP > 0) {

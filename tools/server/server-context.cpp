@@ -3654,7 +3654,15 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            if (params_base.split_batch_by_seq) {
+                // one slot per sub-batch: post_decode() takes the slots of each sub-batch as it does for a batch larger than n_batch
+                int32_t n_same = 1;
+                while (n_same < n_tokens && batch.tokens[off + n_same].id_slot == batch.tokens[off].id_slot) {
+                    n_same++;
+                }
+                n_tokens = n_same;
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()

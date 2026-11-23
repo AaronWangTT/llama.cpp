@@ -167,10 +167,12 @@ static void inkling_ctrl1_launch(ggml_backend_cuda_context & ctx, ggml_tensor * 
     } else {
         inkling_ctrl1_gate<float><<<rank/4, 1024, 0, ctx.stream()>>>(cur, msg, static_cast<const float *>(down), gate.get(), n_embd, ggml_inkling_ctrl1_eps);
     }
+    CUDA_CHECK(cudaGetLastError());
     float * dst = static_cast<float *>(op->data);
     if (op->src[3]->type == GGML_TYPE_BF16) {
         inkling_ctrl1_tail<nv_bfloat16><<<n_embd, 32, 0, ctx.stream()>>>(cur, msg, static_cast<const nv_bfloat16 *>(gain), static_cast<const nv_bfloat16 *>(forget), gate.get(), dst, rank/2);
     } else {
         inkling_ctrl1_tail<float><<<n_embd, 32, 0, ctx.stream()>>>(cur, msg, static_cast<const float *>(gain), static_cast<const float *>(forget), gate.get(), dst, rank/2);
     }
+    CUDA_CHECK(cudaGetLastError());
 }

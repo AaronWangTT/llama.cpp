@@ -43,7 +43,7 @@ static __global__ void inkling_pfattn_tile(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int64_t nb32, const int64_t nb33) {
-#if defined(FLASH_ATTN_AVAILABLE) && defined(FAST_FP16_AVAILABLE) && defined(V_DOT2_F32_F16_AVAILABLE)
+#if defined(FLASH_ATTN_AVAILABLE) && defined(FAST_FP16_AVAILABLE) && defined(V_DOT2_F32_F16_AVAILABLE) && defined(RDNA)
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
@@ -475,7 +475,7 @@ static __global__ void inkling_pfattn_tile(
               ne31, ne32, ne33,
               nb31, nb32, nb33);
     NO_DEVICE_CODE;
-#endif // defined(FLASH_ATTN_AVAILABLE) && defined(FAST_FP16_AVAILABLE) && defined(V_DOT2_F32_F16_AVAILABLE)
+#endif // defined(FLASH_ATTN_AVAILABLE) && defined(FAST_FP16_AVAILABLE) && defined(V_DOT2_F32_F16_AVAILABLE) && defined(RDNA)
 }
 
 #endif // defined(GGML_USE_HIP)

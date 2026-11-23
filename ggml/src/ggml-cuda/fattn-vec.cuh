@@ -600,7 +600,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(uint16_t) &&
             strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
             static const bool trace = getenv("GGML_INKLING_MASKSKIP_TRACE") != nullptr;
-            check_geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
+            static const bool geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
+            check_geometry = geometry;
             if (enable && trace) { GGML_LOG_INFO("INKLING_MASKSKIP_HIT %s kv=%lld\n", mask->name, (long long)k->ne[1]); }
             if (enable) {
                 static const bool reorder = [] {
@@ -663,7 +664,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             if (trace_fagqa) {
                 GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld q8\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
             }
-            check_geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
+            static const bool geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
+            check_geometry = geometry;
         }
     }
 #endif

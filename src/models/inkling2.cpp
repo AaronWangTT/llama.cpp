@@ -1,4 +1,13 @@
 #include "models.h"
+
+// F32 accumulation for the product of w. With a LoRA adapter build_lora_mm() returns the sum with the adapter, the product is below it.
+static void inkling_prec_f32(ggml_tensor * res, const ggml_tensor * w) {
+    while (res != nullptr && !(res->op == GGML_OP_MUL_MAT && res->src[0] == w)) {
+        res = res->src[0];
+    }
+    GGML_ASSERT(res != nullptr);
+    GGML_ASSERT(ggml_prec_set_acc(res, GGML_PREC_F32));
+}
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 #include "ggml-inkling-depthmix.h"
 #include "ggml-inkling-concat4.h"
@@ -377,7 +386,7 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     auto project = [&](ggml_tensor * w, ggml_tensor * x) {
         ggml_tensor * res = build_lora_mm(w, x);
         if (w->type == GGML_TYPE_BF16) {
-            ggml_prec_set_acc(res, GGML_PREC_F32);
+            inkling_prec_f32(res, w);
         }
         return res;
     };
@@ -633,7 +642,7 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
 
     // lm_head
     cur = build_lora_mm(model.output, cur);
-    ggml_prec_set_acc(cur, GGML_PREC_F32);
+    inkling_prec_f32(cur, model.output);
 
     if (hparams.f_final_logit_softcapping != 0.0f) {
         const float cap = hparams.f_final_logit_softcapping;

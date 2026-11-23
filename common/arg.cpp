@@ -1701,6 +1701,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--split-batch-by-seq"},
+        {"--no-split-batch-by-seq"},
+        "decode the tokens of each slot in their own sub-batch instead of one mixed batch; for models whose single-sequence graphs are faster than a mixed batch (default: disabled)",
+        [](common_params & params, bool value) {
+            params.split_batch_by_seq = value;
+        }
+    ).set_env("LLAMA_ARG_SPLIT_BATCH_BY_SEQ").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
