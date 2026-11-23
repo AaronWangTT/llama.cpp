@@ -2440,7 +2440,7 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
 #if defined(GGML_USE_HIP)
     // GGML_QWEN35_GLUFUSE=1: fused dense gate/up/GLU on gfx1103. Its WMMA accumulators pair up the rows r and r + 8 like the MMA ones (same results).
     if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && up->op == GGML_OP_MUL_MAT && !up_scale && !gate_scale) {
-        static const bool glu_fuse = [] { const char * s = getenv("GGML_QWEN35_GLUFUSE"); return s && atoi(s) == 1; }();
+        static const bool glu_fuse = [] { const char * s = getenv("GGML_QWEN35_GLUFUSE"); return s && strcmp(s, "1") == 0; }();
         return glu_fuse;
     }
 #endif // defined(GGML_USE_HIP)
