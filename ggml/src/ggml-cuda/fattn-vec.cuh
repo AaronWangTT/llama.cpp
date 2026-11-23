@@ -652,8 +652,13 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(uint16_t) &&
             strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
             // One block per 4 KV heads and split. It takes the 3 query heads of each KV head from one load of each K and V row.
-            fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 4>;
-            kv_heads_per_block = 4;
+            // GGML_INKLING_FAGQA_Q8_HEADS=1 or 2 sets the KV heads per block for tests.
+            static const int heads = [] { const char * s = getenv("GGML_INKLING_FAGQA_Q8_HEADS"); return s ? atoi(s) : 4; }();
+            switch (heads) {
+                case 1:  fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 1>; kv_heads_per_block = 1; break;
+                case 2:  fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 2>; kv_heads_per_block = 2; break;
+                default: fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 4>; kv_heads_per_block = 4; break;
+            }
             static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
             if (trace_fagqa) {
                 GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld q8\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
