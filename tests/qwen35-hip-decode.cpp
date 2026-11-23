@@ -31,14 +31,16 @@ constexpr float EPS   = 1e-6f;
 enum { FUSE_MVSHARE = 1, FUSE_PREP1 = 2, FUSE_GDN1 = 4, FUSE_POST1 = 8, FUSE_BA1 = 16 };
 
 // qwen35: input of 2560, four quantized products of the input. qwen35moe: input of 2048, the beta and alpha weights are F32
+// or, in files with other types for the dense weights, quantized as in qwen35
 struct shape {
     const char * name;
     int          n;
     ggml_type    types[4]; // qkv, z, beta, alpha
-    bool         moe;
+    bool         ba_f32;   // beta and alpha are F32: not in mvshare, GGML_Q35MOE_BA1 takes them
 };
-static const shape SHAPE_QWEN35 = { "qwen35",    2560, { GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0 }, false };
-static const shape SHAPE_MOE    = { "qwen35moe", 2048, { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_F32,  GGML_TYPE_F32  }, true  };
+static const shape SHAPE_QWEN35 = { "qwen35",      2560, { GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0 }, false };
+static const shape SHAPE_MOE    = { "qwen35moe",   2048, { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_F32,  GGML_TYPE_F32  }, true  };
+static const shape SHAPE_MOE_Q  = { "qwen35moe-q", 2048, { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, false };
 
 static void check(bool ok, const char * what) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); std::exit(1); }
@@ -72,8 +74,8 @@ static std::vector<float> run(const model & m, int fuse, const inputs & in) {
     ggml_cgraph *  gf = ggml_new_graph(c);
     const size_t   fs = sizeof(float);
     const int      N  = m.sh->n;
-    // the F32 beta and alpha weights of qwen35moe are not in mvshare
-    const int n_share = m.sh->moe ? 2 : 4;
+    // F32 beta and alpha weights are not in mvshare
+    const int n_share = m.sh->ba_f32 ? 2 : 4;
 
     ggml_tensor * x   = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, 1); ggml_set_input(x);
     ggml_tensor * ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);    ggml_set_input(ids);
@@ -300,9 +302,9 @@ static long run_shape(const shape & sh, ggml_backend_t hip, ggml_backend_t cpu, 
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
     static const int rows[][2] = { {1, 1}, {0, 0}, {0, 2}, {2, 1} }; // {state row, cell}
-    const int fuse_all = FUSE_MVSHARE | FUSE_PREP1 | FUSE_GDN1 | FUSE_POST1 | (sh.moe ? FUSE_BA1 : 0);
+    const int fuse_all = FUSE_MVSHARE | FUSE_PREP1 | FUSE_GDN1 | FUSE_POST1 | (sh.ba_f32 ? FUSE_BA1 : 0);
     std::vector<int> modes = { FUSE_MVSHARE, FUSE_PREP1, FUSE_GDN1, FUSE_POST1 };
-    if (sh.moe) {
+    if (sh.ba_f32) {
         modes.push_back(FUSE_BA1);
         modes.push_back(FUSE_BA1 | FUSE_PREP1);
     }
@@ -363,7 +365,7 @@ static long run_shape(const shape & sh, ggml_backend_t hip, ggml_backend_t cpu, 
             std::printf("%s rep %d cpu callback, products: max|ref| %.4f, max diff %.3e\n", sh.name, rep, amax, dmax);
             check(dmax/amax < 5e-2, "cpu reference of mvshare is off");
             // the mvf callback against the stock F32 products on CPU
-            if (sh.moe) {
+            if (sh.ba_f32) {
                 const auto ba_cpu = run(m_cpu, FUSE_BA1, in);
                 amax = 0.0, dmax = 0.0;
                 for (int i = C + VAL; i < SEG_N[0]; ++i) {
@@ -396,6 +398,7 @@ int main(int argc, char ** argv) {
     }
     if (run_moe) {
         n_diff += run_shape(SHAPE_MOE, hip, cpu, worst_cpu);
+        n_diff += run_shape(SHAPE_MOE_Q, hip, cpu, worst_cpu);
     }
     check(n_diff == 0, "a fused op is not bit-exact");
     check(worst_cpu < 1e-3, "cpu reference error above 1e-3");
