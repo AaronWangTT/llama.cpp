@@ -1509,6 +1509,64 @@ static void test_json_schema() {
     );
 }
 
+// the text that the grammar forces after it accepted the input
+static void test_forced(const std::string & grammar_str, const std::string & input, size_t n_max, const std::string & expected, bool expected_end) {
+    fprintf(stderr, "  input '%s', forced '%s'\n", input.c_str(), expected.c_str());
+
+    llama_grammar * grammar = build_grammar(grammar_str);
+    assert(grammar != nullptr);
+
+    llama_grammar_accept_str(*grammar, input);
+
+    const llama_grammar_stacks stacks_org = llama_grammar_get_stacks(grammar);
+
+    bool is_end = !expected_end;
+    const std::string forced = llama_grammar_forced_str(*grammar, n_max, is_end);
+
+    assert(forced == expected);
+    assert(is_end == expected_end);
+    assert(llama_grammar_get_stacks(grammar) == stacks_org);
+
+    llama_grammar_free_impl(grammar);
+}
+
+static void test_forced_text() {
+    fprintf(stderr, "Testing forced text:\n");
+
+    const std::string grammar_str = R"""(
+        root  ::= "{\"id\": " ("true" | "false") ", \"why\": " str "}"
+        str   ::= "\"" [a-z ]* "\""
+    )""";
+
+    test_forced(grammar_str, "",                       100, "{\"id\": ",      false);
+    test_forced(grammar_str, "{\"i",                   100, "d\": ",          false);
+    test_forced(grammar_str, "{\"id\": ",              100, "",               false);
+    test_forced(grammar_str, "{\"id\": t",             100, "rue, \"why\": \"", false);
+    test_forced(grammar_str, "{\"id\": t",             5,   "rue, ",          false);
+    test_forced(grammar_str, "{\"id\": true, \"why\": \"ab", 100, "",       false);
+    test_forced(grammar_str, "{\"id\": true, \"why\": \"ab\"", 100, "}",    true);
+    test_forced(grammar_str, "{\"id\": true, \"why\": \"ab\"}", 100, "",    true);
+
+    // the text can end or go on: nothing is forced, the grammar is not complete
+    test_forced("root ::= \"ab\" \"c\"?", "ab", 100, "",   false);
+    test_forced("root ::= \"ab\" \"c\"?", "a",  100, "b",  false);
+    test_forced("root ::= \"ab\" \"c\"?", "abc", 100, "",  true);
+
+    // two paths with the same start
+    test_forced("root ::= \"abc\" | \"abd\"", "", 100, "ab", false);
+
+    // multi-byte chars are not cut
+    test_forced("root ::= \"\u00e9\u00e9\"", "", 3, "\xc3\xa9", false);
+    test_forced("root ::= \"\u00e9\u00e9\"", "", 4, "\xc3\xa9\xc3\xa9", true);
+
+    // an optional space in front of every literal, as in the grammars from a JSON schema
+    test_forced("root ::= \"{\" space \"\\\"a\\\"\" space \":\"\nspace ::= | \" \"", "",      100, "{",    false);
+    test_forced("root ::= \"{\" space \"\\\"a\\\"\" space \":\"\nspace ::= | \" \"", "{",     100, "",     false);
+    test_forced("root ::= \"{\" space \"\\\"a\\\"\" space \":\"\nspace ::= | \" \"", "{\"",   100, "a\"",  false);
+
+    fprintf(stderr, "  Passed\n");
+}
+
 int main() {
     fprintf(stdout, "Running grammar integration tests...\n");
     test_simple_grammar();
@@ -1521,6 +1579,7 @@ int main() {
     test_failure_missing_root_symbol();
     test_custom_root_symbol_check();
     test_json_schema();
+    test_forced_text();
     fprintf(stdout, "All tests passed.\n");
     return 0;
 }

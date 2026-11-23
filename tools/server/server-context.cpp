@@ -396,6 +396,9 @@ struct server_slot {
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
+    // tokens that the grammar forced, not decoded yet: they go into the batch in front of the sampled token
+    llama_tokens forced;
+
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
     // corresponding to one token position (size = n_embd)
     // for realtime transcription, these are the rows from the last audio stream step (size = n_rows * n_embd)
@@ -442,6 +445,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        forced.clear();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -626,6 +630,14 @@ struct server_slot {
                     inp_embd.clear(); // rows are consumed, the next step produces new ones
                 }
             } else {
+                // the forced tokens need no logits
+                for (const llama_token token : forced) {
+                    add_ok &= batch.add(id, token, prompt.tokens.pos_next(), false, false);
+                    prompt.tokens.push_back(token);
+                }
+                forced.clear();
+
+                i_batch = batch.size();
                 add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
             }
 
@@ -2196,7 +2208,7 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        if (!params_base.ctx_shift && slot.prompt.n_tokens() + (int32_t) slot.forced.size() + 1 >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -4602,8 +4614,9 @@ private:
                         // extract the logits only for the last token
                         batch.set_output(batch.size() - 1, true);
 
-                        slot.stats.n_gen = 0;
-                        slot.i_batch     = batch.size() - 1;
+                        slot.stats.n_gen        = 0;
+                        slot.stats.n_gen_forced = 0;
+                        slot.i_batch            = batch.size() - 1;
 
                         slot.init_sampler();
                     } else {
@@ -4846,6 +4859,35 @@ private:
         return true;
     }
 
+    // max number of tokens that the grammar can force in one step of this slot, 0 if the slot must sample every token
+    int32_t get_n_forced_max(const server_slot & slot) const {
+        if (params_base.n_grammar_forced <= 0 || slot.can_speculate() || slot.audio_stream || !slot.inp_embd.empty()) {
+            return 0;
+        }
+
+        // a forced token has no logits
+        if (slot.task->params.sampling.n_probs > 0) {
+            return 0;
+        }
+
+        // every slot can add its forced tokens and its sampled token to the same batch
+        const int32_t n_batch_slot = (int32_t) llama_n_batch(ctx_tgt) / std::max(1, (int32_t) slots.size()) - 1;
+
+        // as for a draft, leave space for 1 extra token to allow context shifts
+        const int32_t n_ctx_left = slot.n_ctx - slot.prompt.n_tokens() - 2;
+
+        return std::max(0, std::min({ params_base.n_grammar_forced, n_batch_slot, n_ctx_left }));
+    }
+
+    // accept the tokens that the grammar forces after the tokens accepted so far
+    llama_tokens accept_forced_tokens(server_slot & slot, int32_t n_max) {
+        const llama_tokens ids = common_sampler_forced(slot.smpl.get(), vocab, n_max);
+        for (const llama_token id : ids) {
+            common_sampler_accept(slot.smpl.get(), id, true);
+        }
+        return ids;
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4922,45 +4964,74 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+            // the tokens of this step: the first one is sampled unless the grammar forces it, the grammar forces the others
+            llama_tokens ids;
+
+            const int32_t n_forced_max = get_n_forced_max(slot);
+            if (n_forced_max > 0) {
+                ids = accept_forced_tokens(slot, n_forced_max);
+                if (!ids.empty()) {
+                    // the logits of this step are not read, the time measurement below needs the synchronization
+                    llama_synchronize(slot.ctx_tgt);
+                }
+            }
+
+            if (ids.empty()) {
+                llama_token id;
+                {
+                    scoped_timer timer(t_sampl, n_sampl);
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                }
+
+                common_sampler_accept(slot.smpl.get(), id, true);
+                ids.push_back(id);
+
+                if (n_forced_max > 0 && !llama_vocab_is_eog(vocab, id)) {
+                    const llama_tokens forced = accept_forced_tokens(slot, n_forced_max);
+                    ids.insert(ids.end(), forced.begin(), forced.end());
+                }
             }
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
-
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
-            slot.stats.n_gen += 1;
+            for (size_t i = 0; i < ids.size(); i++) {
+                slot.stats.n_gen += 1;
+                if (i > 0) {
+                    slot.stats.n_gen_forced += 1;
+                }
 
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
+                if (slot.stats.n_gen == 1) {
+                    slot.stats.update_prompt_last();
+                    slot.t_print_last = t_now;
+                    slot.n_gen_last = 0;
+                }
 
-            slot.stats.update_gen_last();
+                slot.stats.update_gen_last();
 
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+                completion_token_output result;
+                result.tok          = ids[i];
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
+                if (slot.task->params.sampling.n_probs > 0) {
+                    populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                }
 
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
+                if (!process_token(result, slot)) {
+                    // release slot because of stop condition
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
 
-                return;
+                    return;
+                }
+
+                if (i + 1 < ids.size()) {
+                    slot.forced.push_back(ids[i]);
+                }
             }
 
             slot.print_timings_tg();

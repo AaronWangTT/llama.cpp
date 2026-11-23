@@ -423,6 +423,7 @@ struct server_slot_stats {
     uint64_t n_prompt_cached    = 0;
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
+    uint64_t n_gen_forced       = 0; // tokens of n_gen that the grammar forced and that share the decode step of the token before them
 
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result
@@ -477,7 +478,7 @@ struct server_slot_stats {
     // number of decode steps spent on generation
     // the first token is free, it comes from the logits of the last prompt batch
     uint64_t n_gen_steps() const {
-        return n_gen > 0 ? n_gen - 1 : 0;
+        return n_gen > 0 ? n_gen - 1 - n_gen_forced : 0;
     }
 
     // other derived metrics

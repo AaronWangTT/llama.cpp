@@ -194,3 +194,10 @@ void llama_grammar_accept_token(
               struct llama_grammar & grammar,
                        llama_token   token,
                  const std::string & piece);
+
+// the text that every stack requires next, at most n_max bytes; the grammar state is not changed
+// is_end is set when the grammar is complete after this text
+std::string llama_grammar_forced_str(
+        const struct llama_grammar & grammar,
+                            size_t   n_max,
+                              bool & is_end);

@@ -49,6 +49,12 @@ void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
+// the tokens that the grammar forces next, at most n_max; the caller accepts them instead of sampling
+// they are the tokenization of the text that every path of the grammar requires next, without its last token:
+// the model chooses the token that joins the end of this text with the text that follows
+// when the grammar is complete after the text, all its tokens and the end-of-generation token are returned
+llama_tokens common_sampler_forced(struct common_sampler * gsmpl, const struct llama_vocab * vocab, size_t n_max);
+
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 

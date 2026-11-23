@@ -3872,6 +3872,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--grammar-forced-max"}, "N",
+        string_format("max number of tokens per step that the server takes from the grammar without sampling, when the grammar forces the text that follows; they are the tokens of the tokenizer for this text and are decoded in one batch with the next sampled token, so the logits after them can differ from the ones of one-token steps (default: %d, 0 = disabled)", params.n_grammar_forced),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cannot be negative");
+            }
+            params.n_grammar_forced = value;
+        }
+    ).set_env("LLAMA_ARG_GRAMMAR_FORCED_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {

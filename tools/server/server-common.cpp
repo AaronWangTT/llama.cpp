@@ -162,6 +162,10 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (n_gen_forced > 0) {
+        base["forced_n"] = n_gen_forced;
+    }
+
     return base;
 }
 

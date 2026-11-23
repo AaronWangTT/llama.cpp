@@ -730,6 +730,8 @@ struct common_params {
 
     float slot_prompt_similarity = 0.1f;
 
+    int32_t n_grammar_forced = 0; // server: max tokens per step that are taken from the grammar without sampling, 0 = disabled
+
     // batched-bench params
     bool is_pp_shared   = false;
     bool is_tg_separate = false;

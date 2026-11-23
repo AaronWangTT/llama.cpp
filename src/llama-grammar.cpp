@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-sampler.h"
+#include "unicode.h"
 
 #include <cmath>
 #include <algorithm>
@@ -1602,3 +1603,69 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
     }
 }
 
+std::string llama_grammar_forced_str(const struct llama_grammar & grammar, size_t n_max, bool & is_end) {
+    is_end = false;
+
+    std::string result;
+
+    if (grammar.awaiting_trigger || grammar.partial_utf8.n_remain != 0) {
+        return result;
+    }
+
+    llama_grammar_stacks stacks = grammar.stacks;
+
+    while (!stacks.empty()) {
+        size_t   n_done = 0; // stacks that accept the end of the text
+        uint32_t chr    = 0;
+
+        for (const auto & stack : stacks) {
+            if (stack.empty()) {
+                n_done++;
+                continue;
+            }
+
+            const llama_grammar_element * pos = stack.back();
+
+            // one exact char: not a token, a range, a set or an inverse set
+            if (pos->type != LLAMA_GRETYPE_CHAR || pos->value == 0 ||
+                    pos[1].type == LLAMA_GRETYPE_CHAR_RNG_UPPER ||
+                    pos[1].type == LLAMA_GRETYPE_CHAR_ALT ||
+                    (chr != 0 && chr != pos->value)) {
+                return result;
+            }
+
+            chr = pos->value;
+        }
+
+        if (n_done == stacks.size()) {
+            is_end = true;
+            break;
+        }
+
+        // a stack that can end here makes the char optional
+        if (n_done > 0) {
+            break;
+        }
+
+        const std::string utf8 = unicode_cpt_to_utf8(chr);
+        if (result.size() + utf8.size() > n_max) {
+            break;
+        }
+
+        llama_grammar_stacks stacks_new;
+        for (const auto & stack : stacks) {
+            const llama_grammar_element * pos = stack.back();
+
+            llama_grammar_stack stack_new(stack.begin(), stack.end() - 1);
+            if (!llama_grammar_is_end_of_sequence(pos + 1)) {
+                stack_new.push_back(pos + 1);
+            }
+            llama_grammar_advance_stack(grammar.rules, stack_new, stacks_new);
+        }
+
+        stacks  = std::move(stacks_new);
+        result += utf8;
+    }
+
+    return result;
+}

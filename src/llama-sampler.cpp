@@ -1,5 +1,6 @@
 #include "llama-sampler.h"
 
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-grammar.h"
@@ -2822,6 +2823,24 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens) {
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
+}
+
+std::string llama_sampler_grammar_forced_str(const struct llama_sampler * smpl, size_t n_max, bool * is_end) {
+    bool end = false;
+    std::string result;
+
+    if (smpl != nullptr && smpl->iface == &llama_sampler_grammar_i) {
+        const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+        if (ctx->grammar) {
+            result = llama_grammar_forced_str(*ctx->grammar, n_max, end);
+        }
+    }
+
+    if (is_end != nullptr) {
+        *is_end = end;
+    }
+
+    return result;
 }
 
 // penalties

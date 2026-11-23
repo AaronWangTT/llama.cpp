@@ -7,6 +7,8 @@
 
 #include "ggml.h"
 
+#include "../src/llama-ext.h" // llama_sampler_grammar_forced_str
+
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -505,6 +507,62 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     llama_sampler_accept(gsmpl->chain, token);
 
     gsmpl->prev.push_back(token);
+}
+
+llama_tokens common_sampler_forced(struct common_sampler * gsmpl, const struct llama_vocab * vocab, size_t n_max) {
+    llama_tokens result;
+
+    if (!gsmpl || !gsmpl->grmr || n_max == 0) {
+        return result;
+    }
+
+    // the reasoning budget sampler forces tokens of its own
+    if (gsmpl->rbudget) {
+        const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
+        if (state != REASONING_BUDGET_IDLE && state != REASONING_BUDGET_DONE) {
+            return result;
+        }
+    }
+
+    const size_t n_text_max = 8 * n_max;
+
+    bool is_end = false;
+    const std::string text = llama_sampler_grammar_forced_str(gsmpl->grmr, n_text_max, &is_end);
+
+    if (!text.empty()) {
+        result = common_tokenize(vocab, text, false, false);
+
+        // the tokenizer must not add or drop a char, the grammar reads the pieces
+        std::string pieces;
+        for (const llama_token token : result) {
+            pieces += common_token_to_piece(vocab, token, true);
+        }
+        if (pieces != text) {
+            result.clear();
+            return result;
+        }
+
+        if (result.size() > n_max) {
+            result.resize(n_max);
+            is_end = false;
+        } else if (!is_end) {
+            // the tokenizer joins the end of this text with the text that follows: ": " + "1" is ":", " 1"
+            // the model chooses that token, a forced one in its place moves its next choice
+            result.pop_back();
+        }
+    }
+
+    if (is_end && result.size() < n_max) {
+        llama_token eog = llama_vocab_eot(vocab);
+        if (eog == LLAMA_TOKEN_NULL) {
+            eog = llama_vocab_eos(vocab);
+        }
+        if (eog != LLAMA_TOKEN_NULL && llama_vocab_is_eog(vocab, eog)) {
+            result.push_back(eog);
+        }
+    }
+
+    return result;
 }
 
 void common_sampler_reset(struct common_sampler * gsmpl) {
