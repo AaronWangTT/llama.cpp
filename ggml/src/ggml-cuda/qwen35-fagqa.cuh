@@ -507,7 +507,7 @@ static bool ggml_cuda_flash_attn_ext_qwen35_fagqa(ggml_backend_cuda_context & ct
     cudaStream_t stream = ctx.stream();
 
     // The check reads the result back. A stream that captures a graph cannot do this, so it needs GGML_CUDA_DISABLE_GRAPHS=1.
-    static const bool check = getenv("GGML_QWEN35_FAGQA_CHECK") != nullptr && getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+    static const bool check = [] { const char * s = getenv("GGML_QWEN35_FAGQA_CHECK"); return s && strcmp(s, "1") == 0; }() && getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
     std::vector<float> out_ref;
     if (check) {
         ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

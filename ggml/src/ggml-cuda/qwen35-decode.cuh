@@ -20,6 +20,12 @@ static bool qwen35_state_on_device(int device, const ggml_tensor * t) {
     return buf && buf->buft == ggml_backend_cuda_buffer_type(device);
 }
 
+// a weight in memory of this device; the scheduler gives an op with a weight in host memory to the CPU backend
+static bool qwen35_weight_on_device(int device, const ggml_tensor * t) {
+    const ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    return buf && buf->buft == ggml_backend_cuda_buffer_type(device) && ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
 //
 // mvshare
 //
@@ -144,6 +150,7 @@ static __global__ void qwen35_prep1(
 
 static bool qwen35_prep1_supported(int device, const ggml_tensor * op) {
     return qwen35_decode_device(device) && ggml_qwen35_prep1_enabled() && ggml_qwen35_is_prep1(op) &&
+        qwen35_weight_on_device(device, op->src[3]) && qwen35_weight_on_device(device, op->src[4]) && qwen35_weight_on_device(device, op->src[5]) &&
         qwen35_state_on_device(device, op->src[6]) && qwen35_state_on_device(device, op->src[8]);
 }
 
@@ -321,7 +328,8 @@ static __global__ void qwen35_post1(const float * x_ptr, const float * w_ptr, co
 }
 
 static bool qwen35_post1_supported(int device, const ggml_tensor * op) {
-    return qwen35_decode_device(device) && ggml_qwen35_post1_enabled() && ggml_qwen35_is_post1(op);
+    return qwen35_decode_device(device) && ggml_qwen35_post1_enabled() && ggml_qwen35_is_post1(op) &&
+        qwen35_weight_on_device(device, op->src[1]);
 }
 
 static void qwen35_post1_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op) {

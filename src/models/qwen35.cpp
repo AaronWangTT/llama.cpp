@@ -7,8 +7,10 @@
 #include <cstring>
 
 // the one-token ops exist on a single ROCm device only; returns that device or nullptr
+// not with tensor overrides: an op next to a weight in host memory can go to the CPU backend, the new state is then lost
 static ggml_backend_dev_t qwen35_one_token_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
     if (cparams.cb_eval || cparams.optimizer_graph || !loras->empty() || model.devices.size() != 1 || model.devices.front().is_meta ||
+            model.has_tensor_overrides() ||
             (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
         return nullptr;
     }
@@ -406,8 +408,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * prep   = nullptr; // [q, k, v, beta, gate]
     ggml_tensor * output = nullptr;
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
-    const auto dev = n_seq_tokens == 1 && n_seqs == 1 && cparams.n_rs_seq == 0 && mctx_cur->get_n_rs() == 1 ?
+    const auto dev_one = n_seq_tokens == 1 && n_seqs == 1 && cparams.n_rs_seq == 0 && mctx_cur->get_n_rs() == 1 ?
         qwen35_one_token_dev(cparams, model, loras) : nullptr;
+    // a layer that is not on that device keeps the stock ops
+    const auto dev = dev_one && model.dev_layer(il) == dev_one ? dev_one : nullptr;
     const size_t fs = sizeof(float);
 
     // the zero state of build_rs(); the fused ops read the state row of the sequence from the cache
