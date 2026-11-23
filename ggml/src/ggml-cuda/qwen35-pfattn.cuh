@@ -9,7 +9,7 @@
 // A V half tile is transposed in shared memory, so a warp reads a WMMA operand with 4 loads of 16 bytes: 128 pairs of elements, 2*16 half2 (32 rows) and the padding per pair.
 #define QWEN35_PF_STRIDE_VT (2*16 + 4)
 
-// Shared memory: Q of 64 columns, one half tile of K or V (32 rows, or 128 pairs of elements), the mask tile of 16 queries.
+// Shared memory: Q of 64 columns, one half tile of K or V (32 rows, or 128 pairs of elements), the mask tile of up to 16 queries.
 #define QWEN35_PF_NBYTES_SHARED ((64*QWEN35_PF_STRIDE + 128*QWEN35_PF_STRIDE_VT)*sizeof(half2) + 16*(64 + 8)*sizeof(half))
 
 // K/V row numbers of 4 rows of a half tile. Warp w takes the rows 4*w .. 4*w + 3 from row0.
@@ -82,10 +82,10 @@ static __device__ __forceinline__ void qwen35_pf_store_rows_t(half2 * const __re
     }
 }
 
-// One output tile of 16 queries and 4 query heads of a KV head.
-// For each query the float operations and their order are the same as in flash_attn_ext_f16_process_tile<256, 256, 16, 4, 8, false, false, false>.
+// One output tile of 64 Q columns: 16 queries and 4 query heads of a KV head, or 8 queries and 8 query heads.
+// For each query the float operations and their order are the same as in flash_attn_ext_f16_process_tile<256, 256, ncols1, ncols2, 8, false, false, false>.
 // Q stays in shared memory. K and V come in half tiles of 32 rows. The global loads of a half tile go out before the product of the half tile before it, and their row numbers one step earlier.
-template<bool needs_fixup, bool is_fixup>
+template<int ncols1, int ncols2, bool needs_fixup, bool is_fixup>
 static __device__ __forceinline__ void qwen35_pfattn_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -110,8 +110,6 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
 #if defined(FLASH_ATTN_AVAILABLE) && defined(AMD_WMMA_256B_AVAILABLE)
     constexpr int DKQ    = 256;
     constexpr int DV     = 256;
-    constexpr int ncols1 = 16;
-    constexpr int ncols2 = 4;
     constexpr int ncols  = ncols1 * ncols2;
     constexpr int nwarps = 8;
 
@@ -133,7 +131,7 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
     static_assert(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols) == nwarps*warp_size && np == 2 && nbatch_fa == 64 && nbatch_combine == 64 &&
         cols_per_warp == 16 && cols_per_thread == 1 && warp_size == 32, "the kernel is written for this config");
     static_assert(nrows == np*T_A_KQ::I && nrows == np*2*T_A_VKQ::J && nrows == nwarps*4, "a half tile is one WMMA tile per parallel warp");
-    static_assert(ncols1 == 2*nwarps && nbatch_fa == 2*warp_size, "the mask tile is 2 queries per warp and 2 keys per lane");
+    static_assert(ncols1 % nwarps == 0 && ncols1 <= 16 && nbatch_fa == 2*warp_size, "the mask tile is 1 or 2 queries per warp and 2 keys per lane");
 
     constexpr int stride_tile_Q = QWEN35_PF_STRIDE;
     constexpr int stride_tile_K = QWEN35_PF_STRIDE;
@@ -514,7 +512,7 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(AMD_WMMA_256B_AVAILABLE)
 }
 
-// Same work split over the blocks as flash_attn_ext_f16<256, 256, 16, 4, false, false, false>. The caller makes sure that there is a mask, no sinks and no logit softcap.
+// Same work split over the blocks as flash_attn_ext_f16<256, 256, ncols1, ncols2, false, false, false>. The caller makes sure that there is a mask, no sinks and no logit softcap.
 template<int DKQ, int DV, int ncols1, int ncols2>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void qwen35_pfattn_f16(
@@ -551,7 +549,7 @@ static __global__ void qwen35_pfattn_f16(
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
     GGML_UNUSED_VARS(sinks_ptr, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne10, ne13, ne31);
 
-    static_assert(DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4, "the kernel is written for this shape");
+    static_assert(DKQ == 256 && DV == 256 && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8)), "the kernel is written for these shapes");
     constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
@@ -600,12 +598,12 @@ static __global__ void qwen35_pfattn_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // The block is working on an entire tile.
-            qwen35_pfattn_process_tile<needs_fixup, is_fixup>
+            qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dst_meta, scale,
                  ne01, ne02, gqa_ratio, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // The block is missing the beginning of a tile.
-            qwen35_pfattn_process_tile<needs_fixup, is_fixup>
+            qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dst_meta, scale,
                  ne01, ne02, gqa_ratio, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
@@ -643,7 +641,7 @@ static __global__ void qwen35_pfattn_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    qwen35_pfattn_process_tile<needs_fixup, is_fixup>
+    qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup>
         (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dst_meta, scale,
          ne01, ne02, gqa_ratio, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else

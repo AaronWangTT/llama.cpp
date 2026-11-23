@@ -57,7 +57,8 @@ static __global__ void qwen35_convpf(const float * cur_ptr, const float * past_p
 
 static bool qwen35_convpf_supported(int device, const ggml_tensor * op) {
     const auto & info = ggml_cuda_info().devices[device];
-    return info.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && info.warp_size == 32 && ggml_qwen35_convpf_enabled() && ggml_qwen35_is_convpf(op);
+    return info.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && info.warp_size == 32 && (ggml_qwen35_convpf_enabled() || ggml_q35moe_convpf_enabled()) &&
+        ggml_qwen35_is_convpf(op);
 }
 
 static void qwen35_convpf_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op) {

@@ -211,6 +211,7 @@ static __global__ void inkling_gate_j32_tail16(const char * __restrict__ x, cons
 }
 
 #include "inkling-hotpair.cuh"
+#include "q35moe-exptail.cuh"
 
 static int inkling_tail_layer(const char * name, const char * prefix, const char * suffix) {
     const size_t n = strlen(prefix);
@@ -330,6 +331,16 @@ void ggml_cuda_mul_mat_q(
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
     }
     GGML_ASSERT(J_best > 0);
+
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+    // GGML_Q35MOE_EXPTAIL=1: the kernel of q35moe-exptail.cuh sets the width of the tile specs
+    const bool q35moe_exptail = ids &&
+        q35moe_exptail_wanted(src0, src1, ids, dst, cc, ggml_cuda_info().devices[id].warp_size, fallback, prec_src1, fusion != nullptr);
+    if (q35moe_exptail) {
+        J_best        = q35moe_exptail_width;
+        nthreads_best = 128;
+    }
+#endif
 
     // A tile of size J can read in at most J - 1 extra columns.
     // For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.
@@ -512,6 +523,10 @@ void ggml_cuda_mul_mat_q(
                 return;
             }
         }
+    }
+    if (q35moe_exptail) {
+        q35moe_exptail_launch(args, cc, prec_src1, stream);
+        return;
     }
 #endif
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
