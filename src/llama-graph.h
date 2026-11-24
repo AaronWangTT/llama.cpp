@@ -855,6 +855,7 @@ struct llm_graph_params {
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
+    ggml_tensor * logits_rows   = nullptr; // vocabulary rows of the logits, see llama_set_logits_rows() (read)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -956,6 +957,7 @@ struct llm_graph_params {
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
+            logits_rows   == other.logits_rows   &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1022,6 +1024,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_logits_rows = nullptr; // [n_rows] token ids of the rows of t_logits when it does not hold the whole vocabulary
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1137,6 +1140,7 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
+    ggml_tensor * logits_rows;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

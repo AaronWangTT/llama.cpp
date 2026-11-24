@@ -1509,6 +1509,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_logits_rows = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1681,6 +1682,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    logits_rows      (params.logits_rows),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -4740,11 +4742,12 @@ void llm_graph_context::build_sampling() const {
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
+            // with a row list the logits are indexed by list entry, the samplers map the entries to token ids
             struct llama_sampler_data data = {
                 /*.logits       =*/ logits_seq,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ nullptr,
+                /*.candidates   =*/ res->t_logits_rows,
             };
 
             assert(sampler->iface->backend_apply);

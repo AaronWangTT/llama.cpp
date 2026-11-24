@@ -1651,6 +1651,81 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
     return true;
 }
 
+bool llama_context::set_logits_rows(const llama_token * rows, int32_t n_rows) {
+    // the graphs in flight read the list
+    synchronize();
+
+    auto reset = [&]() {
+        if (logits_rows != nullptr) {
+            sched_need_reserve = true;
+        }
+        logits_rows = nullptr;
+        buf_logits_rows.reset();
+        ctx_logits_rows.reset();
+    };
+
+    if (rows == nullptr || n_rows <= 0) {
+        reset();
+        return n_rows == 0;
+    }
+
+    const int32_t n_vocab = model.vocab.n_tokens();
+
+    // only the MTP graphs take the list; a short list could not feed the samplers
+    bool ok = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_rows >= 256 && n_rows <= n_vocab;
+    if (ok) {
+        std::vector<bool> seen(n_vocab, false);
+        for (int32_t i = 0; i < n_rows && ok; ++i) {
+            ok = rows[i] >= 0 && rows[i] < n_vocab && !seen[rows[i]];
+            if (ok) {
+                seen[rows[i]] = true;
+            }
+        }
+    }
+
+    ggml_backend_dev_t dev = ok ? model.dev_output() : nullptr;
+    if (dev == nullptr || backend_from_dev(dev) == nullptr) {
+        LLAMA_LOG_WARN("%s: the row list cannot be used (%d rows), the logits keep the whole vocabulary\n", __func__, n_rows);
+        reset();
+        return false;
+    }
+
+    const int64_t n_cols = cparams.n_seq_max;
+
+    if (logits_rows == nullptr || logits_rows->ne[0] != n_rows || logits_rows->ne[1] != n_cols) {
+        reset();
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_logits_rows.reset(ggml_init(params));
+
+        logits_rows = ggml_new_tensor_2d(ctx_logits_rows.get(), GGML_TYPE_I32, n_rows, n_cols);
+        ggml_set_name(logits_rows, "logits_rows");
+
+        buf_logits_rows.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_logits_rows.get(), ggml_backend_dev_buffer_type(dev)));
+        if (!buf_logits_rows) {
+            LLAMA_LOG_WARN("%s: failed to allocate the row list, the logits keep the whole vocabulary\n", __func__);
+            reset();
+            return false;
+        }
+
+        sched_need_reserve = true;
+
+        LLAMA_LOG_INFO("%s: logits for %d of %d vocabulary rows\n", __func__, n_rows, n_vocab);
+    }
+
+    std::vector<int32_t> data((size_t) n_rows*n_cols);
+    for (int64_t c = 0; c < n_cols; ++c) {
+        std::copy(rows, rows + n_rows, data.begin() + c*n_rows);
+    }
+    ggml_backend_tensor_set(logits_rows, data.data(), 0, ggml_nbytes(logits_rows));
+
+    return true;
+}
+
 bool llama_context::set_ctx_state_src(llama_context * ctx_src) {
     if (cparams.ctx_state_src != ctx_src) {
         sched_need_reserve = true;
@@ -3096,6 +3171,7 @@ llm_graph_params llama_context::graph_params(
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
+        /*.logits_rows   =*/ logits_rows,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4741,6 +4817,10 @@ bool llama_set_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t 
 
 bool llama_set_ctx_state_src(llama_context * ctx, llama_context * ctx_src) {
     return ctx->set_ctx_state_src(ctx_src);
+}
+
+bool llama_set_logits_rows(llama_context * ctx, const llama_token * rows, int32_t n_rows) {
+    return ctx->set_logits_rows(rows, n_rows);
 }
 
 void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {

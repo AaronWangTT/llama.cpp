@@ -1568,6 +1568,154 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
+    // shortlist of the draft head (llama_set_logits_rows()): always sl_n distinct token ids,
+    // the tokens the sequences have seen plus the most frequent ones of the file up to sl_n
+    int32_t sl_n = 0;                         // 0 - unused
+    std::vector<llama_token> sl_rank;         // all token ids, the ones of the file first
+    std::vector<uint8_t>     sl_in;           // [n_vocab] the token is in the list
+    std::vector<std::vector<uint8_t>> sl_seen; // [n_seq][n_vocab] the sequence has seen the token
+    std::vector<llama_token> sl_rows;         // the list as it was sent to the context
+    int32_t sl_victim = -1;                   // rank index of the next file token to give up its row
+    bool    sl_dirty  = false;
+    bool    sl_full   = false;
+
+    bool sl_seen_any(llama_token id) const {
+        for (const auto & s : sl_seen) {
+            if (s[id]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // the list from scratch: the seen tokens first, then the file order
+    void sl_rebuild() {
+        const int32_t n_vocab = (int32_t) sl_in.size();
+        const int32_t n_keep  = sl_n - sl_n/4; // the seen tokens take at most this many rows
+
+        std::fill(sl_in.begin(), sl_in.end(), 0);
+
+        int32_t n = 0;
+        for (llama_token id = 0; id < n_vocab && n < n_keep; ++id) {
+            if (sl_seen_any(id)) {
+                sl_in[id] = 1;
+                n++;
+            }
+        }
+        sl_full = n >= n_keep;
+
+        sl_victim = -1;
+        for (int32_t r = 0; r < n_vocab && n < sl_n; ++r) {
+            if (!sl_in[sl_rank[r]]) {
+                sl_in[sl_rank[r]] = 1;
+                n++;
+            }
+            sl_victim = r;
+        }
+        sl_dirty = true;
+    }
+
+    // seq_id has seen the token: it takes the row of the least frequent file token that no sequence has seen
+    void sl_add(llama_seq_id seq_id, llama_token id) {
+        if (sl_n == 0 || id < 0 || id >= (llama_token) sl_in.size() || sl_seen[seq_id][id]) {
+            return;
+        }
+        sl_seen[seq_id][id] = 1;
+        if (sl_in[id] || sl_full) {
+            return;
+        }
+        while (sl_victim >= sl_n/4 && (!sl_in[sl_rank[sl_victim]] || sl_seen_any(sl_rank[sl_victim]))) {
+            sl_victim--;
+        }
+        if (sl_victim < sl_n/4) {
+            // no row left to give up, the next begin() starts over
+            sl_full = true;
+            return;
+        }
+        sl_in[sl_rank[sl_victim--]] = 0;
+        sl_in[id] = 1;
+        sl_dirty  = true;
+    }
+
+    void sl_push() {
+        if (sl_n == 0 || !sl_dirty) {
+            return;
+        }
+        sl_dirty = false;
+
+        sl_rows.clear();
+        for (llama_token id = 0; id < (llama_token) sl_in.size(); ++id) {
+            if (sl_in[id]) {
+                sl_rows.push_back(id);
+            }
+        }
+        GGML_ASSERT((int32_t) sl_rows.size() == sl_n);
+
+        if (!llama_set_logits_rows(params.ctx_dft, sl_rows.data(), sl_n)) {
+            SPC_WRN("%s", "the draft context does not take the shortlist, drafting with the whole output head\n");
+            llama_set_logits_rows(params.ctx_dft, nullptr, 0);
+            sl_n = 0;
+        }
+    }
+
+    void sl_init(const common_params_speculative_draft & p) {
+        if (p.shortlist_n <= 0) {
+            return;
+        }
+
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(p.ctx_dft)));
+
+        const bool all_backend = std::all_of(backend_chains.begin(), backend_chains.end(), [](const llama_sampler * c) { return c != nullptr; });
+        if (p.shortlist.empty() || !all_backend || is_mem_shared || chain_heads) {
+            SPC_WRN("the draft shortlist is not used (file '%s', %d rows of %d, backend sampling %d)\n",
+                    p.shortlist.c_str(), p.shortlist_n, n_vocab, (int) all_backend);
+            return;
+        }
+
+        std::vector<uint8_t> ranked(n_vocab, 0);
+
+        size_t n_file = 0;
+        {
+            std::ifstream f(p.shortlist);
+            std::string line;
+            while (f && std::getline(f, line)) {
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                char * end = nullptr;
+                const long id = std::strtol(line.c_str(), &end, 10);
+                if (end == line.c_str() || id < 0 || id >= n_vocab || ranked[id]) {
+                    continue;
+                }
+                ranked[id] = 1;
+                sl_rank.push_back((llama_token) id);
+            }
+            n_file = sl_rank.size();
+        }
+        if (n_file == 0) {
+            SPC_WRN("no token ids in the draft shortlist file '%s', drafting with the whole output head\n", p.shortlist.c_str());
+            sl_rank.clear();
+            return;
+        }
+        for (llama_token id = 0; id < n_vocab; ++id) {
+            if (!ranked[id]) {
+                sl_rank.push_back(id);
+            }
+        }
+
+        sl_n = std::min(std::max(p.shortlist_n, 1024), n_vocab);
+        sl_in.assign(n_vocab, 0);
+        sl_seen.assign(n_seq, std::vector<uint8_t>(n_vocab, 0));
+
+        sl_rebuild();
+        sl_push();
+
+        if (sl_n > 0) {
+            SPC_INF("draft shortlist: logits for %d of %d rows of the output head (%zu ranked token ids in '%s')\n",
+                    sl_n, n_vocab, n_file, p.shortlist.c_str());
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1655,10 +1803,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
+
+        sl_init(this->params);
     }
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (sl_n > 0 && ctx_dft) {
+            llama_set_logits_rows(ctx_dft, nullptr, 0);
+        }
         if (dev_rows) {
             llama_set_ctx_state_src(ctx_dft, nullptr);
             llama_set_embeddings_nextn_dev(this->params.ctx_tgt, false);
@@ -1678,6 +1831,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+
+        if (sl_n > 0) {
+            // the tokens of this sequence start over with the prompt
+            std::fill(sl_seen[seq_id].begin(), sl_seen[seq_id].end(), 0);
+            for (const llama_token id : prompt) {
+                if (id >= 0 && id < (llama_token) sl_in.size()) {
+                    sl_seen[seq_id][id] = 1;
+                }
+            }
+            sl_rebuild();
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1718,6 +1882,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     if (i_batch_beg[seq_id] < 0) {
                         i_batch_beg[seq_id] = k;
                     }
+                    sl_add(seq_id, batch_in.tokens[k].id);
                 }
             }
         }
@@ -1884,7 +2049,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+
+            sl_add(seq_id, dp.id_last);
         }
+
+        sl_push();
 
         int i = 0;
 

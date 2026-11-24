@@ -350,6 +350,11 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    // draft-mtp: the draft head computes logits only for shortlist_n vocabulary rows (0 - all rows):
+    // the tokens of the sequences plus the first tokens of the file (token ids, most frequent first, one per line)
+    std::string shortlist;
+    int32_t     shortlist_n = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

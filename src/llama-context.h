@@ -96,6 +96,8 @@ struct llama_context {
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
+    bool set_logits_rows(const llama_token * rows, int32_t n_rows);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -485,6 +487,12 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read;
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
+
+    // device buffer with the vocabulary rows of the logits, I32 [n_rows, n_seq_max]: every column holds the same list,
+    // one column per output of a draft step (see llama_set_logits_rows())
+    ggml_context_ptr        ctx_logits_rows;
+    ggml_backend_buffer_ptr buf_logits_rows;
+    ggml_tensor *           logits_rows = nullptr;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

@@ -4326,6 +4326,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-draft-shortlist"}, "FNAME",
+        "draft-mtp: file with token ids, most frequent first, one per line; with --spec-draft-shortlist-n the draft head "
+        "computes logits only for the tokens of the sequences plus the first tokens of this file (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.shortlist = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SHORTLIST"));
+    add_opt(common_arg(
+        {"--spec-draft-shortlist-n"}, "N",
+        string_format("draft-mtp: number of vocabulary rows the draft head computes logits for, needs --spec-draft-shortlist "
+                      "and backend sampling of the draft (default: %d, 0 = all rows)", params.speculative.draft.shortlist_n),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.shortlist_n = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SHORTLIST_N"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",
