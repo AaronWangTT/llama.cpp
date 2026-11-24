@@ -332,6 +332,170 @@ void mvf_cpu(ggml_tensor * dst, int ith, int, void *) {
         }
     }
 }
+//
+// prepn, gdnn
+//
+
+// tokens of a batch that the ops for a few tokens take
+bool few_tokens(int64_t n_t) {
+    return n_t >= 2 && n_t <= ggml_q35moe_few_max;
+}
+
+// [n0, n1, n_t] F32 with dense rows, the tokens may have a stride
+bool f32_tokens(const ggml_tensor * x, int64_t n0, int64_t n1, int64_t n_t) {
+    return x && x->type == GGML_TYPE_F32 && x->ne[0] == n0 && x->ne[1] == n1 && x->ne[2] == n_t && x->ne[3] == 1 &&
+        x->nb[0] == sizeof(float) && x->nb[1] == (size_t) n0*sizeof(float) && x->nb[2] >= (size_t) (n0*n1)*sizeof(float) &&
+        x->nb[2] % sizeof(float) == 0;
+}
+
+// cell is the row of slot 0 in states, the rows of one slot per token exist
+bool slot_rows_ok(const ggml_tensor * states, const ggml_tensor * cell, int64_t n_t, int64_t slot_rows) {
+    if (states->view_src || cell->view_src != states || cell->view_offs % states->nb[1] != 0) {
+        return false;
+    }
+    const int64_t row = cell->view_offs/states->nb[1];
+    return slot_rows >= 1 && slot_rows <= states->ne[1] && row < slot_rows && row + (n_t - 1)*slot_rows < states->ne[1];
+}
+
+bool prepn_layout(const ggml_tensor * qkv, const ggml_tensor * beta, const ggml_tensor * alpha, const ggml_tensor * conv_w,
+        const ggml_tensor * dt, const ggml_tensor * a, const ggml_tensor * states, const ggml_tensor * ids, const ggml_tensor * cell,
+        int64_t n_norm, int64_t slot_rows) {
+    if (!qkv || !dt) {
+        return false;
+    }
+    const int64_t n   = qkv->ne[0];
+    const int64_t n_t = qkv->ne[1];
+    const int64_t n_h = ggml_nelements(dt);
+    return few_tokens(n_t) && n > 0 && n % head_dim == 0 && n <= INT32_MAX/(n_conv*ggml_q35moe_few_max) && n_norm >= 0 && n_norm <= n &&
+        n_norm % head_dim == 0 && n_h > 0 && n_h <= n && f32_block(qkv, n*n_t) && f32_block(beta, n_h*n_t) && f32_block(alpha, n_h*n_t) &&
+        f32_block(dt, n_h) && f32_block(a, n_h) && f32_block(conv_w, n_conv*n) && conv_w->ne[0] == n_conv && conv_w->ne[1] == n &&
+        state_rows(states, cell, (n_conv - 1)*n) && row_id(ids) && slot_rows_ok(states, cell, n_t, slot_rows);
+}
+
+// reference; a channel is read from the state row before its slots are written, the row can be one of the slots
+void prepn_cpu(ggml_tensor * dst, int ith, int, void *) {
+    if (ith != 0) {
+        return;
+    }
+    const ggml_tensor * states = dst->src[6];
+    const int64_t n         = dst->src[0]->ne[0];
+    const int64_t n_t       = dst->src[0]->ne[1];
+    const int64_t n_h       = ggml_nelements(dst->src[4]);
+    const int64_t n_norm    = ggml_get_op_params_i32(dst, ggml_qwen35_prep1_slot_n_norm);
+    const float   eps       = ggml_get_op_params_f32(dst, ggml_qwen35_prep1_slot_eps);
+    const float   scale     = ggml_get_op_params_f32(dst, ggml_qwen35_prep1_slot_scale);
+    const int64_t slot_size = ggml_get_op_params_i32(dst, ggml_q35moe_prepn_slot_slot_rows)*states->ne[0];
+    const float * qkv    = static_cast<const float *>(dst->src[0]->data);
+    const float * beta   = static_cast<const float *>(dst->src[1]->data);
+    const float * alpha  = static_cast<const float *>(dst->src[2]->data);
+    const float * weight = static_cast<const float *>(dst->src[3]->data);
+    const float * dt     = static_cast<const float *>(dst->src[4]->data);
+    const float * a      = static_cast<const float *>(dst->src[5]->data);
+    const float * past   = static_cast<const float *>(states->data) + state_row(states, dst->src[7])*states->ne[0];
+    float *       cell   = static_cast<float *>(dst->src[8]->data);
+    float *       out    = static_cast<float *>(dst->data);
+
+    for (int64_t c = 0; c < n; ++c) {
+        float x[n_conv - 1 + ggml_q35moe_few_max];
+        for (int j = 0; j < n_conv - 1; ++j) {
+            x[j] = past[c*(n_conv - 1) + j];
+        }
+        for (int64_t t = 0; t < n_t; ++t) {
+            x[n_conv - 1 + t] = qkv[t*n + c];
+        }
+        for (int64_t t = 0; t < n_t; ++t) {
+            float sum = 0.0f;
+            for (int j = 0; j < n_conv; ++j) {
+                sum += x[t + j]*weight[c*n_conv + j];
+            }
+            out[t*n + c] = sum/(1.0f + expf(-sum));
+        }
+        for (int64_t s = 0; s < n_t; ++s) {
+            for (int j = 0; j < n_conv - 1; ++j) {
+                cell[s*slot_size + c*(n_conv - 1) + j] = x[n_t - s + j];
+            }
+        }
+    }
+    for (int64_t t = 0; t < n_t; ++t) {
+        for (int64_t h = 0; h < n_norm/head_dim; ++h) {
+            float * y = out + t*n + h*head_dim;
+            float sum = 0.0f;
+            for (int i = 0; i < head_dim; ++i) {
+                sum += y[i]*y[i];
+            }
+            const float norm = 1.0f/sqrtf(sum/head_dim + eps);
+            for (int i = 0; i < head_dim; ++i) {
+                y[i] = scale*(norm*y[i]);
+            }
+        }
+        for (int64_t h = 0; h < n_h; ++h) {
+            const float v = alpha[t*n_h + h] + dt[h];
+            out[n_t*n + t*n_h + h]           = 1.0f/(1.0f + expf(-beta[t*n_h + h]));
+            out[n_t*n + n_t*n_h + t*n_h + h] = (v > 20.0f ? v : log1pf(expf(v)))*a[h];
+        }
+    }
+}
+
+bool gdnn_layout(const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * g, const ggml_tensor * b,
+        const ggml_tensor * states, const ggml_tensor * ids, const ggml_tensor * cell, int64_t slot_rows) {
+    if (!q || !v) {
+        return false;
+    }
+    const int64_t n_h   = v->ne[1];
+    const int64_t n_h_k = q->ne[1];
+    const int64_t n_t   = v->ne[2];
+    return few_tokens(n_t) && n_h > 0 && n_h <= INT32_MAX/(head_dim*head_dim) && n_h_k > 0 && n_h % n_h_k == 0 &&
+        f32_tokens(v, head_dim, n_h, n_t) && f32_tokens(q, head_dim, n_h_k, n_t) && f32_tokens(k, head_dim, n_h_k, n_t) &&
+        q->nb[2] == k->nb[2] && f32_block(g, n_h*n_t) && f32_block(b, n_h*n_t) &&
+        state_rows(states, cell, head_dim*head_dim*n_h) && row_id(ids) && slot_rows_ok(states, cell, n_t, slot_rows);
+}
+
+// reference; a row of the state is read before its slots are written, the state row can be one of the slots
+void gdnn_cpu(ggml_tensor * dst, int ith, int, void *) {
+    if (ith != 0) {
+        return;
+    }
+    const ggml_tensor * states = dst->src[5];
+    const int64_t n_h       = dst->src[2]->ne[1];
+    const int64_t n_h_k     = dst->src[0]->ne[1];
+    const int64_t n_t       = dst->src[2]->ne[2];
+    const int64_t slot_size = ggml_get_op_params_i32(dst, ggml_q35moe_gdnn_slot_slot_rows)*states->ne[0];
+    const int64_t s_qk      = dst->src[0]->nb[2]/sizeof(float);
+    const int64_t s_v       = dst->src[2]->nb[2]/sizeof(float);
+    const float * q     = static_cast<const float *>(dst->src[0]->data);
+    const float * k     = static_cast<const float *>(dst->src[1]->data);
+    const float * v     = static_cast<const float *>(dst->src[2]->data);
+    const float * g     = static_cast<const float *>(dst->src[3]->data);
+    const float * b     = static_cast<const float *>(dst->src[4]->data);
+    const float * src   = static_cast<const float *>(states->data) + state_row(states, dst->src[6])*states->ne[0];
+    float *       cell  = static_cast<float *>(dst->src[7]->data);
+    float *       out   = static_cast<float *>(dst->data);
+    const float   scale = 1.0f/sqrtf((float) head_dim);
+
+    for (int64_t h = 0; h < n_h; ++h) {
+        for (int col = 0; col < head_dim; ++col) {
+            float s[head_dim];
+            std::memcpy(s, src + (h*head_dim + col)*head_dim, sizeof(s));
+            for (int64_t t = 0; t < n_t; ++t) {
+                const float * q_h   = q + t*s_qk + (h % n_h_k)*head_dim;
+                const float * k_h   = k + t*s_qk + (h % n_h_k)*head_dim;
+                const float   decay = expf(g[t*n_h + h]);
+                float kv = 0.0f;
+                for (int i = 0; i < head_dim; ++i) {
+                    kv += s[i]*k_h[i];
+                }
+                const float delta = (v[t*s_v + h*head_dim + col] - decay*kv)*b[t*n_h + h];
+                float attn = 0.0f;
+                for (int i = 0; i < head_dim; ++i) {
+                    s[i] = decay*s[i] + k_h[i]*delta;
+                    attn += s[i]*q_h[i];
+                }
+                out[(t*n_h + h)*head_dim + col] = attn*scale;
+                std::memcpy(cell + (n_t - 1 - t)*slot_size + (h*head_dim + col)*head_dim, s, sizeof(s));
+            }
+        }
+    }
+}
 } // namespace
 
 bool ggml_qwen35_mvshare_enabled() {
@@ -417,7 +581,7 @@ bool ggml_qwen35_post1_enabled() {
 }
 
 ggml_tensor * ggml_qwen35_try_post1(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * z, float eps) {
-    if (!(ggml_qwen35_post1_enabled() || ggml_q35moe_post1_enabled()) || !post1_layout(x, w, z)) {
+    if (!(ggml_qwen35_post1_enabled() || ggml_q35moe_post1_enabled() || ggml_q35moe_postn_enabled()) || !post1_layout(x, w, z)) {
         return nullptr;
     }
     ggml_tensor * args[] = { x, w, z };
@@ -482,5 +646,62 @@ bool ggml_q35moe_is_mvf(const ggml_tensor * op) {
 
 bool ggml_q35moe_rs1_enabled() {
     static const bool enabled = env_on("GGML_Q35MOE_RS1");
+    return enabled;
+}
+
+bool ggml_q35moe_prepn_enabled() {
+    static const bool enabled = env_on("GGML_Q35MOE_PREPN");
+    return enabled;
+}
+
+ggml_tensor * ggml_q35moe_try_prepn(ggml_context * ctx, ggml_tensor * qkv, ggml_tensor * beta, ggml_tensor * alpha,
+        ggml_tensor * conv_w, ggml_tensor * dt, ggml_tensor * a, ggml_tensor * states, ggml_tensor * ids, ggml_tensor * cell,
+        int64_t n_norm, float eps, float scale, int64_t slot_rows) {
+    if (!ggml_q35moe_prepn_enabled() || slot_rows > INT32_MAX || !prepn_layout(qkv, beta, alpha, conv_w, dt, a, states, ids, cell, n_norm, slot_rows)) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = { qkv, beta, alpha, conv_w, dt, a, states, ids, cell };
+    ggml_tensor * op = ggml_custom_4d(ctx, GGML_TYPE_F32, ggml_nelements(qkv) + 2*ggml_nelements(beta), 1, 1, 1, args, 9, prepn_cpu, 1, nullptr);
+    ggml_set_op_params_i32(op, ggml_qwen35_prep1_slot_n_norm,    (int32_t) n_norm);
+    ggml_set_op_params_f32(op, ggml_qwen35_prep1_slot_eps,       eps);
+    ggml_set_op_params_f32(op, ggml_qwen35_prep1_slot_scale,     scale);
+    ggml_set_op_params_i32(op, ggml_q35moe_prepn_slot_slot_rows, (int32_t) slot_rows);
+    return op;
+}
+
+bool ggml_q35moe_is_prepn(const ggml_tensor * op) {
+    if (!custom_op(op, prepn_cpu, 9) || op->ne[1] != 1 || op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+    return prepn_layout(op->src[0], op->src[1], op->src[2], op->src[3], op->src[4], op->src[5], op->src[6], op->src[7], op->src[8],
+            ggml_get_op_params_i32(op, ggml_qwen35_prep1_slot_n_norm), ggml_get_op_params_i32(op, ggml_q35moe_prepn_slot_slot_rows)) &&
+        op->ne[0] == ggml_nelements(op->src[0]) + 2*ggml_nelements(op->src[1]);
+}
+
+bool ggml_q35moe_gdnn_enabled() {
+    static const bool enabled = env_on("GGML_Q35MOE_GDNN");
+    return enabled;
+}
+
+ggml_tensor * ggml_q35moe_try_gdnn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * g, ggml_tensor * b, ggml_tensor * states, ggml_tensor * ids, ggml_tensor * cell, int64_t slot_rows) {
+    if (!ggml_q35moe_gdnn_enabled() || slot_rows > INT32_MAX || !gdnn_layout(q, k, v, g, b, states, ids, cell, slot_rows)) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = { q, k, v, g, b, states, ids, cell };
+    ggml_tensor * op = ggml_custom_4d(ctx, GGML_TYPE_F32, head_dim, v->ne[1], v->ne[2], 1, args, 8, gdnn_cpu, 1, nullptr);
+    ggml_set_op_params_i32(op, ggml_q35moe_gdnn_slot_slot_rows, (int32_t) slot_rows);
+    return op;
+}
+
+bool ggml_q35moe_is_gdnn(const ggml_tensor * op) {
+    return custom_op(op, gdnn_cpu, 8) && op->ne[0] == head_dim && op->ne[3] == 1 &&
+        gdnn_layout(op->src[0], op->src[1], op->src[2], op->src[3], op->src[4], op->src[5], op->src[6], op->src[7],
+                ggml_get_op_params_i32(op, ggml_q35moe_gdnn_slot_slot_rows)) &&
+        op->ne[1] == op->src[2]->ne[1] && op->ne[2] == op->src[2]->ne[2];
+}
+
+bool ggml_q35moe_postn_enabled() {
+    static const bool enabled = env_on("GGML_Q35MOE_POSTN");
     return enabled;
 }

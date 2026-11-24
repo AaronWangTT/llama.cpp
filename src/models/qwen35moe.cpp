@@ -420,6 +420,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     if (ggml_tensor * one = build_layer_attn_linear_one(inp, cur, il)) {
         return one;
     }
+    if (ggml_tensor * few = build_layer_attn_linear_few(inp, cur, il)) {
+        return few;
+    }
 #endif
 
     // Input projections
@@ -809,6 +812,218 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, 1);
+
+    // Output projection
+    cur = build_lora_mm(layer.ssm_out, final_output, layer.ssm_out_s);
+    cb(cur, "linear_attn_out", il);
+
+    return cur;
+}
+#endif
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+// build_layer_attn_linear() for 2 to n_rs_seq + 1 tokens of one sequence in a context with rollback snapshots (a draft verification
+// batch) on a single ROCm device. GGML_Q35MOE_PREPN, GDNN and POSTN give one part each to an op of ggml-qwen35-decode.h,
+// a part whose op is off or not usable gets the stock nodes
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_few(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        cur,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+    const auto & layer    = model.layers[il];
+
+    if (!ggml_q35moe_prepn_enabled() && !ggml_q35moe_gdnn_enabled() && !ggml_q35moe_postn_enabled()) {
+        return nullptr;
+    }
+    // a reason that holds for the whole context goes to the log once; the shape of the batch does not
+    const char * why = nullptr;
+    const auto dev = q35moe_rocm_dev(cparams, model, loras, il, false, &why);
+
+    const int64_t d_inner       = hparams.ssm_d_inner;
+    const int64_t head_k_dim    = hparams.ssm_d_state;
+    const int64_t num_k_heads   = hparams.ssm_n_group;
+    const int64_t num_v_heads   = hparams.ssm_dt_rank;
+    const int64_t head_v_dim    = d_inner / num_v_heads;
+    const int64_t key_dim       = head_k_dim * num_k_heads;
+    const int64_t conv_channels = d_inner + 2 * key_dim;
+    const int64_t n_t           = ubatch.n_seq_tokens;
+
+    // the kernels replay the stock kernels of this head size only
+    if (dev && (head_k_dim != ggml_qwen35_head_dim || head_v_dim != head_k_dim || d_inner != head_v_dim * num_v_heads)) {
+        why = "the head size of the recurrent blocks";
+    }
+    if (dev && !why && cparams.n_rs_seq == 0) {
+        why = "the context keeps no rollback snapshots (n_rs_seq is 0)";
+    }
+    if (why) {
+        q35moe_log_off("GGML_Q35MOE_PREPN/GDNN/POSTN", why);
+        return nullptr;
+    }
+    // PREPN and GDNN write the state cache, the backend takes them only with the cache in its memory
+    if (!cparams.offload_kqv && (ggml_q35moe_prepn_enabled() || ggml_q35moe_gdnn_enabled())) {
+        q35moe_log_off("GGML_Q35MOE_PREPN/GDNN", "the recurrent state is not in device memory (--no-kv-offload)");
+    }
+    // up to n_rs_seq + 1 tokens every token writes a slot and the stock delta net is the plain kernel
+    if (n_t < 2 || n_t > (int64_t) cparams.n_rs_seq + 1 || n_t > ggml_q35moe_few_max || ubatch.n_seqs != 1 || mctx_cur->get_n_rs() != 1) {
+        return nullptr;
+    }
+
+    const size_t fs = sizeof(float);
+
+    auto usable = [&](const ggml_tensor * candidate) {
+        return candidate && ggml_backend_dev_supports_op(dev, candidate);
+    };
+    // the zero state of build_rs(); the fused ops read the state row of the sequence from the cache
+    auto clear_zero_state = [&](ggml_tensor * states) {
+        const int32_t rs_zero = mctx_cur->get_rs_z();
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, states->ne[0]*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
+    };
+    // slot 0 of the cell of the sequence
+    auto cell_of = [&](ggml_context * ctx, ggml_tensor * states) {
+        return ggml_view_2d(ctx, states, states->ne[0], 1, states->nb[1], mctx_cur->get_head()*states->nb[1]);
+    };
+
+    // Input projections
+    auto qkvz = build_qkvz(cur, il);
+    ggml_tensor * qkv_mixed = qkvz.first;
+    ggml_tensor * z         = qkvz.second;
+
+    ggml_tensor * beta = build_lora_mm(layer.ssm_beta, cur, layer.ssm_beta_s);
+    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_t, 1);
+    cb(beta, "beta", il);
+
+    ggml_tensor * alpha = build_lora_mm(layer.ssm_alpha, cur, layer.ssm_alpha_s);
+    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_t, 1);
+    cb(alpha, "alpha", il);
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+    ggml_tensor * conv_kernel     = layer.ssm_conv1d;
+
+    const float eps_norm = hparams.f_norm_rms_eps;
+
+    // n_t <= n_rs_seq + 1: the stock graph writes one slot per token, see build_conv_state_store() and build_recurrent_attn()
+    const int64_t slot_rows = mctx_cur->get_size();
+
+    ggml_tensor * gate   = nullptr;
+    ggml_tensor * q_conv = nullptr;
+    ggml_tensor * k_conv = nullptr;
+    ggml_tensor * v_conv = nullptr;
+
+    // conv, SiLU, L2 norm, beta and gate of all tokens in one op, which also writes the rollback windows of the conv state
+    if (ggml_q35moe_prepn_enabled() && conv_channels == qkv_mixed->ne[0]) {
+        auto make = [&](ggml_context * ctx) {
+            return ggml_q35moe_try_prepn(ctx, qkv_mixed, beta, alpha, conv_kernel, layer.ssm_dt, layer.ssm_a,
+                    conv_states_all, inp->s_copy_main, cell_of(ctx, conv_states_all),
+                    2*key_dim, eps_norm/(float) head_k_dim, 1.0f/sqrtf((float) head_k_dim), slot_rows);
+        };
+        ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(make(probe.get()))) {
+            clear_zero_state(conv_states_all);
+            ggml_tensor * prep = make(ctx0);
+            cb(prep, "linear_attn_prep", il);
+
+            const size_t nb_t = conv_channels*fs;
+            const size_t nb_h = num_v_heads*fs;
+
+            q_conv = ggml_view_4d(ctx0, prep, head_k_dim, num_k_heads, n_t, 1, head_k_dim*fs, nb_t, nb_t*n_t, 0);
+            k_conv = ggml_view_4d(ctx0, prep, head_k_dim, num_k_heads, n_t, 1, head_k_dim*fs, nb_t, nb_t*n_t, key_dim*fs);
+            v_conv = ggml_view_4d(ctx0, prep, head_v_dim, num_v_heads, n_t, 1, head_v_dim*fs, nb_t, nb_t*n_t, 2*key_dim*fs);
+            beta   = ggml_view_4d(ctx0, prep, 1, num_v_heads, n_t, 1, fs, nb_h, nb_h*n_t, nb_t*n_t);
+            gate   = ggml_view_4d(ctx0, prep, 1, num_v_heads, n_t, 1, fs, nb_h, nb_h*n_t, nb_t*n_t + nb_h*n_t);
+        }
+    }
+
+    // with the fused delta net the state stays in the cache: no copy of it here
+    const bool gdn_few = ggml_q35moe_gdnn_enabled();
+
+    ggml_tensor * state = nullptr;
+    if (!q_conv) {
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
+
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, layer.ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
+
+        gate = ggml_mul(ctx0, alpha_softplus, layer.ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_t, 1);
+
+        ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel->ne[0], conv_channels, il);
+
+        if (!gdn_few) {
+            state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), 1);
+            state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, 1);
+            cb(state, "state_predelta", il);
+        }
+
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        const int64_t nb1_qkv = ggml_row_size(conv_output_silu->type, conv_channels);
+
+        q_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, n_t, 1, head_k_dim*fs, nb1_qkv, nb1_qkv*n_t, 0);
+        k_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, n_t, 1, head_k_dim*fs, nb1_qkv, nb1_qkv*n_t, key_dim*fs);
+        v_conv = ggml_view_4d(ctx0, conv_output_silu, head_v_dim, num_v_heads, n_t, 1, head_v_dim*fs, nb1_qkv, nb1_qkv*n_t, 2*key_dim*fs);
+
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
+
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
+
+    cb(q_conv, "q_conv_predelta", il);
+    cb(k_conv, "k_conv_predelta", il);
+    cb(v_conv, "v_conv_predelta", il);
+
+    // the delta net reads the state row of the sequence and writes the snapshots of the tokens
+    ggml_tensor * output = nullptr;
+    if (gdn_few) {
+        auto make = [&](ggml_context * ctx) {
+            return ggml_q35moe_try_gdnn(ctx, q_conv, k_conv, v_conv, gate, beta, ssm_states_all, inp->s_copy_main, cell_of(ctx, ssm_states_all),
+                    slot_rows);
+        };
+        ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(make(probe.get()))) {
+            clear_zero_state(ssm_states_all);
+            output = make(ctx0);
+            cb(output, "attn_output", il);
+        }
+    }
+    if (!output) {
+        if (!state) {
+            state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), 1);
+            state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, 1);
+            cb(state, "state_predelta", il);
+        }
+        output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    }
+
+    // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
+    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_t, 1);
+
+    // Apply gated normalization: self.norm(core_attn_out, z)
+    ggml_tensor * attn_out_norm = nullptr;
+    if (ggml_q35moe_postn_enabled()) {
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(ggml_qwen35_try_post1(probe.get(), output, layer.ssm_norm, z_2d, eps_norm))) {
+            attn_out_norm = ggml_qwen35_try_post1(ctx0, output, layer.ssm_norm, z_2d, eps_norm);
+        }
+    }
+    if (!attn_out_norm) {
+        attn_out_norm = build_norm_gated(output, layer.ssm_norm, z_2d, il);
+    }
+
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_t);
 
     // Output projection
     cur = build_lora_mm(layer.ssm_out, final_output, layer.ssm_out_s);

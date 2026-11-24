@@ -292,6 +292,275 @@ static void qwen35_gdn1_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op
 }
 
 //
+// prepn
+//
+
+// qwen35_prep1 for N tokens of one sequence, token by token; ssm_conv_f32<true> runs the same sums over the tokens.
+// Slot s of the cell gets the conv state of s tokens before the end of the batch, one slot per token.
+// past can be one of these rows: a thread reads its part of the row before it writes it
+template <int N>
+__launch_bounds__(WARP_SIZE, 1)
+static __global__ void q35moe_prepn(
+        const float * qkv_ptr, const float * beta, const float * alpha, const float * weight_ptr, const float * dt, const float * a,
+        const float * states, const int32_t * ids, float * cell_ptr, float * dst_ptr,
+        const int64_t state_stride, const int64_t slot_stride, const int n_channels, const int n_norm, const int n_heads,
+        const int ncols, const float eps, const float scale_out) {
+    constexpr int n_conv = ggml_qwen35_n_conv;
+    constexpr int vec    = ggml_qwen35_head_dim / WARP_SIZE;
+    const float * GGML_CUDA_RESTRICT qkv    = qkv_ptr;
+    const float * GGML_CUDA_RESTRICT weight = weight_ptr;
+    float       * GGML_CUDA_RESTRICT dst    = dst_ptr;
+
+    const int     c0   = blockIdx.x*ggml_qwen35_head_dim + threadIdx.x*vec;
+    const float * past = states + ids[0]*state_stride + (int64_t) c0*(n_conv - 1);
+    float       * cell = cell_ptr + (int64_t) c0*(n_conv - 1);
+
+    float x[vec][n_conv - 1 + N];
+    float w[vec][n_conv];
+#pragma unroll
+    for (int i = 0; i < vec; i++) {
+#pragma unroll
+        for (int j = 0; j < n_conv; j++) {
+            w[i][j] = weight[(c0 + i)*n_conv + j];
+        }
+#pragma unroll
+        for (int j = 0; j < n_conv - 1; j++) {
+            x[i][j] = past[i*(n_conv - 1) + j];
+        }
+#pragma unroll
+        for (int t = 0; t < N; t++) {
+            x[i][n_conv - 1 + t] = qkv[t*n_channels + c0 + i];
+        }
+    }
+
+    static_assert(vec == 4, "the norm reads one float4 per thread");
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        float y[vec];
+#pragma unroll
+        for (int i = 0; i < vec; i++) {
+            const float b = 0.0f;
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < n_conv; j++) {
+                sumf += x[i][t + j] * w[i][j];
+            }
+            sumf += b;
+            y[i] = ggml_cuda_op_silu_single(sumf);
+        }
+
+        float4 r = make_float4(y[0], y[1], y[2], y[3]);
+        if ((int) blockIdx.x*ggml_qwen35_head_dim < n_norm) {
+            const float4 xs = r;
+            float tmp = 0.0f;
+            tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+            tmp = warp_reduce_sum(tmp);
+            const float scale = rsqrtf(tmp / ncols + eps);
+
+            r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+            r.x *= scale_out;
+            r.y *= scale_out;
+            r.z *= scale_out;
+            r.w *= scale_out;
+        }
+        dst[t*n_channels + c0 + 0] = r.x;
+        dst[t*n_channels + c0 + 1] = r.y;
+        dst[t*n_channels + c0 + 2] = r.z;
+        dst[t*n_channels + c0 + 3] = r.w;
+    }
+
+#pragma unroll
+    for (int s = 0; s < N; s++) {
+#pragma unroll
+        for (int i = 0; i < vec; i++) {
+#pragma unroll
+            for (int j = 0; j < n_conv - 1; j++) {
+                cell[s*slot_stride + i*(n_conv - 1) + j] = x[i][N - s + j];
+            }
+        }
+    }
+
+    if (blockIdx.x == 0) {
+        float * dst_beta = dst + N*n_channels;
+        float * dst_gate = dst_beta + N*n_heads;
+        for (int t = 0; t < N; t++) {
+            for (int h = threadIdx.x; h < n_heads; h += WARP_SIZE) {
+                dst_beta[t*n_heads + h] = 1.0f / (1.0f + expf(-beta[t*n_heads + h]));
+
+                const float v = alpha[t*n_heads + h] + dt[h];
+                dst_gate[t*n_heads + h] = ((v > 20.0f) ? v : log1pf(expf(v))) * a[h];
+            }
+        }
+    }
+}
+
+static bool q35moe_prepn_supported(int device, const ggml_tensor * op) {
+    return qwen35_decode_device(device) && ggml_q35moe_prepn_enabled() && ggml_q35moe_is_prepn(op) &&
+        qwen35_weight_on_device(device, op->src[3]) && qwen35_weight_on_device(device, op->src[4]) && qwen35_weight_on_device(device, op->src[5]) &&
+        qwen35_state_on_device(device, op->src[6]) && qwen35_state_on_device(device, op->src[8]);
+}
+
+template <int N>
+static void q35moe_prepn_launch_n(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
+    const int     n_channels  = op->src[0]->ne[0];
+    const int     n_heads     = ggml_nelements(op->src[4]);
+    const int64_t slot_stride = ggml_get_op_params_i32(op, ggml_q35moe_prepn_slot_slot_rows)*op->src[6]->ne[0];
+    q35moe_prepn<N><<<n_channels/ggml_qwen35_head_dim, WARP_SIZE, 0, ctx.stream()>>>(
+        static_cast<const float *>(op->src[0]->data), static_cast<const float *>(op->src[1]->data), static_cast<const float *>(op->src[2]->data),
+        static_cast<const float *>(op->src[3]->data), static_cast<const float *>(op->src[4]->data), static_cast<const float *>(op->src[5]->data),
+        static_cast<const float *>(op->src[6]->data), static_cast<const int32_t *>(op->src[7]->data), static_cast<float *>(op->src[8]->data),
+        static_cast<float *>(op->data), op->src[6]->ne[0], slot_stride, n_channels, ggml_get_op_params_i32(op, ggml_qwen35_prep1_slot_n_norm), n_heads,
+        ggml_qwen35_head_dim, ggml_get_op_params_f32(op, ggml_qwen35_prep1_slot_eps), ggml_get_op_params_f32(op, ggml_qwen35_prep1_slot_scale));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void q35moe_prepn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
+    static_assert(ggml_q35moe_few_max == 8, "one kernel per token count");
+    switch (op->src[0]->ne[1]) {
+        case 2: q35moe_prepn_launch_n<2>(ctx, op); break;
+        case 3: q35moe_prepn_launch_n<3>(ctx, op); break;
+        case 4: q35moe_prepn_launch_n<4>(ctx, op); break;
+        case 5: q35moe_prepn_launch_n<5>(ctx, op); break;
+        case 6: q35moe_prepn_launch_n<6>(ctx, op); break;
+        case 7: q35moe_prepn_launch_n<7>(ctx, op); break;
+        case 8: q35moe_prepn_launch_n<8>(ctx, op); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+//
+// gdnn
+//
+
+// gated_delta_net_cuda<S_v, false, true> of one sequence, statement by statement; the input state is row ids[0] of states.
+// Slot s of the cell gets the state of s tokens before the end of the batch, one slot per token.
+// The input state can be one of these rows: a thread reads its part of the state before it writes it
+template <int S_v, int cols_per_warp>
+__launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+static __global__ void q35moe_gdnn(
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * states, const int32_t * ids, float * dst, float * state,
+        const int64_t state_stride, const int64_t slot_stride, const int64_t H, const int64_t n_tokens,
+        const int64_t sq2, const int64_t sv2, const uint3 neqk1_magic, const float scale) {
+    const uint32_t h_idx = blockIdx.x;
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    constexpr int lanes_per_col = warp_size / cols_per_warp;
+    constexpr int rows_per_lane = S_v / lanes_per_col;
+    static_assert(S_v % lanes_per_col == 0, "S_v must be a multiple of lanes_per_col");
+
+    const int lane        = threadIdx.x;
+    const int col_in_warp = lane / lanes_per_col;
+    const int lane_in_col = lane - col_in_warp * lanes_per_col;
+    const int col = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp + col_in_warp;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+
+    float * attn_data = dst;
+
+    const float * curr_state = states + ids[0] * state_stride + h_idx * S_v * S_v + col * S_v;
+    state += h_idx * S_v * S_v;
+    attn_data += h_idx * S_v;
+
+    float s_shard[rows_per_lane];
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const int i = r * lanes_per_col + lane_in_col;
+        s_shard[r]  = curr_state[i];
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float * q_t = q + t * sq2 + iq1 * S_v;
+        const float * k_t = k + t * sq2 + iq1 * S_v;
+        const float * v_t = v + t * sv2 + h_idx * S_v;
+
+        const int64_t gb_offset = t * H + h_idx;
+        const float * beta_t = beta + gb_offset;
+        const float * g_t    = g    + gb_offset;
+
+        const float beta_val = *beta_t;
+
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * lanes_per_col + lane_in_col;
+            k_reg[r] = k_t[i];
+            q_reg[r] = q_t[i];
+        }
+
+        const float g_val = expf(*g_t);
+
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            kv_shard += s_shard[r] * k_reg[r];
+        }
+        float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
+
+        float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+
+        float attn_col = warp_reduce_sum<lanes_per_col>(attn_partial);
+
+        if (lane_in_col == 0) {
+            attn_data[col] = attn_col * scale;
+        }
+
+        attn_data += S_v * H;
+
+        const int target_slot = (int) n_tokens - 1 - t;
+        float * snapshot = state + target_slot * slot_stride;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * lanes_per_col + lane_in_col;
+            snapshot[col * S_v + i] = s_shard[r];
+        }
+    }
+}
+
+static bool q35moe_gdnn_supported(int device, const ggml_tensor * op) {
+    return qwen35_decode_device(device) && ggml_q35moe_gdnn_enabled() && ggml_q35moe_is_gdnn(op) &&
+        qwen35_state_on_device(device, op->src[5]) && qwen35_state_on_device(device, op->src[7]);
+}
+
+static void q35moe_gdnn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
+    constexpr int S_v           = ggml_qwen35_head_dim;
+    constexpr int cols_per_warp = 4; // gdn_cols_per_warp
+    const int64_t H           = op->src[2]->ne[1];
+    const int64_t neqk1       = op->src[0]->ne[1];
+    const int64_t slot_stride = ggml_get_op_params_i32(op, ggml_q35moe_gdnn_slot_slot_rows)*op->src[5]->ne[0];
+
+    // the block layout of launch_gated_delta_net
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int nsm       = ggml_cuda_info().devices[ctx.device].nsm;
+    int num_warps = 4;
+    while (num_warps > 1 && H*(S_v / (cols_per_warp * num_warps)) < nsm) {
+        num_warps /= 2;
+    }
+    const dim3 grid_dims(H, 1, (S_v + cols_per_warp * num_warps - 1) / (cols_per_warp * num_warps));
+    const dim3 block_dims(warp_size, num_warps, 1);
+
+    q35moe_gdnn<S_v, cols_per_warp><<<grid_dims, block_dims, 0, ctx.stream()>>>(
+        static_cast<const float *>(op->src[0]->data), static_cast<const float *>(op->src[1]->data), static_cast<const float *>(op->src[2]->data),
+        static_cast<const float *>(op->src[3]->data), static_cast<const float *>(op->src[4]->data),
+        static_cast<const float *>(op->src[5]->data), static_cast<const int32_t *>(op->src[6]->data),
+        static_cast<float *>(op->data), static_cast<float *>(op->src[7]->data),
+        op->src[5]->ne[0], slot_stride, H, op->src[2]->ne[2],
+        (int64_t) (op->src[0]->nb[2]/sizeof(float)), (int64_t) (op->src[2]->nb[2]/sizeof(float)), init_fastdiv_values(neqk1),
+        1.0f / sqrtf((float) S_v));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+//
 // post1
 //
 
@@ -328,7 +597,8 @@ static __global__ void qwen35_post1(const float * x_ptr, const float * w_ptr, co
 }
 
 static bool qwen35_post1_supported(int device, const ggml_tensor * op) {
-    return qwen35_decode_device(device) && (ggml_qwen35_post1_enabled() || ggml_q35moe_post1_enabled()) && ggml_qwen35_is_post1(op) &&
+    return qwen35_decode_device(device) && (ggml_qwen35_post1_enabled() || ggml_q35moe_post1_enabled() || ggml_q35moe_postn_enabled()) &&
+        ggml_qwen35_is_post1(op) &&
         qwen35_weight_on_device(device, op->src[1]);
 }
 

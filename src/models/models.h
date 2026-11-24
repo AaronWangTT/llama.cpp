@@ -2907,6 +2907,12 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // a few tokens of one sequence with rollback snapshots, same build; nullptr when no op is on or the batch is another one
+        ggml_tensor * build_layer_attn_linear_few(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * cur,
+                            int   il);
+
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
                             int   il);

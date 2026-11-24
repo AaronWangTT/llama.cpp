@@ -52,10 +52,36 @@ GGML_API bool ggml_q35moe_is_mvf(const ggml_tensor * op);
 // GGML_Q35MOE_RS1=1: the five one-token ops of qwen35moe also in a context that keeps rollback snapshots (n_rs_seq > 0).
 // The ops read the row that the memory names (a rollback slot or slot 0) and write slot 0, as the stock graph of one token does.
 GGML_API bool ggml_q35moe_rs1_enabled();
+
+// The ops below take 2 to ggml_q35moe_few_max tokens of one sequence in a context with rollback snapshots (a draft verification batch).
+// A state tensor holds slot s of cell c in row s*slot_rows + c. cell is the row of slot 0, a view of states. An op writes one slot
+// per token: slot s gets the state of s tokens before the end of the batch. The row ids[0] can be one of these rows.
+
+// GGML_Q35MOE_PREPN=1: ggml_qwen35_try_prep1 for n_tokens tokens, with the rollback windows of the conv state.
+// qkv: [n_channels, n_tokens], beta, alpha: n_heads*n_tokens; result: [y of all tokens, sigmoid(beta), softplus(alpha + dt)*a],
+// n_channels*n_tokens + 2*n_heads*n_tokens F32
+GGML_API bool ggml_q35moe_prepn_enabled();
+GGML_API ggml_tensor * ggml_q35moe_try_prepn(ggml_context * ctx, ggml_tensor * qkv, ggml_tensor * beta, ggml_tensor * alpha,
+        ggml_tensor * conv_w, ggml_tensor * dt, ggml_tensor * a, ggml_tensor * states, ggml_tensor * ids, ggml_tensor * cell,
+        int64_t n_norm, float eps, float scale, int64_t slot_rows);
+GGML_API bool ggml_q35moe_is_prepn(const ggml_tensor * op);
+
+// GGML_Q35MOE_GDNN=1: gated delta net over n_tokens tokens without a copy of the state, the op writes the snapshots.
+// q, k: [head_dim, n_heads_k, n_tokens], v: [head_dim, n_heads, n_tokens] (the tokens may have a stride), g, b: n_heads*n_tokens;
+// result: [head_dim, n_heads, n_tokens]
+GGML_API bool ggml_q35moe_gdnn_enabled();
+GGML_API ggml_tensor * ggml_q35moe_try_gdnn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * g, ggml_tensor * b, ggml_tensor * states, ggml_tensor * ids, ggml_tensor * cell, int64_t slot_rows);
+GGML_API bool ggml_q35moe_is_gdnn(const ggml_tensor * op);
+
+// GGML_Q35MOE_POSTN=1: ggml_qwen35_try_post1 takes the heads of several tokens in the qwen35moe graph
+GGML_API bool ggml_q35moe_postn_enabled();
 }
 
 constexpr int ggml_qwen35_mvshare_max = 8;
 constexpr int ggml_q35moe_mvf_max     = 4;
+// most tokens of a batch that PREPN and GDNN take; the dense products of such a batch are vector kernels
+constexpr int ggml_q35moe_few_max     = 8;
 // the kernels replay the stock kernels of these sizes only
 constexpr int ggml_qwen35_head_dim = 128;
 constexpr int ggml_qwen35_n_conv   = 4;
@@ -65,3 +91,5 @@ constexpr int ggml_qwen35_prep1_slot_n_norm = 8;
 constexpr int ggml_qwen35_prep1_slot_eps    = 10;
 constexpr int ggml_qwen35_prep1_slot_scale  = 11;
 constexpr int ggml_qwen35_post1_slot_eps    = 8;
+constexpr int ggml_q35moe_prepn_slot_slot_rows = 12;
+constexpr int ggml_q35moe_gdnn_slot_slot_rows  = 8;
