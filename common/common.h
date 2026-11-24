@@ -355,6 +355,9 @@ struct common_params_speculative_draft {
     std::string shortlist;
     int32_t     shortlist_n = 0;
 
+    // draft-mtp: the draft head attends only to the last attn_window positions (0 - the whole sequence)
+    int32_t attn_window = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

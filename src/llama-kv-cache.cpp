@@ -1401,7 +1401,7 @@ uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch) const {
 
     uint32_t n_max = 0;
 
-    const auto slices = get_kv_rows_slices(ubatch, n_slices, n_swa, swa_type);
+    const auto slices = get_kv_rows_slices(ubatch, n_slices, attn_n_swa(), attn_swa_type());
 
     for (uint32_t s = 0; s < n_slices; ++s) {
         // a cell shared by several sequences of the slice is counted once per sequence, an upper bound is enough
@@ -1931,7 +1931,7 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         const auto & cells = v_cells[0];
         int32_t * data = (int32_t *) attn_mask.rows->data;
 
-        cells.get_seq_cells(get_kv_rows_slices(*ubatch, n_slices, n_swa, swa_type), data, n_rows);
+        cells.get_seq_cells(get_kv_rows_slices(*ubatch, n_slices, attn_n_swa(), attn_swa_type()), data, n_rows);
     }
 
     // the mask is left unallocated when the graph only stores K/V without attending
@@ -1971,8 +1971,8 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
             /*.ubatch           =*/ ubatch,
             /*.v_cells          =*/ v_cells,
             /*.seq_to_stream    =*/ seq_to_stream,
-            /*.n_swa            =*/ n_swa,
-            /*.swa_type         =*/ swa_type,
+            /*.n_swa            =*/ attn_n_swa(),
+            /*.swa_type         =*/ attn_swa_type(),
             /*.n_kv             =*/ n_kv,
             /*.n_stream         =*/ n_stream,
             /*.n_tps            =*/ n_tps,

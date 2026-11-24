@@ -97,6 +97,7 @@ struct llama_context {
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
     bool set_logits_rows(const llama_token * rows, int32_t n_rows);
+    bool set_attn_window(uint32_t n_window);
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
