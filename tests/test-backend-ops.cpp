@@ -13189,6 +13189,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 16384, 4096, 1, n_slices, GGML_TYPE_F16, false, true));
     }
 
+    // qwen35moe one-token attention: head size 256, 2 K/V heads, GQA 8, F16 and Q8_0 K/V
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t n_slices : {1, 2, 3, 4, 5, 6}) {
+            for (int64_t kv : {256, 512, 1024}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4*kv, kv, 1, n_slices, type_KV));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 16384, 4096, 1, n_slices, type_KV, false, true));
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(512, 32, 4, 32, 2));
 

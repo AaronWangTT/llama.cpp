@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 #include "qwen35-fagqa.cuh"
+#include "q35moe-fagqa.cuh"
 
 #if !defined(GGML_USE_MUSA)
 
@@ -859,6 +860,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
 #ifdef GGML_USE_HIP
     if (ggml_cuda_flash_attn_ext_qwen35_fagqa(ctx, dst, kernel == BEST_FATTN_KERNEL_MMA_F16)) {
+        GGML_ASSERT(ctx.inkling_pf_mask == nullptr);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_q35moe_fagqa(ctx, dst, kernel == BEST_FATTN_KERNEL_MMA_F16)) {
         GGML_ASSERT(ctx.inkling_pf_mask == nullptr);
         return;
     }
