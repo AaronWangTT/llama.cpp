@@ -789,7 +789,8 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    // restore a cached prompt into a slot; with keep the data stays for the next load, otherwise the caller removes the emptied entry
+    // restore a cached prompt into a slot; with keep the slot gets a copy, otherwise the caller removes the entry
+    // the entry is complete after a failed restore
     bool load_state(server_prompt_cache_state & state, bool keep, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();

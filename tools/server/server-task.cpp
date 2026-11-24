@@ -1920,7 +1920,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 bool server_prompt_cache::load_state(server_prompt_cache_state & state, bool keep, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     {
-        auto & data = state.data.main;
+        const auto & data = state.data.main;
 
         const size_t size = data.size();
         const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -1929,15 +1929,10 @@ bool server_prompt_cache::load_state(server_prompt_cache_state & state, bool kee
 
             return false;
         }
-
-        if (!keep) {
-            data.clear();
-            data.shrink_to_fit();
-        }
     }
 
     {
-        auto & data = state.data.drft;
+        const auto & data = state.data.drft;
 
         if (!data.empty()) {
             GGML_ASSERT(ctx_dft);
@@ -1948,11 +1943,6 @@ bool server_prompt_cache::load_state(server_prompt_cache_state & state, bool kee
                 SRV_WRN("failed to restore state with size %zu\n", size);
 
                 return false;
-            }
-
-            if (!keep) {
-                data.clear();
-                data.shrink_to_fit();
             }
         }
     }

@@ -1971,8 +1971,6 @@ private:
             ret = free_slots[0];
         }
 
-        const int64_t t_start = ggml_time_us();
-
         // the wanted prompt leaves the cache while other states are saved, so that it is not evicted
         std::list<server_prompt_cache_state> taken;
         if (is_cached) {
@@ -2012,17 +2010,17 @@ private:
             SLT_INF(*ret, "selected slot by reuse, n_reuse = %d of %d prompt tokens, state of %d tokens in the cache, %s\n",
                     n_best, task.n_tokens(), n_tokens, is_cont ? "continuation" : "fork");
 
-            // make room for the cells of the state; if the load fails anyway, try once more without any idle slot
-            bool ok = false;
-            for (int32_t n_cells : { n_tokens, n_ctx }) {
-                if (!free_idle_cells(n_cells, *ret) && n_cells == n_tokens) {
-                    SLT_WRN(*ret, "no room for the cached prompt of %d tokens, the active slots hold too many cells\n", n_tokens);
-                    break;
-                }
+            // make room for the cells of the state
+            bool ok = free_idle_cells(n_tokens, *ret);
+
+            const int64_t t_start = ggml_time_us();
+
+            if (!ok) {
+                SLT_WRN(*ret, "no room for the cached prompt of %d tokens, the active slots hold too many cells\n", n_tokens);
+            } else if (!prompt_cache->load_state(state, !is_cont, ret->prompt, ctx_tgt, ctx_dft, ret->id)) {
+                // the count of free cells was wrong: try once more without any idle slot
+                free_idle_cells(n_ctx, *ret);
                 ok = prompt_cache->load_state(state, !is_cont, ret->prompt, ctx_tgt, ctx_dft, ret->id);
-                if (ok) {
-                    break;
-                }
             }
 
             if (ok) {
