@@ -743,6 +743,9 @@ struct server_prompt_cache_state {
     // eviction order with --cache-evict-cost: the lowest value goes first
     double prio = 0.0;
 
+    // number of the save, keeps the order of the list when a prompt leaves it for a moment; 0 = goes first
+    uint64_t seq = 0;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -772,6 +775,8 @@ struct server_prompt_cache {
     bool   evict_by_cost = false;
     double prio_base     = 0.0; // priority of the last evicted prompt
 
+    uint64_t seq_next = 1;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -780,12 +785,20 @@ struct server_prompt_cache {
     bool has(const server_tokens & tokens) const;
 
     // the cached prompt that goes next when room is needed
-    std::list<server_prompt_cache_state>::iterator evict_next();
+    // keep_last: not the newest one while there is another, it was saved a moment ago
+    std::list<server_prompt_cache_state>::iterator evict_next(bool keep_last = false);
 
-    // eviction priority of a cached prompt that is saved or used now
+    // eviction priority of a cached prompt that is saved now
     double prio_new(const server_prompt_cache_state & state) const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // put a prompt that was taken out of the list back at its place
+    std::list<server_prompt_cache_state>::iterator put_back(std::list<server_prompt_cache_state> & taken);
+
+    // make a cached prompt the first one to go when room is needed
+    void demote(std::list<server_prompt_cache_state>::iterator it);
+
+    // evict = false: the new prompt must not cost another one its place, nullptr when there is no room for it
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool evict = true);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

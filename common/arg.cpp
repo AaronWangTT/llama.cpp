@@ -1749,7 +1749,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--slot-select-reuse"},
         {"--no-slot-select-reuse"},
-        "give a request the idle slot or cached prompt with the longest prefix that it can reuse, and save the state of another conversation before the request changes it (default: disabled)",
+        "give a request the idle slot or cached prompt with the longest prefix that it can reuse, and save the state of another conversation before the request changes it; --slot-prompt-similarity is then the smallest share of the prompt that a state must make reusable; a request waits when its cached prompt has no room next to the active requests (default: disabled)",
         [](common_params & params, bool value) {
             params.slot_select_reuse = value;
         }
@@ -1757,7 +1757,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-evict-cost"},
         {"--no-cache-evict-cost"},
-        "when the prompt cache is full, remove the prompt with the fewest tokens per byte instead of the oldest one; a prompt that waits loses this protection as others are removed (default: disabled)",
+        "when the prompt cache is full, remove the prompt with the fewest tokens per byte instead of the oldest one; prompts saved after a removal rank higher, so a long prompt that waits is protected for a few removals only (default: disabled)",
         [](common_params & params, bool value) {
             params.cache_evict_cost = value;
         }
