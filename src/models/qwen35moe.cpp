@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 #include "ggml-q35moe-ffn.h"
@@ -1271,6 +1273,22 @@ static bool q35moe_mtpstore(const llama_cparams & cparams, const int64_t n_outpu
     return why == nullptr;
 }
 
+// an MTP graph that keeps the whole head although a row list is set, once per reason (a string literal) with the graph it first happens for
+// the graph that reserves memory has one output per sequence, so the line also comes when no decode has that many outputs yet
+static void q35moe_log_rows_off(const char * why, const int64_t n_out, const int64_t n_rows) {
+    static std::mutex mutex;
+    static std::vector<const char *> seen;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const char * s : seen) {
+        if (s == why) {
+            return;
+        }
+    }
+    seen.push_back(why);
+    LLAMA_LOG_WARN("qwen35moe: an MTP graph with %lld outputs computes the whole output head, the logits row list (%lld rows, --spec-draft-shortlist) is not used there: %s\n",
+            (long long) n_out, (long long) n_rows, why);
+}
+
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE
 llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     : llm_graph_context(params) {
@@ -1493,11 +1511,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
         !loras->empty()                                         ? "a LoRA adapter is in use" :
         !head_plain                                             ? "the output head has a scale, a rotation or a precision policy" :
         ggml_n_dims(head_w) != 2 || !ggml_is_contiguous(head_w) ? "the output head is not a plain matrix" :
-        !all_sampled                                            ? "an output of the graph has no backend sampler" :
-        n_out > 8                                               ? "a graph has more than 8 outputs" :
-        n_out*logits_rows->ne[0] > head_w->ne[1]                ? "outputs x rows of a graph is above the vocabulary size" : nullptr;
+        !all_sampled                                            ? "an output has no backend sampler" :
+        n_out > 8                                               ? "more than 8 outputs" :
+        n_out*logits_rows->ne[0] > head_w->ne[1]                ? "outputs x rows is above the vocabulary size" : nullptr;
     if (rows_off != nullptr) {
-        q35moe_log_off("the logits row list (--spec-draft-shortlist)", rows_off);
+        q35moe_log_rows_off(rows_off, n_out, logits_rows->ne[0]);
     }
     // one product per output: the kernels for several vectors at a time read two matrix rows per block, here a matrix is one row
     if (logits_rows != nullptr && n_out >= 1 && rows_off == nullptr) {
