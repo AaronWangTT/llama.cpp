@@ -175,6 +175,9 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // prompt_cache_key of the request, names the conversation (see --slot-select-reuse)
+    std::string cache_key;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
@@ -696,9 +699,15 @@ struct server_prompt {
     // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
+    // the request that used this state last: length of its prompt and its prompt_cache_key (see --slot-select-reuse)
+    int32_t     n_tokens_task = 0;
+    std::string cache_key;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        n_tokens_task = 0;
+        cache_key.clear();
     }
 
     int n_tokens() const {
@@ -709,6 +718,8 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            n_tokens_task,
+            cache_key,
         };
     }
 };
@@ -725,6 +736,12 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+
+    // llama_memory_seq_pos_min() of the saved state, tells if a prefix of it needs a context checkpoint
+    llama_pos pos_min = -1;
+
+    // eviction order with --cache-evict-cost: the lowest value goes first
+    double prio = 0.0;
 
     size_t size() const {
         size_t res = data.size();
@@ -751,13 +768,29 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // --cache-evict-cost
+    bool   evict_by_cost = false;
+    double prio_base     = 0.0; // priority of the last evicted prompt
+
     size_t size() const;
 
     size_t n_tokens() const;
 
+    // true if a cached prompt starts with these tokens
+    bool has(const server_tokens & tokens) const;
+
+    // the cached prompt that goes next when room is needed
+    std::list<server_prompt_cache_state>::iterator evict_next();
+
+    // eviction priority of a cached prompt that is saved or used now
+    double prio_new(const server_prompt_cache_state & state) const;
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // restore a cached prompt into a slot; with keep the data stays for the next load, otherwise the caller removes the emptied entry
+    bool load_state(server_prompt_cache_state & state, bool keep, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
 };

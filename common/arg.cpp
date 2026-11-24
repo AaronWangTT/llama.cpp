@@ -1747,6 +1747,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-select-reuse"},
+        {"--no-slot-select-reuse"},
+        "give a request the idle slot or cached prompt with the longest prefix that it can reuse, and save the state of another conversation before the request changes it (default: disabled)",
+        [](common_params & params, bool value) {
+            params.slot_select_reuse = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SELECT_REUSE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-evict-cost"},
+        {"--no-cache-evict-cost"},
+        "when the prompt cache is full, remove the prompt with the fewest tokens per byte instead of the oldest one; a prompt that waits loses this protection as others are removed (default: disabled)",
+        [](common_params & params, bool value) {
+            params.cache_evict_cost = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_EVICT_COST").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-exceed-fail-one"},
+        {"--no-ctx-exceed-fail-one"},
+        "when the context is exceeded, fail only the request that does not fit instead of all active requests (default: disabled)",
+        [](common_params & params, bool value) {
+            params.ctx_exceed_fail_one = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_EXCEED_FAIL_ONE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

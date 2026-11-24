@@ -353,6 +353,8 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t_start = ggml_time_us();
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
@@ -366,7 +368,17 @@ struct server_slot {
             return false;
         }
 
+        cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
+
+        SLT_INF(*this, "saved prompt to cache: %d tokens, %.3f MiB, %zu checkpoints, %.2f ms\n",
+                prompt.n_tokens(), cur_size / (1024.0 * 1024.0), prompt.checkpoints.size(), (ggml_time_us() - t_start) / 1000.0);
+
         return true;
+    }
+
+    // true when the state is in the cache after the call, or when there is nothing to save
+    bool prompt_save_safe(server_prompt_cache & prompt_cache) const {
+        return prompt.tokens.size() == 0 || prompt_save(prompt_cache) || prompt_cache.has(prompt.tokens);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1621,6 +1633,7 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->evict_by_cost = params_base.cache_evict_cost;
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1817,7 +1830,235 @@ private:
         return nullptr;
     }
 
+    // number of tokens of a state that a prompt can reuse: the common prefix, or the last context checkpoint inside it when the memory cannot go back to it
+    // same rules as the start of prompt processing in update_slots()
+    int32_t n_reusable(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const {
+        const int32_t n_prefix = prompt.tokens.get_common_prefix(tokens_new);
+        if (n_prefix == 0) {
+            return 0;
+        }
+
+        const llama_pos pos_next      = prompt.tokens.pos_next(n_prefix);
+        const llama_pos pos_eval      = pos_next - (n_prefix < (int32_t) tokens_new.size() ? 0 : 1);
+        const llama_pos pos_min_thold = std::max(0, n_swa_reuse > 0 ? pos_eval - n_swa_reuse + 2 : pos_eval);
+
+        if (pos_min < pos_min_thold) {
+            return n_prefix;
+        }
+
+        for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
+            const auto & cur = **it;
+            if (cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0)) {
+                const llama_pos pos_ckpt = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
+                return std::min(prompt.tokens.size_up_to_pos(pos_ckpt), (size_t) cur.n_tokens);
+            }
+        }
+
+        return 0;
+    }
+
+    // a request continues the conversation of a state when it repeats the last prompt of that state
+    // the last tokens of that prompt can change: a chat template can write the start of the answer in another way
+    // the last default context checkpoint of a prompt is that many tokens before its end for the same reason
+    // two different prompt_cache_key values are two conversations
+    bool is_continuation(const server_prompt & prompt, const server_task & task) const {
+        static const size_t n_tail = 4;
+
+        if (!prompt.cache_key.empty() && !task.cache_key.empty() && prompt.cache_key != task.cache_key) {
+            return false;
+        }
+
+        const size_t n_last = prompt.n_tokens_task > 0 ? std::min((size_t) prompt.n_tokens_task, prompt.tokens.size()) : prompt.tokens.size();
+
+        return prompt.tokens.get_common_prefix(task.tokens) + n_tail >= n_last;
+    }
+
+    // unified KV cache: save and clear idle slots, least recently used first, until n_cells are free
+    // a state that cannot be saved stays in its slot
+    bool free_idle_cells(int32_t n_cells, const server_slot & slot_keep) {
+        if (!params_base.kv_unified) {
+            return true;
+        }
+
+        int32_t n_used = 0;
+        for (const auto & slot : slots) {
+            if (&slot != &slot_keep) {
+                n_used += slot.prompt.n_tokens();
+            }
+        }
+
+        for (auto * slot : get_free_slots(slots.size(), slot_keep.id)) {
+            if (n_used + n_cells <= n_ctx) {
+                break;
+            }
+            if (slot->prompt.n_tokens() == 0 || !prompt_cache || !slot->prompt_save_safe(*prompt_cache)) {
+                continue;
+            }
+            n_used -= slot->prompt.n_tokens();
+            slot->prompt_clear();
+        }
+
+        return n_used + n_cells <= n_ctx;
+    }
+
+    // --slot-select-reuse: the request gets the state with the longest prefix that it can reuse, from an idle slot or from the prompt cache
+    // the state of another conversation is saved before the request changes it, and stays in the cache when the request only starts from it
+    server_slot * get_available_slot_reuse(const server_task & task) {
+        server_slot * slot_req = nullptr;
+
+        if (task.id_slot != -1) {
+            slot_req = get_slot_by_id(task.id_slot);
+
+            // a busy slot is returned untouched, the caller defers the task
+            if (slot_req && slot_req->is_processing()) {
+                return slot_req;
+            }
+        }
+
+        server_slot *         slot_best = nullptr;
+        const server_prompt * best      = nullptr;
+
+        std::list<server_prompt_cache_state>::iterator it_best;
+
+        // a state is worth taking when it covers more than this many tokens of the prompt
+        int32_t n_best = slot_prompt_similarity * task.tokens.size();
+
+        auto is_better = [&](const server_prompt & prompt, llama_pos pos_min, bool is_slot) {
+            const int32_t n_cur = n_reusable(prompt, pos_min, task.tokens);
+
+            SRV_TRC(" - %s with %d tokens, %zu checkpoints: common prefix %zu, reusable %d\n",
+                    is_slot ? "slot" : "cached prompt", prompt.n_tokens(), prompt.checkpoints.size(), prompt.tokens.get_common_prefix(task.tokens), n_cur);
+
+            // on a tie the shorter state is cheaper to save or to load
+            if (n_cur > n_best || (best && n_cur == n_best && prompt.n_tokens() < best->n_tokens())) {
+                n_best = n_cur;
+                best   = &prompt;
+                return true;
+            }
+            return false;
+        };
+
+        if (task.params.cache_prompt && !task.is_stateless()) {
+            for (server_slot & slot : slots) {
+                if (slot.is_processing() || slot.prompt.tokens.empty() || (slot_req && slot_req != &slot)) {
+                    continue;
+                }
+                if (is_better(slot.prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), true)) {
+                    slot_best = &slot;
+                }
+            }
+
+            if (prompt_cache) {
+                for (auto it = prompt_cache->states.begin(); it != prompt_cache->states.end(); ++it) {
+                    if (is_better(it->prompt, it->pos_min, false)) {
+                        slot_best = nullptr;
+                        it_best   = it;
+                    }
+                }
+            }
+        }
+
+        const bool is_cached = best && !slot_best;
+        const bool is_cont   = best && is_continuation(*best, task);
+
+        // the slot for the request: the one that holds the state or the requested one, then an empty one, then the least recently used one
+        server_slot * ret = slot_best ? slot_best : slot_req;
+        if (ret == nullptr) {
+            const auto free_slots = get_free_slots(1, -1);
+            if (free_slots.empty()) {
+                return nullptr;
+            }
+            ret = free_slots[0];
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        // the wanted prompt leaves the cache while other states are saved, so that it is not evicted
+        std::list<server_prompt_cache_state> taken;
+        if (is_cached) {
+            taken.splice(taken.begin(), prompt_cache->states, it_best);
+        }
+
+        // the state in the slot belongs to another conversation: save it
+        // when that fails the state stays there and the request goes to another idle slot, without that state
+        if (!(slot_best && is_cont) && prompt_cache && !ret->prompt_save_safe(*prompt_cache)) {
+            server_slot * slot_alt = nullptr;
+            if (slot_req == nullptr) {
+                for (auto * slot : get_free_slots(slots.size(), ret->id)) {
+                    if (slot->prompt_save_safe(*prompt_cache)) {
+                        slot_alt = slot;
+                        break;
+                    }
+                }
+            }
+            if (slot_alt) {
+                SLT_WRN(*ret, "failed to save the state of %d tokens, it stays in the slot\n", ret->prompt.n_tokens());
+                ret       = slot_alt;
+                slot_best = nullptr;
+            } else {
+                SLT_WRN(*ret, "failed to save the state of %d tokens, it is lost\n", ret->prompt.n_tokens());
+            }
+        }
+
+        if (slot_best) {
+            SLT_INF(*ret, "selected slot by reuse, n_reuse = %d of %d prompt tokens, state of %d tokens in the slot, %s\n",
+                    n_best, task.n_tokens(), ret->prompt.n_tokens(), is_cont ? "continuation" : "fork");
+        } else if (is_cached) {
+            auto & state = taken.front();
+
+            const int    n_tokens = state.prompt.n_tokens();
+            const size_t size     = state.data.size();
+
+            SLT_INF(*ret, "selected slot by reuse, n_reuse = %d of %d prompt tokens, state of %d tokens in the cache, %s\n",
+                    n_best, task.n_tokens(), n_tokens, is_cont ? "continuation" : "fork");
+
+            // make room for the cells of the state; if the load fails anyway, try once more without any idle slot
+            bool ok = false;
+            for (int32_t n_cells : { n_tokens, n_ctx }) {
+                if (!free_idle_cells(n_cells, *ret) && n_cells == n_tokens) {
+                    SLT_WRN(*ret, "no room for the cached prompt of %d tokens, the active slots hold too many cells\n", n_tokens);
+                    break;
+                }
+                ok = prompt_cache->load_state(state, !is_cont, ret->prompt, ctx_tgt, ctx_dft, ret->id);
+                if (ok) {
+                    break;
+                }
+            }
+
+            if (ok) {
+                SLT_INF(*ret, "loaded cached prompt: %d tokens, common prefix %zu, %.3f MiB, %.2f ms%s\n",
+                        n_tokens, ret->prompt.tokens.get_common_prefix(task.tokens), size / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0,
+                        is_cont ? "" : ", the cache keeps it");
+            } else {
+                SLT_WRN(*ret, "%s", "failed to load prompt from cache\n");
+                ret->prompt_clear();
+            }
+
+            // a prompt that another conversation started from, or that was not loaded, goes back as the newest one
+            if (!ok || !is_cont) {
+                prompt_cache->states.splice(prompt_cache->states.end(), taken);
+            }
+        } else {
+            SLT_INF(*ret, "selected slot without reuse, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
+
+            // the request starts from nothing, the old state is in the cache
+            if (prompt_cache && ret->prompt.n_tokens() > 0 && prompt_cache->has(ret->prompt.tokens)) {
+                ret->prompt_clear();
+            }
+        }
+
+        if (prompt_cache) {
+            prompt_cache->update();
+        }
+
+        return ret;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
+        if (params_base.slot_select_reuse) {
+            return get_available_slot_reuse(task);
+        }
+
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1936,6 +2177,20 @@ private:
 
         if (!params_base.kv_unified) {
             return res;
+        }
+
+        if (params_base.slot_select_reuse && prompt_cache) {
+            // save the state first, least recently used slot first; a state that cannot be saved goes last
+            for (auto * slot : get_free_slots(slots.size(), -1)) {
+                if (slot->prompt.n_tokens() > 0 && slot->prompt_save_safe(*prompt_cache)) {
+                    SRV_WRN("clearing slot %d with %zu tokens, the state is in the prompt cache\n", slot->id, slot->prompt.tokens.size());
+
+                    slot->prompt_clear();
+                    prompt_cache->update();
+
+                    return true;
+                }
+            }
         }
 
         for (auto & slot : slots) {
@@ -3110,6 +3365,9 @@ private:
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
+                                } else if (params_base.slot_select_reuse && slot.prompt.n_tokens() > 0 && !prompt_cache->has(slot.prompt.tokens)) {
+                                    SLT_WRN(slot, "failed to save the state of %d tokens, it stays in the slot\n", slot.prompt.n_tokens());
+                                    continue;
                                 }
 
                                 if (params_base.kv_unified) {
@@ -3684,7 +3942,8 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
-                bool ok = decode(n_batch, off);
+                int32_t n_skip = 0;
+                bool ok = decode(n_batch, off, n_skip);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3696,7 +3955,8 @@ private:
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
                 } else {
-                    // try again with the updated n_batch
+                    // try again with the updated n_batch, after the tokens of a slot that failed alone
+                    off_next = off + n_skip;
                     continue;
                 }
             } catch (const std::exception & e) {
@@ -4342,12 +4602,15 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, n_prefix = %d, size = %.3f MiB, t = %.2f ms)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, n_prefix, (float) cur.size() / 1024 / 1024, (ggml_time_us() - t_start_restore) / 1000.0);
+                                        SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, n_prefix = %d, size = %.3f MiB, t = %.2f ms)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, n_prefix, (float) cur.size() / 1024 / 1024, (ggml_time_us() - t_start_restore) / 1000.0);
                                     }
 
                                     if (do_reset) {
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        SLT_INF(slot, "full prompt re-processing: the state of %d tokens shares %d tokens with the prompt and has no context checkpoint at or before that (%zu checkpoints, first at n_tokens = %" PRId64 ")\n",
+                                                slot.prompt.n_tokens(), n_prefix, slot.prompt.checkpoints.size(),
+                                                slot.prompt.checkpoints.empty() ? (int64_t) -1 : slot.prompt.checkpoints.front()->n_tokens);
                                         pos_next = 0;
                                         n_past = 0;
                                     }
@@ -4381,6 +4644,10 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // the state belongs to this request from here on, see --slot-select-reuse
+                        slot.prompt.n_tokens_task = slot.task->n_tokens();
+                        slot.prompt.cache_key     = slot.task->cache_key;
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4721,8 +4988,9 @@ private:
     }
 
     // returns true = success ; false = retry with smaller batch size
+    // n_skip: tokens at off that the caller must drop before the retry, they belong to a slot that failed alone
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off) {
+    bool decode(int32_t & n_batch, int32_t off, int32_t & n_skip) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -4786,6 +5054,38 @@ private:
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+
+                    // --ctx-exceed-fail-one: the token at off found no room, only its slot fails
+                    // the tokens of a slot are next to each other in the batch, the ones before off are decoded
+                    if (params_base.ctx_exceed_fail_one && n_batch == 1 && ret == 1 && !batch.has_embd()) {
+                        server_slot & slot = slots[batch.tokens[off].id_slot];
+
+                        if (slot.is_processing() && !slot.task->is_parent() && !slot.task->is_child()) {
+                            while (off + n_skip < batch.size() && batch.tokens[off + n_skip].id_slot == slot.id) {
+                                n_skip++;
+                            }
+
+                            // the state is good up to the last decoded token, the conversation can go on from there later
+                            // not with draft tokens in the batch: the ones that are decoded are not verified
+                            const int32_t n_keep = slot.spec_draft.empty() && !slot.prompt.tokens.has_mtmd ? slot.prompt.n_tokens() - n_skip : 0;
+
+                            SLT_WRN(slot, "the context is full, this request fails alone, state kept: %d of %d tokens\n", n_keep, slot.prompt.n_tokens());
+
+                            send_error(slot, err);
+                            slot.release();
+                            slot.i_batch = -1;
+
+                            if (n_keep > 0 && n_keep <= slot.prompt.n_tokens()) {
+                                slot.prompt.tokens.keep_first(n_keep);
+                            } else {
+                                slot.prompt_clear();
+                            }
+
+                            n_batch = llama_n_batch(ctx_tgt);
+
+                            return false;
+                        }
+                    }
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
@@ -5511,7 +5811,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.apply_chat_session(chat_session);
 
-            task.id_slot = json_value(data, "id_slot", -1);
+            task.id_slot   = json_value(data, "id_slot", -1);
+            task.cache_key = json_value(data, "prompt_cache_key", std::string());
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
