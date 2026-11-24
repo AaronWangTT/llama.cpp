@@ -38,7 +38,7 @@ static bool q35moe_pfmm_supported(int device, const ggml_tensor * w, const ggml_
             return false;
         }
     }
-    return true;
+    return inkling_pfmm_stock_sgemm("GGML_Q35MOE_PFMM");
 }
 
 static void q35moe_pfmm_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {

@@ -13188,6 +13188,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 16384, 4096, 1, n_slices, GGML_TYPE_F16, false, true));
     }
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 4096, 1024, 1, 5));
 
     // qwen35moe one-token attention: head size 256, 2 K/V heads, GQA 8, F16 and Q8_0 K/V
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
@@ -13197,6 +13198,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 16384, 4096, 1, n_slices, type_KV, false, true));
         }
+    }
+
+    // the same with more slices, other numbers of K/V heads, a list of 102400 rows
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t n_slices : {7, 8, 9, 10, 11, 12}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4096, 1024, 1, n_slices, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 16384, 4096, 1, n_slices, type_KV, false, true));
+        }
+        for (int64_t nh : {1, 4}) {
+            for (int64_t n_slices : {1, 2, 3, 4, 5, 6}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, nh, 8, 4096, 1024, 1, n_slices, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, nh, 8, 16384, 4096, 1, n_slices, type_KV, false, true));
+            }
+        }
+        for (int64_t n_slices : {1, 2, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 131072, 102400, 1, n_slices, type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 131072, 102400, 1, 4, type_KV, false, true));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));

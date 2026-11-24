@@ -665,32 +665,52 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ct
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * rows = dst->src[5];
 
+    // An op of this shape is the one-token attention of the model: each reason that sends it to the stock kernel goes to the log once.
+    // Ops of other shapes (other models, prompt batches) come here too, they say nothing.
+    const bool   candidate = Q->ne[0] == DKQ && Q->ne[1] == 1 && Q->ne[2] == ncols2*K->ne[2] && !dst->src[4];
+    const char * func      = __func__;
+    static bool  logged[10] = {false};
+    const auto stock = [&](const int reason, const char * why) {
+        if (candidate && !logged[reason]) {
+            logged[reason] = true;
+            GGML_LOG_WARN("%s: GGML_Q35MOE_FAGQA is not used: %s (sequences = %lld, K %s, V %s)\n",
+                func, why, (long long) Q->ne[3], ggml_type_name(K->type), ggml_type_name(V->type));
+        }
+        return false;
+    };
+
     // The op must be one that goes to flash_attn_ext_f16<256, 256, 2, 8, false, false, false> with its GQA path.
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    if (!mma_f16 || cc != GGML_CUDA_CC_OFFSET_AMD + 0x1103 || !mask || !rows || dst->src[4]) {
-        return false;
+    if (cc != GGML_CUDA_CC_OFFSET_AMD + 0x1103) {
+        return stock(0, "the device is not gfx1103");
+    }
+    if (!mask || !rows) {
+        return stock(1, "no list of K/V rows (it needs --kv-unified, and LLAMA_KV_ROWS_DISABLE not set)");
+    }
+    if (!mma_f16 || dst->src[4]) {
+        return stock(2, "the op does not go to the WMMA kernel");
     }
     const bool q8 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
     if (Q->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F16 || !(q8 || (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16))) {
-        return false;
+        return stock(3, "K and V must both be F16 or both be Q8_0");
     }
     if (Q->ne[0] != DKQ || K->ne[0] != DKQ || V->ne[0] != DV || Q->ne[1] != 1 || Q->ne[2] != ncols2*K->ne[2] || V->ne[2] != K->ne[2]) {
-        return false;
+        return stock(4, "the shape of K or V");
     }
     if (rows->ne[0] % FATTN_KQ_STRIDE != 0 || rows->ne[1] != Q->ne[3] || mask->ne[0] != rows->ne[0] || mask->ne[2] != 1) {
-        return false;
+        return stock(5, "the shape of the row list or of the mask");
     }
     if (ggml_get_op_params_f32(dst, 1) != 0.0f || ggml_get_op_params_f32(dst, 2) != 0.0f) {
-        return false;
+        return stock(6, "max_bias or logit_softcap is set");
     }
     // The kernel loads 16 bytes at a time. A Q8_0 row must be whole blocks, one after the other.
     if (!ggml_cuda_is_aligned(Q, 16) || !ggml_cuda_is_aligned(K, 16) || !ggml_cuda_is_aligned(V, 16) || !ggml_cuda_is_aligned(mask, 16) ||
             !ggml_cuda_is_aligned(rows, 16)) {
-        return false;
+        return stock(7, "a tensor is not aligned to 16 bytes");
     }
     if (K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type)) {
-        return false;
+        return stock(8, "the strides of K or V");
     }
 
     // The plan of launch_fattn for that kernel.
@@ -701,7 +721,7 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ct
     const int nwarps    = nthreads / warp_size;
     if (warp_size != WARP_SIZE || nwarps != 2 || nbatch_fa != 32 || !ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols, cc) ||
             ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc) > 1 || ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc)) {
-        return false;
+        return stock(9, "the configuration of the WMMA kernel");
     }
 
     const int64_t n_kv       = rows->ne[0];
@@ -723,6 +743,7 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ct
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, ref, nthreads, nbytes_shared_total));
     GGML_ASSERT(max_blocks_per_sm > 0);
 
+    // The two tests of the plan depend on the number of sequences in the batch, so they do not go to the log.
     const int max_blocks               = max_blocks_per_sm*nsm;
     const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
@@ -737,17 +758,36 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ct
     }
     const bool uniform = nblocks % ntiles_dst == 0; // Each block is in one KV head.
 
+    static bool logged_use = false;
+    if (!logged_use) {
+        logged_use = true;
+        GGML_LOG_INFO("%s: GGML_Q35MOE_FAGQA is used, K and V %s, kv = %lld, sequences = %lld, blocks = %d\n",
+            __func__, ggml_type_name(K->type), (long long) n_kv, (long long) Q->ne[3], nblocks);
+    }
+
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
 
     // The check reads the result back. A stream that captures a graph cannot do this, so it needs GGML_CUDA_DISABLE_GRAPHS=1.
-    static const bool check = [] { const char * s = getenv("GGML_Q35MOE_FAGQA_CHECK"); return s && strcmp(s, "1") == 0; }() && getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+    static const bool check = [] {
+        const char * s = getenv("GGML_Q35MOE_FAGQA_CHECK");
+        if (!s || strcmp(s, "1") != 0) {
+            return false;
+        }
+        if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
+            GGML_LOG_WARN("GGML_Q35MOE_FAGQA_CHECK=1 does nothing, it needs GGML_CUDA_DISABLE_GRAPHS=1\n");
+            return false;
+        }
+        return true;
+    }();
     std::vector<float> out_ref;
     if (check) {
         ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
         out_ref.resize(ggml_nelements(dst));
         CUDA_CHECK(cudaMemcpyAsync(out_ref.data(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Every byte 0xff: a value that the new kernel does not write then has other bits than the reference.
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0xff, ggml_nbytes(dst), stream));
     }
 
     // The mask scan of launch_fattn, a list of K/V rows can end with padding.

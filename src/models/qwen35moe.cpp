@@ -7,17 +7,51 @@
 #include "ggml-qwen35-decode.h"
 
 #include <cstring>
+#include <mutex>
+#include <utility>
+#include <vector>
 
-// the fused ops exist on a single ROCm device only; returns that device or nullptr
+// the fused ops exist on a single ROCm device only; returns that device if layer il is on it, else nullptr and the reason in why
 // not with tensor overrides: an op next to a weight in host memory can go to the CPU backend, the new state is then lost
-static ggml_backend_dev_t q35moe_rocm_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
-    if (cparams.cb_eval || cparams.optimizer_graph || !loras->empty() || model.devices.size() != 1 || model.devices.front().is_meta ||
-            model.has_tensor_overrides() ||
-            (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
-        return nullptr;
+// rs: the op reads or writes the recurrent state, it does not keep the copies for a rollback
+static ggml_backend_dev_t q35moe_rocm_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras,
+        const int il, const bool rs, const char ** why) {
+    if (cparams.cb_eval) {
+        *why = "an eval callback is set";
+    } else if (cparams.optimizer_graph) {
+        *why = "the graph is for training";
+    } else if (!loras->empty()) {
+        *why = "a LoRA adapter is in use";
+    } else if (model.devices.size() != 1 || model.devices.front().is_meta) {
+        *why = "the model is not on one plain device";
+    } else if (model.has_tensor_overrides()) {
+        *why = "tensor overrides are set (-ot, --cpu-moe)";
+    } else if (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
+        *why = "the split mode is not none or layer";
+    } else if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.devices.front().dev)), "ROCm") != 0) {
+        *why = "the device is not a ROCm device";
+    } else if (rs && cparams.n_rs_seq != 0) {
+        *why = "n_rs_seq > 0 (state rollback for speculative decoding)";
+    } else if (model.dev_layer(il) != model.devices.front().dev) {
+        *why = "the block is not on the device";
+    } else {
+        return model.devices.front().dev;
     }
-    const auto dev = model.devices.front().dev;
-    return std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0 ? dev : nullptr;
+    return nullptr;
+}
+
+// a switch that is set but can not act in this context goes to the log, once per switch and reason (both are string literals)
+static void q35moe_log_off(const char * switches, const char * why) {
+    static std::mutex mutex;
+    static std::vector<std::pair<const char *, const char *>> seen;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const auto & s : seen) {
+        if (s.first == switches && s.second == why) {
+            return;
+        }
+    }
+    seen.emplace_back(switches, why);
+    LLAMA_LOG_WARN("qwen35moe: no effect of %s: %s\n", switches, why);
 }
 #endif
 
@@ -424,10 +458,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
     // GGML_Q35MOE_CONVPF=1, many tokens of one sequence: one op reads the conv state and qkv_mixed, there is no concat tensor
-    if (ggml_q35moe_convpf_enabled() && n_seqs == 1 && n_seq_tokens >= ggml_qwen35_convpf_min_n_tokens && cparams.n_rs_seq == 0 &&
-            conv_kernel_size == ggml_qwen35_convpf_n_conv && qkv_mixed->ne[0] == conv_channels) {
-        // a layer that is not on that device keeps the stock ops
-        if (const auto dev_pf = q35moe_rocm_dev(cparams, model, loras); dev_pf && model.dev_layer(il) == dev_pf) {
+    if (ggml_q35moe_convpf_enabled()) {
+        // a reason that holds for the whole context goes to the log once; the shape of the batch does not
+        const char * why = nullptr;
+        const auto dev_pf = q35moe_rocm_dev(cparams, model, loras, il, true, &why);
+        if (dev_pf && (conv_kernel_size != ggml_qwen35_convpf_n_conv || qkv_mixed->ne[0] != conv_channels)) {
+            why = "the conv kernel size or the channel count";
+        }
+        if (why) {
+            q35moe_log_off("GGML_Q35MOE_CONVPF", why);
+        } else if (n_seqs == 1 && n_seq_tokens >= ggml_qwen35_convpf_min_n_tokens) {
             ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
             ggml_tensor * past = ggml_new_tensor_2d(probe.get(), GGML_TYPE_F32, conv_kernel_size - 1, conv_channels);
             auto * candidate = ggml_qwen35_try_convpf(probe.get(), qkv_mixed, past, conv_kernel);
@@ -542,14 +582,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
             !ggml_q35moe_post1_enabled()) {
         return nullptr;
     }
-    if (ubatch.n_seq_tokens != 1 || ubatch.n_seqs != 1 || cparams.n_rs_seq != 0 || mctx_cur->get_n_rs() != 1) {
-        return nullptr;
-    }
-    // a layer that is not on that device keeps the stock ops
-    const auto dev = q35moe_rocm_dev(cparams, model, loras);
-    if (!dev || model.dev_layer(il) != dev) {
-        return nullptr;
-    }
+    // a reason that holds for the whole context goes to the log once; the shape of the batch does not
+    const char * why = nullptr;
+    const auto dev = q35moe_rocm_dev(cparams, model, loras, il, true, &why);
 
     const int64_t d_inner       = hparams.ssm_d_inner;
     const int64_t head_k_dim    = hparams.ssm_d_state;
@@ -560,7 +595,18 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
     const int64_t conv_channels = d_inner + 2 * key_dim;
 
     // the kernels replay the stock kernels of this head size only
-    if (head_k_dim != ggml_qwen35_head_dim || head_v_dim != head_k_dim || d_inner != head_v_dim * num_v_heads) {
+    if (dev && (head_k_dim != ggml_qwen35_head_dim || head_v_dim != head_k_dim || d_inner != head_v_dim * num_v_heads)) {
+        why = "the head size of the recurrent blocks";
+    }
+    if (why) {
+        q35moe_log_off("GGML_Q35MOE_MVSHARE/BA1/PREP1/GDN1/POST1", why);
+        return nullptr;
+    }
+    // PREP1 and GDN1 write the state cache, the backend takes them only with the cache in its memory
+    if (!cparams.offload_kqv && (ggml_q35moe_prep1_enabled() || ggml_q35moe_gdn1_enabled())) {
+        q35moe_log_off("GGML_Q35MOE_PREP1/GDN1", "the recurrent state is not in device memory (--no-kv-offload)");
+    }
+    if (ubatch.n_seq_tokens != 1 || ubatch.n_seqs != 1 || mctx_cur->get_n_rs() != 1) {
         return nullptr;
     }
 
@@ -830,42 +876,98 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 // build_layer_ffn() plus the residual as the fused op of ggml-q35moe-ffn.h, nullptr if the op does not take this layer
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cur, ggml_tensor * residual, const int il) {
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
-    const auto & layer = model.layers[il];
-
-    if (!ggml_q35moe_ffn1_enabled() || moe_cache != nullptr) {
-        return nullptr;
-    }
-    const auto dev = q35moe_rocm_dev(cparams, model, loras);
-    if (dev == nullptr || model.dev_layer(il) != dev) {
+    if (!ggml_q35moe_ffn1_enabled()) {
         return nullptr;
     }
 
-    // the op replays build_moe_ffn() and build_ffn() with these settings only
-    constexpr float eps = 1e-6f;
-    const bool plain_graph = n_expert == ggml_q35moe_n_expert && n_expert_used == ggml_q35moe_n_used &&
-        hparams.n_expert_used(il) == (uint32_t) ggml_q35moe_n_used && hparams.n_expert_groups <= 1 &&
-        (hparams.expert_weights_scale == 0.0f || hparams.expert_weights_scale == 1.0f) && hparams.expert_weights_norm_eps <= 0.0f &&
-        !hparams.expert_router_f32 && !(hparams.swiglu_clamp_exp[il] > eps) && !(hparams.swiglu_clamp_shexp[il] > eps) &&
-        !layer.ffn_gate_up_exps && !layer.ffn_up_exps_s && !layer.ffn_gate_exps_s && !layer.ffn_down_exps_s &&
-        !layer.ffn_up_shexp_s && !layer.ffn_gate_shexp_s && !layer.ffn_down_shexp_s;
-    if (!plain_graph) {
-        return nullptr;
-    }
+    constexpr int n_w = GGML_Q35MOE_FFN1_N_SRC - GGML_Q35MOE_FFN1_GATE_INP;
 
-    ggml_tensor * w[] = {
-        layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
-        layer.ffn_gate_inp_shexp, layer.ffn_up_shexp, layer.ffn_gate_shexp, layer.ffn_down_shexp,
-    };
-    for (const ggml_tensor * m : w) {
-        // no rotated input and no precision request for a product
-        if (m == nullptr || (hdmd && hdmd->rot.count(m)) || (prec_policy && (prec_policy->prec_src1.count(m) || prec_policy->prec_acc.count(m)))) {
-            return nullptr;
+    // why block i does not take the op for the input x and the residual r, nullptr if it takes it; w gets the weights of the block
+    const auto refusal = [&](const int i, ggml_tensor * x, ggml_tensor * r, ggml_tensor ** w) -> const char * {
+        const auto & layer = model.layers[i];
+
+        if (moe_cache != nullptr) {
+            return "the MoE cache is on";
         }
+        const char * why = nullptr;
+        const auto dev = q35moe_rocm_dev(cparams, model, loras, i, false, &why);
+        if (dev == nullptr) {
+            return why;
+        }
+
+        // the op replays build_moe_ffn() and build_ffn() with these settings only
+        constexpr float eps = 1e-6f;
+        const bool plain_graph = n_expert == ggml_q35moe_n_expert && n_expert_used == ggml_q35moe_n_used &&
+            hparams.n_expert_used(i) == (uint32_t) ggml_q35moe_n_used && hparams.n_expert_groups <= 1 &&
+            (hparams.expert_weights_scale == 0.0f || hparams.expert_weights_scale == 1.0f) && hparams.expert_weights_norm_eps <= 0.0f &&
+            !hparams.expert_router_f32 && !(hparams.swiglu_clamp_exp[i] > eps) && !(hparams.swiglu_clamp_shexp[i] > eps) &&
+            !layer.ffn_gate_up_exps && !layer.ffn_up_exps_s && !layer.ffn_gate_exps_s && !layer.ffn_down_exps_s &&
+            !layer.ffn_up_shexp_s && !layer.ffn_gate_shexp_s && !layer.ffn_down_shexp_s;
+        if (!plain_graph) {
+            return "feed-forward settings that the op does not replay";
+        }
+
+        ggml_tensor * const ws[n_w] = {
+            layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+            layer.ffn_gate_inp_shexp, layer.ffn_up_shexp, layer.ffn_gate_shexp, layer.ffn_down_shexp,
+        };
+        for (int j = 0; j < n_w; ++j) {
+            const ggml_tensor * m = ws[j];
+            // no rotated input and no precision request for a product
+            if (m == nullptr || (hdmd && hdmd->rot.count(m)) || (prec_policy && (prec_policy->prec_src1.count(m) || prec_policy->prec_acc.count(m)))) {
+                return "a weight is missing, rotated or has a precision request";
+            }
+            w[j] = ws[j];
+        }
+
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        auto * candidate = ggml_q35moe_try_ffn1(probe.get(), x, r, w);
+        if (candidate == nullptr) {
+            return "weight types or sizes without a kernel";
+        }
+        if (!ggml_backend_dev_supports_op(dev, candidate)) {
+            return "the backend refuses the op (a weight is not in device memory, or GGML_CUDA_DISABLE_FUSION is set)";
+        }
+        return nullptr;
+    };
+
+    // once per process: the number of blocks that take the op for one token, and the first reason against it
+    static std::once_flag reported;
+    if (!model.no_alloc()) {
+        std::call_once(reported, [&] {
+            int          n_take    = 0;
+            int          first     = -1;
+            const char * first_why = nullptr;
+            for (int i = 0; i < n_layer; ++i) {
+                ggml_context_ptr inputs{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+                ggml_tensor * x = ggml_new_tensor_1d(inputs.get(), GGML_TYPE_F32, ggml_q35moe_n_embd);
+                ggml_tensor * r = ggml_new_tensor_1d(inputs.get(), GGML_TYPE_F32, ggml_q35moe_n_embd);
+                ggml_tensor * w[n_w];
+                const char *  why = refusal(i, x, r, w);
+                if (why == nullptr) {
+                    n_take++;
+                } else if (first_why == nullptr) {
+                    first     = i;
+                    first_why = why;
+                }
+            }
+            if (first_why == nullptr) {
+                LLAMA_LOG_INFO("qwen35moe: GGML_Q35MOE_FFN1: %d of %d blocks take the op in a graph of one token\n", n_take, (int) n_layer);
+            } else {
+                LLAMA_LOG_WARN("qwen35moe: GGML_Q35MOE_FFN1: %d of %d blocks take the op in a graph of one token, block %d does not: %s\n",
+                        n_take, (int) n_layer, first, first_why);
+            }
+        });
     }
 
-    ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
-    auto * candidate = ggml_q35moe_try_ffn1(probe.get(), cur, residual, w);
-    if (candidate == nullptr || !ggml_backend_dev_supports_op(dev, candidate)) {
+    // The op is for graphs of one token only: the last block of a many-token graph with one output row has a one-token input too.
+    // The op there would change the topology between batches (one slot generates, another reads a prompt), and the scheduler then plans the memory again.
+    if (ubatch.n_tokens != 1) {
+        return nullptr;
+    }
+
+    ggml_tensor * w[n_w];
+    if (refusal(il, cur, residual, w) != nullptr) {
         return nullptr;
     }
 

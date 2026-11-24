@@ -507,13 +507,25 @@ static bool ggml_cuda_flash_attn_ext_qwen35_fagqa(ggml_backend_cuda_context & ct
     cudaStream_t stream = ctx.stream();
 
     // The check reads the result back. A stream that captures a graph cannot do this, so it needs GGML_CUDA_DISABLE_GRAPHS=1.
-    static const bool check = [] { const char * s = getenv("GGML_QWEN35_FAGQA_CHECK"); return s && strcmp(s, "1") == 0; }() && getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+    static const bool check = [] {
+        const char * s = getenv("GGML_QWEN35_FAGQA_CHECK");
+        if (!s || strcmp(s, "1") != 0) {
+            return false;
+        }
+        if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
+            GGML_LOG_WARN("GGML_QWEN35_FAGQA_CHECK=1 does nothing, it needs GGML_CUDA_DISABLE_GRAPHS=1\n");
+            return false;
+        }
+        return true;
+    }();
     std::vector<float> out_ref;
     if (check) {
         ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
         out_ref.resize(ggml_nelements(dst));
         CUDA_CHECK(cudaMemcpyAsync(out_ref.data(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Every byte 0xff: a value that the new kernel does not write then has other bits than the reference.
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0xff, ggml_nbytes(dst), stream));
     }
 
     // The mask scan of launch_fattn, a list of K/V rows can end with padding.

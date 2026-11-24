@@ -401,9 +401,15 @@ static __global__ void q35moe_ffn_exps_down(
     dst[row] = out;
 }
 
+static bool ggml_cuda_fusion_disabled(); // ggml-cuda.cu
+
 static bool q35moe_ffn1_supported(int device, const ggml_tensor * op) {
     const auto & info = ggml_cuda_info().devices[device];
     if (info.cc != GGML_CUDA_CC_OFFSET_AMD + 0x1103 || info.warp_size != q35moe_warp || !ggml_q35moe_ffn1_enabled() || !ggml_q35moe_is_ffn1(op)) {
+        return false;
+    }
+    // the op replays the fused kernels of the stock nodes; with GGML_CUDA_DISABLE_FUSION those nodes run one by one and round in another way
+    if (ggml_cuda_fusion_disabled()) {
         return false;
     }
     // weights in memory of this device only: the scheduler gives an op with a weight in host memory to the CPU backend

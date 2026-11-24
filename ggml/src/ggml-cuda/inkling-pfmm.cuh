@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cctype>
+#include <string>
+
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
 #error "Compile this private PFMM experiment for gfx1103 only"
 #endif
@@ -15,6 +18,36 @@ constexpr int inkling_pfmm_depth    = 16;  // k per load
 static bool inkling_pfmm_enabled() {
     static const bool enabled = [] { const char * p = getenv("GGML_INKLING_PFMM"); return p && strcmp(p, "1") == 0; }();
     return enabled;
+}
+
+// The kernel replays the F32 SGEMM that rocBLAS takes by default. False if the environment gives the stock product another compute type or
+// another GEMM; this goes to the log once. name is the switch that asks.
+static bool inkling_pfmm_stock_sgemm(const char * name) {
+    const char * var = nullptr;
+    for (const char * v : { "ROCBLAS_USE_HIPBLASLT", "ROCBLAS_TENSILE_LIBPATH", "ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH" }) {
+        if (getenv(v) != nullptr) {
+            var = v;
+        }
+    }
+    // read on each call and in lower case, as ggml_cuda_mul_mat_cublas does
+    if (const char * p = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE")) {
+        std::string type = p;
+        for (char & c : type) {
+            c = std::tolower(c);
+        }
+        if (type == "f16" || type == "fp16" || type == "bf16") {
+            var = "GGML_CUDA_CUBLAS_COMPUTE_TYPE";
+        }
+    }
+    if (var == nullptr) {
+        return true;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_WARN("%s: %s is not used, %s is set\n", __func__, name, var);
+    }
+    return false;
 }
 
 // weights k and k + 1 of a row; a BF16 weight is the high half of the F32 value
@@ -146,7 +179,7 @@ static bool inkling_pfmm_supported(int device, const ggml_tensor * w, const ggml
             return false;
         }
     }
-    return true;
+    return inkling_pfmm_stock_sgemm("GGML_INKLING_PFMM");
 }
 
 static void inkling_pfmm_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {
