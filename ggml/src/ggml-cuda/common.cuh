@@ -1349,6 +1349,44 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
+#ifdef GGML_USE_HIP
+// GGML_Q35MOE_QSHARE=1 (mmq.cu): the Q8_1 copy of src1 that an MMQ product made, and for routed experts the column lists,
+// kept for the next product of the same graph run that reads the same src1.
+// The graph loop drops the kept data at the start of a graph and when a node may have written into the memory of the kept src1 or ids.
+struct ggml_cuda_qshare {
+    struct buffer {
+        void * ptr  = nullptr;
+        size_t size = 0;
+    };
+
+    const ggml_tensor * node     = nullptr; // the node that the graph loop computes now, nullptr inside a fused op
+    bool                captured = false;   // the graph runs as a captured CUDA graph: nothing is kept
+    bool                valid    = false;
+
+    // what the kept data was made from
+    const ggml_tensor * src1    = nullptr;
+    const char *        src1_lo = nullptr; // bytes of src1
+    const char *        src1_hi = nullptr;
+    int64_t             src1_ne[GGML_MAX_DIMS] = {};
+    size_t              src1_nb[GGML_MAX_DIMS] = {};
+    int                 ds_layout   = -1;
+    int64_t             ne10_padded = 0;
+    const ggml_tensor * ids    = nullptr; // routed experts only
+    const char *        ids_lo = nullptr; // bytes of ids
+    const char *        ids_hi = nullptr;
+    int64_t             ids_ne[2]  = {};
+    size_t              ids_nb1    = 0;
+    int64_t             n_experts  = 0;
+    int                 tile_width = 0;
+
+    buffer q8, ids_src1, ids_dst, tile_spec;
+
+    // products that made the kept data / took it: in this graph run, in all runs
+    int      n_kept_graph = 0, n_taken_graph = 0;
+    uint64_t n_kept       = 0, n_taken       = 0;
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1368,6 +1406,8 @@ struct ggml_backend_cuda_context {
     // Inkling prefill: tile flags and far bias of the mask that the next attention op takes (inkling_pfmask_24).
     int * inkling_pf_aux = nullptr;
     const ggml_tensor * inkling_pf_mask = nullptr;
+
+    ggml_cuda_qshare qshare;
 #endif
 
 #ifdef USE_CUDA_GRAPH

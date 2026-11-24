@@ -974,6 +974,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (inkling_pf_aux != nullptr) {
         CUDA_CHECK(cudaFree(inkling_pf_aux));
     }
+    if (qshare.n_kept > 0) {
+        GGML_LOG_INFO("%s: GGML_Q35MOE_QSHARE: %llu products quantized their input, %llu took the Q8_1 input of the product before\n",
+            __func__, (unsigned long long) qshare.n_kept, (unsigned long long) qshare.n_taken);
+    }
+    for (const ggml_cuda_qshare::buffer & b : { qshare.q8, qshare.ids_src1, qshare.ids_dst, qshare.tile_spec }) {
+        if (b.ptr != nullptr) {
+            CUDA_CHECK(cudaFree(b.ptr));
+        }
+    }
 #endif
 }
 
@@ -5426,8 +5435,57 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+#ifdef GGML_USE_HIP
+// GGML_Q35MOE_QSHARE: start and end of a graph run, nothing is kept across it
+static void ggml_cuda_qshare_reset(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const bool captured) {
+    ggml_cuda_qshare & qs = ctx.qshare;
+    static const bool log = [] { const char * p = getenv("GGML_Q35MOE_QSHARE_LOG"); return p && strcmp(p, "1") == 0; }();
+    if (log && qs.n_kept_graph > 0) {
+        GGML_LOG_INFO("%s: GGML_Q35MOE_QSHARE: graph of %d nodes, %d products quantized their input, %d took the Q8_1 input of the product before\n",
+            __func__, cgraph->n_nodes, qs.n_kept_graph, qs.n_taken_graph);
+    }
+    qs.node          = nullptr;
+    qs.captured      = captured;
+    qs.valid         = false;
+    qs.n_kept_graph  = 0;
+    qs.n_taken_graph = 0;
+}
+
+// GGML_Q35MOE_QSHARE: the nodes first..last were computed. Drops the kept Q8_1 input if one of them may have written into the
+// memory of the kept src1 or ids. A product that is a node of its own writes its output only. Any other op may also write into
+// a source (a copy or an in-place op through its view, a fused or custom op into a state tensor), so its sources count as well.
+static void ggml_cuda_qshare_written(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int first, const int last) {
+    ggml_cuda_qshare & qs = ctx.qshare;
+    qs.node = nullptr;
+    if (!qs.valid) {
+        return;
+    }
+    const auto touches = [&qs](const ggml_tensor * t) {
+        if (t == nullptr || t->data == nullptr) {
+            return false;
+        }
+        const char * lo = (const char *) t->data;
+        const char * hi = lo + ggml_nbytes(t);
+        return (lo < qs.src1_hi && qs.src1_lo < hi) || (qs.ids != nullptr && lo < qs.ids_hi && qs.ids_lo < hi);
+    };
+    for (int i = first; i <= last && qs.valid; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        const bool output_only = first == last && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->view_src == nullptr;
+        bool hit = touches(node);
+        for (int j = 0; j < GGML_MAX_SRC && !hit && !output_only; ++j) {
+            hit = touches(node->src[j]);
+        }
+        qs.valid = !hit;
+    }
+}
+#endif
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+
+#ifdef GGML_USE_HIP
+    ggml_cuda_qshare_reset(*cuda_ctx, cgraph, use_cuda_graph);
+#endif
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5585,6 +5643,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+#ifdef GGML_USE_HIP
+                    ggml_cuda_qshare_written(*cuda_ctx, cgraph, i, i + nodes_to_skip);
+#endif
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5611,11 +5672,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+#ifdef GGML_USE_HIP
+                // GGML_Q35MOE_QSHARE: only the product that is this node may keep or take a Q8_1 input
+                cuda_ctx->qshare.node = node;
+#endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+#ifdef GGML_USE_HIP
+                ggml_cuda_qshare_written(*cuda_ctx, cgraph, i, i);
+#endif
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5653,6 +5721,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+#ifdef GGML_USE_HIP
+    ggml_cuda_qshare_reset(*cuda_ctx, cgraph, false);
+#endif
 }
 
 #ifdef USE_CUDA_GRAPH
