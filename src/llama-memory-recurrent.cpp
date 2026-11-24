@@ -643,8 +643,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             auto & dst_cell = cells[dst_id];
             auto & src_cell = cells[src_id];
 
+            // [TAG_RECURRENT_ROLLBACK_MOVE]
+            // the cell moved out of the way keeps its rollback depth, build_rs() moves its snapshots
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
             // swap tails
@@ -1365,6 +1368,12 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
     if (mem->n_rs_seq == 0) {
+        return src0;
+    }
+
+    // [TAG_RECURRENT_ROLLBACK_MOVE]
+    // a cell that is not part of the ubatch keeps its pending rollback, build_rs() copies all its snapshots as they are
+    if (!is_full && (uint32_t) i >= ubatches[i_next].n_seqs) {
         return src0;
     }
 

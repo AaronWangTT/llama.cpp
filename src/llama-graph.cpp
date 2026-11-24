@@ -4183,7 +4183,6 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
@@ -4210,6 +4209,22 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_cpy(ctx0,
             states_extra,
             ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+
+    // [TAG_RECURRENT_ROLLBACK_MOVE]
+    // an extra state can be a cell that find_slot() moved, its rollback snapshots must move with it
+    // snapshot k of cell c is row k*rs_size + c, and s_copy() gives the row of snapshot 0 for an extra state
+    const int64_t n_extra = n_rs - n_seqs;
+    const int64_t n_snap  = s->ne[1] / rs_size;
+    if (n_extra > 0 && n_snap > 1) {
+        ggml_tensor * extra_copy = ggml_view_1d(ctx0, state_copy, n_extra, (n_seqs - i0)*state_copy->nb[0]);
+        for (int64_t k = 1; k < n_snap; ++k) {
+            ggml_tensor * states_snap = ggml_view_2d(ctx0, states, state_size, rs_size, states->nb[1], k*rs_size*states->nb[1]);
+            ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0,
+                    ggml_get_rows(ctx0, states_snap, extra_copy),
+                    ggml_view_2d(ctx0, s, state_size, n_extra, s->nb[1], (k*rs_size + rs_head + n_seqs)*s->nb[1])));
+        }
+    }
 
     return output_states;
 }
