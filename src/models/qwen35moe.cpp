@@ -871,7 +871,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_few(
         q35moe_log_off("GGML_Q35MOE_PREPN/GDNN", "the recurrent state is not in device memory (--no-kv-offload)");
     }
     // up to n_rs_seq + 1 tokens every token writes a slot and the stock delta net is the plain kernel
-    if (n_t < 2 || n_t > (int64_t) cparams.n_rs_seq + 1 || n_t > ggml_q35moe_few_max || ubatch.n_seqs != 1 || mctx_cur->get_n_rs() != 1) {
+    // 2 to 5 tokens are checked against the stock graph (fixture, spec-ab.sh); the ops could take up to ggml_q35moe_few_max
+    constexpr int64_t n_t_checked = 5;
+    if (n_t < 2 || n_t > (int64_t) cparams.n_rs_seq + 1 || n_t > n_t_checked || n_t > ggml_q35moe_few_max || ubatch.n_seqs != 1 ||
+            mctx_cur->get_n_rs() != 1) {
         return nullptr;
     }
 
