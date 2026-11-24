@@ -488,8 +488,7 @@ private:
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
 
-    // device buffer with the vocabulary rows of the logits, I32 [n_rows, n_seq_max]: every column holds the same list,
-    // one column per output of a draft step (see llama_set_logits_rows())
+    // device buffer with the vocabulary rows of the logits, I32 [n_rows] (see llama_set_logits_rows())
     ggml_context_ptr        ctx_logits_rows;
     ggml_backend_buffer_ptr buf_logits_rows;
     ggml_tensor *           logits_rows = nullptr;

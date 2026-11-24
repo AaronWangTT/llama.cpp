@@ -1424,18 +1424,24 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     for (uint32_t i = 0; i < ubatch.n_tokens && all_sampled; ++i) {
         all_sampled = !ubatch.output[i] || (ubatch.n_seq_id[i] == 1 && samplers.count(ubatch.seq_id[i][0]) > 0);
     }
-    if (logits_rows != nullptr && head_plain && all_sampled && n_out >= 1 && n_out <= logits_rows->ne[1] &&
+    // one product per output: the kernels for several vectors at a time read two matrix rows per block, here a matrix is one row
+    if (logits_rows != nullptr && head_plain && all_sampled && n_out >= 1 && n_out <= 8 && n_out*logits_rows->ne[0] <= head_w->ne[1] &&
             ggml_n_dims(head_w) == 2 && ggml_is_contiguous(head_w)) {
         const int64_t n_rows = logits_rows->ne[0];
 
         ggml_tensor * head_rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
-        ggml_tensor * ids       = ggml_view_2d(ctx0, logits_rows, n_rows, n_out, logits_rows->nb[1], 0);
+        ggml_tensor * ids       = ggml_reshape_2d(ctx0, logits_rows, n_rows, 1);
 
-        cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_out);
-        cur = ggml_mul_mat_id(ctx0, head_rows, cur, ids);
-        cur = ggml_reshape_2d(ctx0, cur, n_rows, n_out);
+        ggml_tensor * h_out = cur;
+        cur = nullptr;
+        for (int64_t i = 0; i < n_out; ++i) {
+            ggml_tensor * h_i = n_out == 1 ? h_out : ggml_view_1d(ctx0, h_out, h_out->ne[0], i*h_out->nb[1]);
+            ggml_tensor * l_i = ggml_mul_mat_id(ctx0, head_rows, ggml_reshape_3d(ctx0, h_i, h_out->ne[0], 1, 1), ids);
+            l_i = ggml_reshape_2d(ctx0, l_i, n_rows, 1);
+            cur = cur == nullptr ? l_i : ggml_concat(ctx0, cur, l_i, 1);
+        }
 
-        res->t_logits_rows = ggml_view_1d(ctx0, logits_rows, n_rows, 0);
+        res->t_logits_rows = logits_rows;
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }

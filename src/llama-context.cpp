@@ -1690,9 +1690,7 @@ bool llama_context::set_logits_rows(const llama_token * rows, int32_t n_rows) {
         return false;
     }
 
-    const int64_t n_cols = cparams.n_seq_max;
-
-    if (logits_rows == nullptr || logits_rows->ne[0] != n_rows || logits_rows->ne[1] != n_cols) {
+    if (logits_rows == nullptr || logits_rows->ne[0] != n_rows) {
         reset();
 
         ggml_init_params params = {
@@ -1702,7 +1700,7 @@ bool llama_context::set_logits_rows(const llama_token * rows, int32_t n_rows) {
         };
         ctx_logits_rows.reset(ggml_init(params));
 
-        logits_rows = ggml_new_tensor_2d(ctx_logits_rows.get(), GGML_TYPE_I32, n_rows, n_cols);
+        logits_rows = ggml_new_tensor_1d(ctx_logits_rows.get(), GGML_TYPE_I32, n_rows);
         ggml_set_name(logits_rows, "logits_rows");
 
         buf_logits_rows.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_logits_rows.get(), ggml_backend_dev_buffer_type(dev)));
@@ -1717,11 +1715,8 @@ bool llama_context::set_logits_rows(const llama_token * rows, int32_t n_rows) {
         LLAMA_LOG_INFO("%s: logits for %d of %d vocabulary rows\n", __func__, n_rows, n_vocab);
     }
 
-    std::vector<int32_t> data((size_t) n_rows*n_cols);
-    for (int64_t c = 0; c < n_cols; ++c) {
-        std::copy(rows, rows + n_rows, data.begin() + c*n_rows);
-    }
-    ggml_backend_tensor_set(logits_rows, data.data(), 0, ggml_nbytes(logits_rows));
+    static_assert(sizeof(llama_token) == sizeof(int32_t), "the row list is a tensor of token ids");
+    ggml_backend_tensor_set(logits_rows, rows, 0, ggml_nbytes(logits_rows));
 
     return true;
 }

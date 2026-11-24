@@ -1573,7 +1573,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t sl_n = 0;                         // 0 - unused
     std::vector<llama_token> sl_rank;         // all token ids, the ones of the file first
     std::vector<uint8_t>     sl_in;           // [n_vocab] the token is in the list
-    std::vector<std::vector<uint8_t>> sl_seen; // [n_seq][n_vocab] the sequence has seen the token
+    std::vector<std::vector<uint8_t>> sl_seen; // [n_seq + 1][n_vocab] the sequence has seen the token; the last row: control and user defined tokens
     std::vector<llama_token> sl_rows;         // the list as it was sent to the context
     int32_t sl_victim = -1;                   // rank index of the next file token to give up its row
     bool    sl_dirty  = false;
@@ -1705,7 +1705,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         sl_n = std::min(std::max(p.shortlist_n, 1024), n_vocab);
         sl_in.assign(n_vocab, 0);
-        sl_seen.assign(n_seq, std::vector<uint8_t>(n_vocab, 0));
+        sl_seen.assign(n_seq + 1, std::vector<uint8_t>(n_vocab, 0));
+
+        // chat, reasoning and tool call markers are always in the list, no text file ranks them
+        {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(p.ctx_dft));
+            std::vector<llama_token> marks;
+            for (llama_token id = 0; id < n_vocab; ++id) {
+                if (llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+                    marks.push_back(id);
+                }
+            }
+            if ((int32_t) marks.size() <= sl_n/8) {
+                for (const llama_token id : marks) {
+                    sl_seen[n_seq][id] = 1;
+                }
+            }
+        }
 
         sl_rebuild();
         sl_push();
