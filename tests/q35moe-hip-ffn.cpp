@@ -1,10 +1,14 @@
-// Fixture for the one-token feed-forward op of the qwen35moe blocks (ggml-q35moe-ffn.h).
+// Fixture for the feed-forward ops of the qwen35moe blocks (ggml-q35moe-ffn.h): one token, and 2 to ggml_q35moe_ffnm_max tokens.
 // The fused op on ROCm0 must match the stock nodes of build_moe_ffn() and build_ffn() bit for bit, for every weight type with a kernel.
+// A token of a many-token op must also get the bits of the one-token op: its value does not depend on the other tokens.
+// With GGML_Q35MOE_FFNM5=1 the op also takes 5 tokens. The stock nodes of 5 tokens use matrix kernels for the routed experts,
+// which round in another way and quantize the input of a Q6_K product in blocks of 64 values instead of 32:
+// there only the bits of the one-token op are checked, and a loose bound against the stock nodes.
 // Both graphs run through the scheduler as in llama.cpp: only then the backend fuses the top-k chain of the stock nodes into
 // topk_moe_cuda, the form that the op replays (without the scheduler the chain runs node by node and rounds differently).
 // Cases with a zero router, a zero shared expert, zero routed experts and a zero input show which part differs.
 // The CPU callback must stay close to the stock nodes on CPU.
-//   GGML_Q35MOE_FFN1=1 q35moe-hip-ffn ABS_LIBDIR
+//   GGML_Q35MOE_FFN1=1 GGML_Q35MOE_FFNM=1 [GGML_Q35MOE_EXPONCE=1] [GGML_Q35MOE_FFNM5=1] q35moe-hip-ffn ABS_LIBDIR
 #include "ggml-backend.h"
 #include "ggml-q35moe-ffn.h"
 
@@ -112,36 +116,45 @@ static model make_model(ggml_backend_t be, ggml_backend_t cpu, const types & t, 
     return m;
 }
 
+// x_data and res_data hold n tokens of N values
 static std::vector<float> run(const model & m, bool fused, const std::vector<float> & x_data, const std::vector<float> & res_data) {
+    const int64_t n = x_data.size() / N;
+
     ggml_backend_t be = m.be;
     ggml_context * c  = ggml_init({128*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
     ggml_cgraph *  gf = ggml_new_graph(c);
 
-    ggml_tensor * x   = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, 1); ggml_set_input(x);
-    ggml_tensor * res = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, 1); ggml_set_input(res);
+    ggml_tensor * x   = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, n); ggml_set_input(x);
+    ggml_tensor * res = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, n); ggml_set_input(res);
 
     ggml_tensor * out;
     if (fused) {
         ggml_tensor * w[N_W];
         std::memcpy(w, m.w, sizeof(w));
-        out = ggml_q35moe_try_ffn1(c, x, res, w);
-        check(out && ggml_q35moe_is_ffn1(out) && ggml_backend_supports_op(be, out), "the backend must take the fused op");
+        if (n == 1) {
+            out = ggml_q35moe_try_ffn1(c, x, res, w);
+            check(out && ggml_q35moe_is_ffn1(out) && !ggml_q35moe_is_ffnm(out), "the one-token op");
+        } else {
+            out = ggml_q35moe_try_ffnm(c, x, res, w);
+            check(out && ggml_q35moe_is_ffnm(out) && !ggml_q35moe_is_ffn1(out), "the many-token op");
+        }
+        check(ggml_backend_supports_op(be, out), "the backend must take the fused op");
     } else {
         // build_moe_ffn() with the settings of qwen35moe
         ggml_tensor * logits   = ggml_mul_mat(c, m.w[W_GATE_INP], x);
         ggml_tensor * probs    = ggml_soft_max(c, logits);
         ggml_tensor * selected = ggml_argsort_top_k(c, probs, N_USED);
-        probs = ggml_reshape_3d(c, probs, 1, N_EXP, 1);
+        probs = ggml_reshape_3d(c, probs, 1, N_EXP, n);
         ggml_tensor * weights = ggml_get_rows(c, probs, selected);
-        weights = ggml_reshape_2d(c, weights, N_USED, 1);
+        weights = ggml_reshape_2d(c, weights, N_USED, n);
         ggml_tensor * weights_sum = ggml_sum_rows(c, weights);
         weights_sum = ggml_clamp(c, weights_sum, 6.103515625e-5, INFINITY);
         weights = ggml_div(c, weights, weights_sum);
-        weights = ggml_reshape_3d(c, weights, 1, N_USED, 1);
+        weights = ggml_reshape_3d(c, weights, 1, N_USED, n);
         ggml_build_forward_expand(gf, weights);
         ggml_build_forward_expand(gf, x);
 
-        ggml_tensor * cur  = ggml_reshape_3d(c, x, N, 1, 1);
+        ggml_tensor * cur  = ggml_reshape_3d(c, x, N, 1, n);
         ggml_tensor * up   = ggml_mul_mat_id(c, m.w[W_UP_EXPS], cur, selected);
         ggml_tensor * gate = ggml_mul_mat_id(c, m.w[W_GATE_EXPS], cur, selected);
         cur = ggml_swiglu_split(c, gate, up);
@@ -151,7 +164,7 @@ static std::vector<float> run(const model & m, bool fused, const std::vector<flo
 
         ggml_tensor * cur_experts[N_USED];
         for (int i = 0; i < N_USED; ++i) {
-            cur_experts[i] = ggml_view_2d(c, experts, N, 1, experts->nb[2], i*experts->nb[1]);
+            cur_experts[i] = ggml_view_2d(c, experts, N, n, experts->nb[2], i*experts->nb[1]);
             ggml_build_forward_expand(gf, cur_experts[i]);
         }
         ggml_tensor * moe_out = cur_experts[0];
@@ -176,12 +189,12 @@ static std::vector<float> run(const model & m, bool fused, const std::vector<flo
     ggml_backend_t backends[2] = { be, m.cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, be == m.cpu ? 1 : 2, 256, false, true);
     check(sched && ggml_backend_sched_alloc_graph(sched, gf), "alloc");
-    ggml_backend_tensor_set(x,   x_data.data(),   0, N*sizeof(float));
-    ggml_backend_tensor_set(res, res_data.data(), 0, N*sizeof(float));
+    ggml_backend_tensor_set(x,   x_data.data(),   0, n*N*sizeof(float));
+    ggml_backend_tensor_set(res, res_data.data(), 0, n*N*sizeof(float));
     check(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS, "compute");
 
-    std::vector<float> result(N);
-    ggml_backend_tensor_get(out, result.data(), 0, N*sizeof(float));
+    std::vector<float> result(n*N);
+    ggml_backend_tensor_get(out, result.data(), 0, n*N*sizeof(float));
     ggml_backend_sched_free(sched);
     ggml_free(c);
     return result;
@@ -189,7 +202,7 @@ static std::vector<float> run(const model & m, bool fused, const std::vector<flo
 
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: q35moe-hip-ffn ABS_LIBDIR");
-    check(ggml_q35moe_ffn1_enabled(), "set GGML_Q35MOE_FFN1=1");
+    check(ggml_q35moe_ffn1_enabled() && ggml_q35moe_ffnm_enabled(), "set GGML_Q35MOE_FFN1=1 and GGML_Q35MOE_FFNM=1");
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
@@ -208,8 +221,11 @@ int main(int argc, char ** argv) {
 
     std::mt19937_64 rng(4096);
     std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int n_tok_max = ggml_q35moe_ffnm5_enabled() ? ggml_q35moe_ffnm5_max : ggml_q35moe_ffnm_max;
     long   n_diff    = 0;
+    long   n_dep     = 0;
     double worst_cpu = 0.0;
+    double worst_mmq = 0.0;
     for (size_t s = 0; s < sizeof(sets)/sizeof(sets[0]); ++s) {
         const types & t = sets[s];
         const auto data = make_data(t, rng);
@@ -220,51 +236,74 @@ int main(int argc, char ** argv) {
                 const std::vector<char> zero(data[zero_w[cs]].size(), 0);
                 ggml_backend_tensor_set(m.w[zero_w[cs]], zero.data(), 0, zero.size());
             }
-            for (int rep = 0; rep < 3; ++rep) {
-                std::vector<float> x(N), res(N);
-                // the last repetition of a case has a zero input
-                const float amp = rep == 2 ? 0.0f : 0.3f*std::exp(0.5f*nd(rng));
-                for (auto & v : x)   { v = amp*nd(rng); }
-                for (auto & v : res) { v = nd(rng); }
-
-                const auto ref = run(m, false, x, res);
-                const auto out = run(m, true,  x, res);
-                int    diff = 0, first = -1;
-                double dmax = 0.0, amax = 0.0;
-                for (int i = 0; i < N; ++i) {
-                    check(std::isfinite(ref[i]) && std::isfinite(out[i]), "finite");
-                    if (std::memcmp(&ref[i], &out[i], sizeof(float)) != 0) {
-                        first = first < 0 ? i : first;
-                        diff++;
+            for (int n_tok = 1; n_tok <= n_tok_max; ++n_tok) {
+                for (int rep = 0; rep < 3; ++rep) {
+                    std::vector<float> x(n_tok*N), res(n_tok*N);
+                    // the last repetition of a case has a zero input in its last token, the one before has the same input in its first two tokens
+                    for (int j = 0; j < n_tok; ++j) {
+                        const float amp = rep == 2 && j == n_tok - 1 ? 0.0f : 0.3f*std::exp(0.5f*nd(rng));
+                        for (int i = 0; i < N; ++i) {
+                            x[j*N + i]   = amp*nd(rng);
+                            res[j*N + i] = nd(rng);
+                        }
                     }
-                    dmax = std::max(dmax, (double) std::fabs(ref[i] - out[i]));
-                    amax = std::max(amax, (double) std::fabs(ref[i] - res[i]));
-                }
-                std::printf("types %s %s %s %s, %s, rep %d: %d/%d differ, max diff %.3e, max|ffn| %.4f",
-                    ggml_type_name(t.up), ggml_type_name(t.down), ggml_type_name(t.shexp_up), ggml_type_name(t.shexp_down),
-                    case_name[cs], rep, diff, N, dmax, amax);
-                if (first >= 0) {
-                    std::printf(", first at %d: %a stock, %a fused", first, ref[first], out[first]);
-                }
-                std::printf("\n");
-                n_diff += diff;
-
-                // CPU: the callback against the stock nodes, which quantize the input of a product
-                if (cs == 0 && rep == 0 && s < 2) {
-                    const model m_cpu  = make_model(cpu, cpu, t, data);
-                    const auto ref_cpu = run(m_cpu, false, x, res);
-                    const auto out_cpu = run(m_cpu, true,  x, res);
-                    double dmax_cpu = 0.0, amax_cpu = 0.0, dmax_dev = 0.0;
-                    for (int i = 0; i < N; ++i) {
-                        amax_cpu = std::max(amax_cpu, (double) std::fabs(ref_cpu[i] - res[i]));
-                        dmax_cpu = std::max(dmax_cpu, (double) std::fabs(ref_cpu[i] - out_cpu[i]));
-                        dmax_dev = std::max(dmax_dev, (double) std::fabs(ref_cpu[i] - ref[i]));
+                    if (rep == 1 && n_tok > 1) {
+                        std::copy(x.begin(), x.begin() + N, x.begin() + N);
                     }
-                    std::printf("cpu callback: max|ffn| %.4f, max diff to the stock nodes on cpu %.3e, stock cpu to stock device %.3e\n",
-                        amax_cpu, dmax_cpu, dmax_dev);
-                    worst_cpu = std::max(worst_cpu, dmax_cpu/amax_cpu);
-                    ggml_backend_buffer_free(m_cpu.w[0]->buffer);
-                    ggml_free(m_cpu.ctx);
+
+                    const auto ref = run(m, false, x, res);
+                    const auto out = run(m, true,  x, res);
+                    // a token of the many-token op against the one-token op
+                    int dep = 0;
+                    for (int j = 0; n_tok > 1 && j < n_tok; ++j) {
+                        const std::vector<float> x1(x.begin() + j*N, x.begin() + (j + 1)*N), res1(res.begin() + j*N, res.begin() + (j + 1)*N);
+                        const auto out1 = run(m, true, x1, res1);
+                        for (int i = 0; i < N; ++i) {
+                            dep += std::memcmp(&out1[i], &out[j*N + i], sizeof(float)) != 0;
+                        }
+                    }
+                    int    diff = 0, first = -1;
+                    double dmax = 0.0, amax = 0.0;
+                    for (int i = 0; i < n_tok*N; ++i) {
+                        check(std::isfinite(ref[i]) && std::isfinite(out[i]), "finite");
+                        if (std::memcmp(&ref[i], &out[i], sizeof(float)) != 0) {
+                            first = first < 0 ? i : first;
+                            diff++;
+                        }
+                        dmax = std::max(dmax, (double) std::fabs(ref[i] - out[i]));
+                        amax = std::max(amax, (double) std::fabs(ref[i] - res[i]));
+                    }
+                    std::printf("types %s %s %s %s, %s, %d tokens, rep %d: %d/%d differ, %d differ from the one-token op, max diff %.3e, max|ffn| %.4f",
+                        ggml_type_name(t.up), ggml_type_name(t.down), ggml_type_name(t.shexp_up), ggml_type_name(t.shexp_down),
+                        case_name[cs], n_tok, rep, diff, n_tok*N, dep, dmax, amax);
+                    if (first >= 0) {
+                        std::printf(", first at %d: %a stock, %a fused", first, ref[first], out[first]);
+                    }
+                    std::printf("\n");
+                    if (n_tok <= ggml_q35moe_ffnm_max) {
+                        n_diff += diff;
+                    } else if (amax > 0.0) {
+                        worst_mmq = std::max(worst_mmq, dmax/amax);
+                    }
+                    n_dep += dep;
+
+                    // CPU: the callback against the stock nodes, which quantize the input of a product
+                    if (cs == 0 && rep == 0 && s < 2 && (n_tok == 1 || n_tok == 3)) {
+                        const model m_cpu  = make_model(cpu, cpu, t, data);
+                        const auto ref_cpu = run(m_cpu, false, x, res);
+                        const auto out_cpu = run(m_cpu, true,  x, res);
+                        double dmax_cpu = 0.0, amax_cpu = 0.0, dmax_dev = 0.0;
+                        for (int i = 0; i < n_tok*N; ++i) {
+                            amax_cpu = std::max(amax_cpu, (double) std::fabs(ref_cpu[i] - res[i]));
+                            dmax_cpu = std::max(dmax_cpu, (double) std::fabs(ref_cpu[i] - out_cpu[i]));
+                            dmax_dev = std::max(dmax_dev, (double) std::fabs(ref_cpu[i] - ref[i]));
+                        }
+                        std::printf("cpu callback: max|ffn| %.4f, max diff to the stock nodes on cpu %.3e, stock cpu to stock device %.3e\n",
+                            amax_cpu, dmax_cpu, dmax_dev);
+                        worst_cpu = std::max(worst_cpu, dmax_cpu/amax_cpu);
+                        ggml_backend_buffer_free(m_cpu.w[0]->buffer);
+                        ggml_free(m_cpu.ctx);
+                    }
                 }
             }
             if (zero_w[cs] >= 0) {
@@ -275,8 +314,14 @@ int main(int argc, char ** argv) {
         ggml_free(m.ctx);
     }
     check(n_diff == 0, "the fused op is not bit-exact");
+    check(n_dep == 0, "a token of the many-token op depends on the other tokens");
+    check(worst_mmq < 1e-2, "5 tokens: error against the stock nodes above 1e-2");
     check(worst_cpu < 5e-2, "cpu reference error above 5e-2");
-    std::printf("PASS bit-exact, worst cpu reference error %.2e\n", worst_cpu);
+    std::printf("PASS bit-exact for 1 to %d tokens, worst cpu reference error %.2e", ggml_q35moe_ffnm_max, worst_cpu);
+    if (n_tok_max > ggml_q35moe_ffnm_max) {
+        std::printf(", %d tokens: bits of the one-token op, worst error against the stock nodes %.2e", n_tok_max, worst_mmq);
+    }
+    std::printf("\n");
     ggml_backend_free(hip);
     ggml_backend_free(cpu);
     return 0;

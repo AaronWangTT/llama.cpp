@@ -1099,17 +1099,26 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     return cur;
 }
 
-// build_layer_ffn() plus the residual as the fused op of ggml-q35moe-ffn.h, nullptr if the op does not take this layer
+// build_layer_ffn() plus the residual as a fused op of ggml-q35moe-ffn.h, nullptr if no op takes this layer
+// GGML_Q35MOE_FFN1 is the op for a graph of one token, GGML_Q35MOE_FFNM the op for a graph of 2 to ggml_q35moe_ffnm_max tokens (GGML_Q35MOE_FFNM5: one more)
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cur, ggml_tensor * residual, const int il) {
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
-    if (!ggml_q35moe_ffn1_enabled()) {
+    if (ggml_q35moe_exponce_enabled() && !ggml_q35moe_ffnm_enabled()) {
+        q35moe_log_off("GGML_Q35MOE_EXPONCE", "it acts inside the op of GGML_Q35MOE_FFNM, which is not set");
+    }
+    if (ggml_q35moe_ffnm5_enabled() && !ggml_q35moe_ffnm_enabled()) {
+        q35moe_log_off("GGML_Q35MOE_FFNM5", "it extends the op of GGML_Q35MOE_FFNM, which is not set");
+    }
+    if (!ggml_q35moe_ffn1_enabled() && !ggml_q35moe_ffnm_enabled()) {
         return nullptr;
     }
 
     constexpr int n_w = GGML_Q35MOE_FFN1_N_SRC - GGML_Q35MOE_FFN1_GATE_INP;
 
+    using try_op_t = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor **);
+
     // why block i does not take the op for the input x and the residual r, nullptr if it takes it; w gets the weights of the block
-    const auto refusal = [&](const int i, ggml_tensor * x, ggml_tensor * r, ggml_tensor ** w) -> const char * {
+    const auto refusal = [&](const int i, ggml_tensor * x, ggml_tensor * r, ggml_tensor ** w, const try_op_t try_op) -> const char * {
         const auto & layer = model.layers[i];
 
         if (moe_cache != nullptr) {
@@ -1147,7 +1156,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cu
         }
 
         ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
-        auto * candidate = ggml_q35moe_try_ffn1(probe.get(), x, r, w);
+        auto * candidate = try_op(probe.get(), x, r, w);
         if (candidate == nullptr) {
             return "weight types or sizes without a kernel";
         }
@@ -1157,47 +1166,67 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cu
         return nullptr;
     };
 
-    // once per process: the number of blocks that take the op for one token, and the first reason against it
-    static std::once_flag reported;
-    if (!model.no_alloc()) {
-        std::call_once(reported, [&] {
-            int          n_take    = 0;
-            int          first     = -1;
-            const char * first_why = nullptr;
-            for (int i = 0; i < n_layer; ++i) {
-                ggml_context_ptr inputs{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
-                ggml_tensor * x = ggml_new_tensor_1d(inputs.get(), GGML_TYPE_F32, ggml_q35moe_n_embd);
-                ggml_tensor * r = ggml_new_tensor_1d(inputs.get(), GGML_TYPE_F32, ggml_q35moe_n_embd);
-                ggml_tensor * w[n_w];
-                const char *  why = refusal(i, x, r, w);
-                if (why == nullptr) {
-                    n_take++;
-                } else if (first_why == nullptr) {
-                    first     = i;
-                    first_why = why;
-                }
+    // the number of blocks that take the op for n_cols tokens, and the first reason against it
+    const auto report = [&](const char * name, const char * graph, const int64_t n_cols, const try_op_t try_op) {
+        int          n_take    = 0;
+        int          first     = -1;
+        const char * first_why = nullptr;
+        for (int i = 0; i < n_layer; ++i) {
+            ggml_context_ptr inputs{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
+            ggml_tensor * x = ggml_new_tensor_2d(inputs.get(), GGML_TYPE_F32, ggml_q35moe_n_embd, n_cols);
+            ggml_tensor * r = ggml_new_tensor_2d(inputs.get(), GGML_TYPE_F32, ggml_q35moe_n_embd, n_cols);
+            ggml_tensor * w[n_w];
+            const char *  why = refusal(i, x, r, w, try_op);
+            if (why == nullptr) {
+                n_take++;
+            } else if (first_why == nullptr) {
+                first     = i;
+                first_why = why;
             }
-            if (first_why == nullptr) {
-                LLAMA_LOG_INFO("qwen35moe: GGML_Q35MOE_FFN1: %d of %d blocks take the op in a graph of one token\n", n_take, (int) n_layer);
-            } else {
-                LLAMA_LOG_WARN("qwen35moe: GGML_Q35MOE_FFN1: %d of %d blocks take the op in a graph of one token, block %d does not: %s\n",
-                        n_take, (int) n_layer, first, first_why);
-            }
-        });
-    }
+        }
+        if (first_why == nullptr) {
+            LLAMA_LOG_INFO("qwen35moe: %s: %d of %d blocks take the op in a graph of %s\n", name, n_take, (int) n_layer, graph);
+        } else {
+            LLAMA_LOG_WARN("qwen35moe: %s: %d of %d blocks take the op in a graph of %s, block %d does not: %s\n",
+                    name, n_take, (int) n_layer, graph, first, first_why);
+        }
+    };
 
-    // The op is for graphs of one token only: the last block of a many-token graph with one output row has a one-token input too.
-    // The op there would change the topology between batches (one slot generates, another reads a prompt), and the scheduler then plans the memory again.
-    if (ubatch.n_tokens != 1) {
+    // once per process and switch
+    if (!model.no_alloc()) {
+        if (ggml_q35moe_ffn1_enabled()) {
+            static std::once_flag reported;
+            std::call_once(reported, [&] { report("GGML_Q35MOE_FFN1", "one token", 1, ggml_q35moe_try_ffn1); });
+        }
+        if (ggml_q35moe_ffnm_enabled()) {
+            static std::once_flag reported;
+            std::call_once(reported, [&] {
+                const char * graph = ggml_q35moe_ffnm5_enabled() ? "2 to 5 tokens (5 tokens: not the stock result)" : "2 to 4 tokens";
+                report(ggml_q35moe_exponce_enabled() ? "GGML_Q35MOE_FFNM with GGML_Q35MOE_EXPONCE" : "GGML_Q35MOE_FFNM", graph, 2, ggml_q35moe_try_ffnm);
+            });
+        }
+    }
+    static_assert(ggml_q35moe_ffnm_max == 4 && ggml_q35moe_ffnm5_max == 5, "the log line names the largest graph");
+
+    // An op is for graphs of its token count only: the last block of a larger graph with few output rows has a small input too.
+    // An op there would change the topology between batches (one slot generates, another reads a prompt), and the scheduler then plans the memory again.
+    try_op_t try_op = nullptr;
+    if (ubatch.n_tokens == 1) {
+        try_op = ggml_q35moe_ffn1_enabled() ? ggml_q35moe_try_ffn1 : nullptr;
+    } else if (ubatch.n_tokens <= (uint32_t) ggml_q35moe_ffnm5_max && cur->ne[1] == (int64_t) ubatch.n_tokens) {
+        // the op itself refuses the largest count without GGML_Q35MOE_FFNM5
+        try_op = ggml_q35moe_ffnm_enabled() ? ggml_q35moe_try_ffnm : nullptr;
+    }
+    if (try_op == nullptr) {
         return nullptr;
     }
 
     ggml_tensor * w[n_w];
-    if (refusal(il, cur, residual, w) != nullptr) {
+    if (refusal(il, cur, residual, w, try_op) != nullptr) {
         return nullptr;
     }
 
-    return ggml_q35moe_try_ffn1(ctx0, cur, residual, w);
+    return try_op(ctx0, cur, residual, w);
 #else
     GGML_UNUSED(cur);
     GGML_UNUSED(residual);
