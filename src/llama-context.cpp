@@ -1672,21 +1672,40 @@ bool llama_context::set_logits_rows(const llama_token * rows, int32_t n_rows) {
 
     const int32_t n_vocab = model.vocab.n_tokens();
 
-    // only the MTP graphs take the list; a short list could not feed the samplers
-    bool ok = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_rows >= 256 && n_rows <= n_vocab;
-    if (ok) {
+    // only the MTP graph of qwen35moe takes the list, and it was verified for a Q8_0 head on a ROCm device only (this fork builds ROCm for gfx1103):
+    // other head types have kernels that read two matrix rows per block, and a head on the CPU reserves n_vocab x n_rows work values
+    ggml_backend_dev_t dev = model.dev_output();
+
+    const ggml_tensor * head = nullptr;
+    if (model.arch == LLM_ARCH_QWEN35MOE && model.layers.size() > (size_t) model.hparams.n_layer()) {
+        const auto & nextn = model.layers[model.hparams.n_layer()].nextn;
+        head = nextn.shared_head_head ? nextn.shared_head_head : model.output;
+    }
+
+    const char * why =
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP                           ? "the context is not an MTP context" :
+        model.arch != LLM_ARCH_QWEN35MOE                                     ? "only the MTP head of qwen35moe takes a row list" :
+        model.devices.size() != 1 || model.devices.front().is_meta           ? "the model is not on one plain device" :
+        model.has_tensor_overrides()                                         ? "tensor overrides are set (-ot, --cpu-moe)" :
+        dev == nullptr || dev != model.devices.front().dev                   ? "the output head is not on the device" :
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") != 0 ? "the device is not a ROCm device" :
+        backend_from_dev(dev) == nullptr                                     ? "the context has no backend for the device" :
+        head == nullptr || head->type != GGML_TYPE_Q8_0                      ? "the output head is not a Q8_0 tensor" :
+        n_rows < 256 || n_rows > n_vocab                                     ? "the list must have 256 to n_vocab rows" : nullptr;
+
+    if (why == nullptr) {
         std::vector<bool> seen(n_vocab, false);
-        for (int32_t i = 0; i < n_rows && ok; ++i) {
-            ok = rows[i] >= 0 && rows[i] < n_vocab && !seen[rows[i]];
-            if (ok) {
+        for (int32_t i = 0; i < n_rows && why == nullptr; ++i) {
+            if (rows[i] < 0 || rows[i] >= n_vocab || seen[rows[i]]) {
+                why = "a token id of the list is out of range or repeated";
+            } else {
                 seen[rows[i]] = true;
             }
         }
     }
 
-    ggml_backend_dev_t dev = ok ? model.dev_output() : nullptr;
-    if (dev == nullptr || backend_from_dev(dev) == nullptr) {
-        LLAMA_LOG_WARN("%s: the row list cannot be used (%d rows), the logits keep the whole vocabulary\n", __func__, n_rows);
+    if (why != nullptr) {
+        LLAMA_LOG_WARN("%s: the row list (%d rows) is not used, the logits keep the whole vocabulary: %s\n", __func__, n_rows, why);
         reset();
         return false;
     }

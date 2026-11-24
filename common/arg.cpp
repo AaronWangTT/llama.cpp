@@ -4328,15 +4328,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-shortlist"}, "FNAME",
         "draft-mtp: file with token ids, most frequent first, one per line; with --spec-draft-shortlist-n the draft head "
-        "computes logits only for the tokens of the sequences plus the first tokens of this file (default: unused)",
+        "computes logits only for the control tokens, the tokens of the sequences (the most recent ones when they do not all fit) "
+        "and the first tokens of this file (default: unused)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.shortlist = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SHORTLIST"));
     add_opt(common_arg(
         {"--spec-draft-shortlist-n"}, "N",
-        string_format("draft-mtp: number of vocabulary rows the draft head computes logits for, needs --spec-draft-shortlist "
-                      "and backend sampling of the draft (default: %d, 0 = all rows)", params.speculative.draft.shortlist_n),
+        string_format("draft-mtp: number of vocabulary rows the draft head computes logits for, 1024 or more (a smaller value is "
+                      "raised to 1024); needs --spec-draft-shortlist and backend sampling of the draft; only for the Q8_0 output head "
+                      "of qwen35moe on a ROCm device, in any other case and in graphs that cannot use the list the whole head is "
+                      "computed and a warning says why (default: %d, 0 = all rows)", params.speculative.draft.shortlist_n),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

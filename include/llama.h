@@ -1190,7 +1190,8 @@ extern "C" {
 
     // Compute the logits of this context only for the vocabulary rows `rows` (distinct token ids, n_rows of them); n_rows = 0 restores the whole vocabulary.
     // Only for outputs that are sampled on the backend (llama_set_sampler()): the samplers get the token ids as candidates, the raw logits are not available.
-    // Returns false if the context does not support it (only MTP draft contexts do) or the list is not valid; the whole vocabulary is used then.
+    // Returns false and logs the reason if the context does not support it or the list is not valid; the whole vocabulary is used then.
+    // Supported: the MTP draft context of qwen35moe with a Q8_0 output head on a single ROCm device.
     LLAMA_API bool llama_set_logits_rows(struct llama_context * ctx, const llama_token * rows, int32_t n_rows);
 
     // Attention of this context reads only the cells of the last n_window positions up to each token; 0 restores the whole sequence.

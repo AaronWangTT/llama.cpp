@@ -1488,9 +1488,19 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     for (uint32_t i = 0; i < ubatch.n_tokens && all_sampled; ++i) {
         all_sampled = !ubatch.output[i] || (ubatch.n_seq_id[i] == 1 && samplers.count(ubatch.seq_id[i][0]) > 0);
     }
+    // a graph with outputs that keeps the whole head although a list is set goes to the log, once per reason
+    const char * rows_off = logits_rows == nullptr || n_out < 1 ? nullptr :
+        !loras->empty()                                         ? "a LoRA adapter is in use" :
+        !head_plain                                             ? "the output head has a scale, a rotation or a precision policy" :
+        ggml_n_dims(head_w) != 2 || !ggml_is_contiguous(head_w) ? "the output head is not a plain matrix" :
+        !all_sampled                                            ? "an output of the graph has no backend sampler" :
+        n_out > 8                                               ? "a graph has more than 8 outputs" :
+        n_out*logits_rows->ne[0] > head_w->ne[1]                ? "outputs x rows of a graph is above the vocabulary size" : nullptr;
+    if (rows_off != nullptr) {
+        q35moe_log_off("the logits row list (--spec-draft-shortlist)", rows_off);
+    }
     // one product per output: the kernels for several vectors at a time read two matrix rows per block, here a matrix is one row
-    if (logits_rows != nullptr && head_plain && all_sampled && n_out >= 1 && n_out <= 8 && n_out*logits_rows->ne[0] <= head_w->ne[1] &&
-            ggml_n_dims(head_w) == 2 && ggml_is_contiguous(head_w)) {
+    if (logits_rows != nullptr && n_out >= 1 && rows_off == nullptr) {
         const int64_t n_rows = logits_rows->ne[0];
 
         ggml_tensor * head_rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
