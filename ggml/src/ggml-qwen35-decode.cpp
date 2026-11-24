@@ -479,3 +479,8 @@ bool ggml_q35moe_is_mvf(const ggml_tensor * op) {
     const int64_t n_rows = mvf_layout(op->src[0], op->src + 1, n_w);
     return n_rows > 0 && n_rows == op->ne[0];
 }
+
+bool ggml_q35moe_rs1_enabled() {
+    static const bool enabled = env_on("GGML_Q35MOE_RS1");
+    return enabled;
+}

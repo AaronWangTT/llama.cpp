@@ -48,6 +48,10 @@ GGML_API bool ggml_q35moe_post1_enabled();
 GGML_API bool ggml_q35moe_ba1_enabled();
 GGML_API ggml_tensor * ggml_q35moe_try_mvf(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x);
 GGML_API bool ggml_q35moe_is_mvf(const ggml_tensor * op);
+
+// GGML_Q35MOE_RS1=1: the five one-token ops of qwen35moe also in a context that keeps rollback snapshots (n_rs_seq > 0).
+// The ops read the row that the memory names (a rollback slot or slot 0) and write slot 0, as the stock graph of one token does.
+GGML_API bool ggml_q35moe_rs1_enabled();
 }
 
 constexpr int ggml_qwen35_mvshare_max = 8;

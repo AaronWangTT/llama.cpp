@@ -583,8 +583,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
         return nullptr;
     }
     // a reason that holds for the whole context goes to the log once; the shape of the batch does not
+    // GGML_Q35MOE_RS1=1: also with rollback snapshots, one token reads the row that the memory names and writes slot 0
     const char * why = nullptr;
-    const auto dev = q35moe_rocm_dev(cparams, model, loras, il, true, &why);
+    const auto dev = q35moe_rocm_dev(cparams, model, loras, il, !ggml_q35moe_rs1_enabled(), &why);
 
     const int64_t d_inner       = hparams.ssm_d_inner;
     const int64_t head_k_dim    = hparams.ssm_d_state;
