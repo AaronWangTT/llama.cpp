@@ -63,6 +63,14 @@ bool ggml_q35moe_convpf_enabled() {
     return enabled;
 }
 
+bool ggml_q35moe_convpfrs_enabled() {
+    static const bool enabled = [] {
+        const char * p = std::getenv("GGML_Q35MOE_CONVPFRS");
+        return p && std::strcmp(p, "1") == 0;
+    }();
+    return enabled;
+}
+
 ggml_tensor * ggml_qwen35_try_convpf(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * past, ggml_tensor * weight) {
     // each graph checks its own switch before it asks for the op
     if ((!ggml_qwen35_convpf_enabled() && !ggml_q35moe_convpf_enabled()) || !layout(cur, past, weight)) {

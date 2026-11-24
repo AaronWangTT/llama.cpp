@@ -7,8 +7,10 @@
 // With GGML_Q35MOE_PREPN=1 GGML_Q35MOE_GDNN=1 GGML_Q35MOE_POSTN=1 in addition to the five GGML_Q35MOE_* switches: state caches with
 // rollback slots. One token (the one-token ops, as with GGML_Q35MOE_RS1) and 2 to 5 tokens (the ops for a few tokens) against the
 // stock graph that writes the snapshots, also when the state row is one of the rows that the batch writes.
+// With GGML_Q35MOE_CONVPF=1: the store of the conv state for many tokens, one copy per slot against the stock SET_ROWS store.
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-qwen35-convpf.h"
 #include "ggml-qwen35-decode.h"
 
 #include <algorithm>
@@ -639,6 +641,66 @@ static long run_shape_keep(const shape & sh, ggml_backend_t hip, ggml_backend_t 
     return n_diff;
 }
 
+// The conv state store of a prompt batch in a cache with rollback slots: build_conv_state_store() on the concat tensor against
+// one copy per slot from qkv_mixed (the CONVPF path of qwen35moe), returns the number of values that differ
+static long run_store_keep(ggml_backend_t be) {
+    constexpr int N_T = 40;
+    const size_t  fs  = sizeof(float);
+    const int64_t K   = N_SLOTS;
+    const states_keep st = make_states_keep(be);
+    std::mt19937 rng(2048);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    std::vector<float> qkv_data((size_t) C*N_T), r_data((size_t) D_R*N_ROWS);
+    for (auto & val : qkv_data) { val = nd(rng); }
+    for (auto & val : r_data)   { val = nd(rng); }
+
+    long n_diff = 0;
+    for (int cell = 0; cell < N_CELLS; ++cell) {
+        std::vector<float> res[2];
+        for (int fused = 0; fused < 2; ++fused) {
+            ggml_context * c  = ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            ggml_cgraph *  gf = ggml_new_graph(c);
+            ggml_tensor * qkv  = ggml_new_tensor_3d(c, GGML_TYPE_F32, C, N_T, 1); ggml_set_input(qkv);
+            ggml_tensor * past = ggml_new_tensor_3d(c, GGML_TYPE_F32, N_CONV - 1, C, 1); ggml_set_input(past);
+            if (fused) {
+                for (int64_t slot = 0; slot < K; ++slot) {
+                    ggml_tensor * last = ggml_view_3d(c, qkv, C, N_CONV - 1, 1, qkv->nb[1], qkv->nb[2], (N_T - slot - (N_CONV - 1))*qkv->nb[1]);
+                    ggml_tensor * row  = ggml_view_2d(c, st.r, D_R, 1, st.r->nb[1], (slot*N_CELLS + cell)*st.r->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(c, ggml_transpose(c, last), row));
+                }
+            } else {
+                ggml_tensor * conv_x = ggml_concat(c, past, ggml_transpose(c, qkv), 0);
+                ggml_tensor * order  = ggml_cast(c, ggml_scale_bias(c, ggml_arange(c, 0.0f, (float) K, 1.0f), -1.0f, (float) (K - 1)), GGML_TYPE_I32);
+                ggml_tensor * windows = ggml_view_4d(c, conv_x, N_CONV - 1, K, C, 1, fs, conv_x->nb[1], conv_x->nb[2], (N_T - (K - 1))*fs);
+                ggml_tensor * slots   = ggml_view_4d(c, st.r, N_CONV - 1, K, C, 1, N_CELLS*st.r->nb[1], (N_CONV - 1)*fs, st.r->nb[1], cell*st.r->nb[1]);
+                ggml_build_forward_expand(gf, ggml_set_rows(c, slots, windows, order));
+            }
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+            check(ggml_gallocr_alloc_graph(ga, gf), "alloc");
+            ggml_backend_tensor_set(qkv,  qkv_data.data(), 0, qkv_data.size()*fs);
+            ggml_backend_tensor_set(st.r, r_data.data(),   0, r_data.size()*fs);
+            if (!fused) {
+                ggml_backend_tensor_set(past, r_data.data(), 0, D_R*fs);
+            }
+            check(ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS, "compute");
+            res[fused].resize(r_data.size());
+            ggml_backend_tensor_get(st.r, res[fused].data(), 0, r_data.size()*fs);
+            ggml_gallocr_free(ga);
+            ggml_free(c);
+        }
+        long diff = 0, changed = 0;
+        for (size_t i = 0; i < r_data.size(); ++i) {
+            diff    += std::memcmp(&res[0][i], &res[1][i], sizeof(float)) != 0;
+            changed += std::memcmp(&res[0][i], &r_data[i], sizeof(float)) != 0;
+        }
+        std::printf("conv state store, %d tokens, cell %d: %ld/%zu differ, the stock store changed %ld values\n", N_T, cell, diff, r_data.size(), changed);
+        check(changed > (long) D_R*(N_SLOTS - 1), "the stock store must write all slots");
+        n_diff += diff;
+    }
+    return n_diff;
+}
+
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: qwen35-hip-decode ABS_LIBDIR");
     const bool run_qwen35 = ggml_qwen35_mvshare_enabled() && ggml_qwen35_prep1_enabled() && ggml_qwen35_gdn1_enabled() && ggml_qwen35_post1_enabled();
@@ -646,6 +708,7 @@ int main(int argc, char ** argv) {
         ggml_q35moe_post1_enabled();
     check(run_qwen35 || run_moe, "set GGML_QWEN35_MVSHARE=1 GGML_QWEN35_PREP1=1 GGML_QWEN35_GDN1=1 GGML_QWEN35_POST1=1 or the five GGML_Q35MOE_* switches");
     const bool run_keep  = run_moe && ggml_q35moe_prepn_enabled() && ggml_q35moe_gdnn_enabled() && ggml_q35moe_postn_enabled();
+    const bool run_store = ggml_q35moe_convpf_enabled();
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
@@ -663,10 +726,13 @@ int main(int argc, char ** argv) {
     if (run_keep) {
         n_diff += run_shape_keep(SHAPE_MOE, hip, cpu, worst_cpu);
     }
+    if (run_store) {
+        n_diff += run_store_keep(hip);
+    }
     check(n_diff == 0, "a fused op is not bit-exact");
     check(worst_cpu < 1e-3, "cpu reference error above 1e-3");
-    std::printf("PASS bit-exact%s%s%s, worst cpu reference error %.2e\n", run_qwen35 ? " qwen35" : "", run_moe ? " qwen35moe" : "",
-            run_keep ? " qwen35moe-snapshots" : "", worst_cpu);
+    std::printf("PASS bit-exact%s%s%s%s, worst cpu reference error %.2e\n", run_qwen35 ? " qwen35" : "", run_moe ? " qwen35moe" : "",
+            run_keep ? " qwen35moe-snapshots" : "", run_store ? " conv-store" : "", worst_cpu);
     ggml_backend_free(hip);
     ggml_backend_free(cpu);
     return 0;

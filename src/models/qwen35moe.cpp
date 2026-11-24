@@ -6,6 +6,7 @@
 #include "ggml-qwen35-convpf.h"
 #include "ggml-qwen35-decode.h"
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -463,14 +464,17 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     // GGML_Q35MOE_CONVPF=1, many tokens of one sequence: one op reads the conv state and qkv_mixed, there is no concat tensor
     if (ggml_q35moe_convpf_enabled()) {
         // a reason that holds for the whole context goes to the log once; the shape of the batch does not
+        // GGML_Q35MOE_CONVPFRS=1: also with rollback snapshots, the store below then writes the windows of all slots
         const char * why = nullptr;
-        const auto dev_pf = q35moe_rocm_dev(cparams, model, loras, il, true, &why);
+        const auto dev_pf = q35moe_rocm_dev(cparams, model, loras, il, !ggml_q35moe_convpfrs_enabled(), &why);
         if (dev_pf && (conv_kernel_size != ggml_qwen35_convpf_n_conv || qkv_mixed->ne[0] != conv_channels)) {
             why = "the conv kernel size or the channel count";
         }
+        // slots that build_conv_state_store() writes; all their windows must lie in qkv_mixed
+        const int64_t n_slots = std::min<int64_t>(n_seq_tokens, (int64_t) cparams.n_rs_seq + 1);
         if (why) {
             q35moe_log_off("GGML_Q35MOE_CONVPF", why);
-        } else if (n_seqs == 1 && n_seq_tokens >= ggml_qwen35_convpf_min_n_tokens) {
+        } else if (n_seqs == 1 && n_seq_tokens >= ggml_qwen35_convpf_min_n_tokens && n_seq_tokens >= n_slots + conv_kernel_size - 1) {
             ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
             ggml_tensor * past = ggml_new_tensor_2d(probe.get(), GGML_TYPE_F32, conv_kernel_size - 1, conv_channels);
             auto * candidate = ggml_qwen35_try_convpf(probe.get(), qkv_mixed, past, conv_kernel);
@@ -486,11 +490,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
                 ggml_build_forward_expand(gf, conv_output_silu);
 
                 // new state: the last tokens of qkv_mixed, the same values as the tail of the concat tensor
-                ggml_tensor * last = ggml_view_3d(ctx0, qkv_mixed, conv_channels, conv_kernel_size - 1, n_seqs,
-                        qkv_mixed->nb[1], qkv_mixed->nb[2], (n_seq_tokens - (conv_kernel_size - 1))*qkv_mixed->nb[1]);
-                ggml_tensor * cell = ggml_view_2d(ctx0, conv_states_all, (conv_kernel_size - 1)*conv_channels, n_seqs,
-                        conv_states_all->nb[1], mctx_cur->get_head()*conv_states_all->nb[1]);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_transpose(ctx0, last), cell));
+                // slot s is the state of s tokens before the end, its row is s*size + head as in build_conv_state_store()
+                for (int64_t slot = 0; slot < n_slots; ++slot) {
+                    ggml_tensor * last = ggml_view_3d(ctx0, qkv_mixed, conv_channels, conv_kernel_size - 1, n_seqs,
+                            qkv_mixed->nb[1], qkv_mixed->nb[2], (n_seq_tokens - slot - (conv_kernel_size - 1))*qkv_mixed->nb[1]);
+                    ggml_tensor * cell = ggml_view_2d(ctx0, conv_states_all, (conv_kernel_size - 1)*conv_channels, n_seqs,
+                            conv_states_all->nb[1], (slot*mctx_cur->get_size() + mctx_cur->get_head())*conv_states_all->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_transpose(ctx0, last), cell));
+                }
             }
         }
     }
