@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 #include "qwen35-fagqa.cuh"
 #include "q35moe-fagqa.cuh"
+#include "q35moe-fagqa4.cuh"
 
 #if !defined(GGML_USE_MUSA)
 
@@ -864,6 +865,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
     if (ggml_cuda_flash_attn_ext_q35moe_fagqa(ctx, dst, kernel == BEST_FATTN_KERNEL_MMA_F16)) {
+        GGML_ASSERT(ctx.inkling_pf_mask == nullptr);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_q35moe_fagqa4(ctx, dst, kernel == BEST_FATTN_KERNEL_MMA_F16)) {
         GGML_ASSERT(ctx.inkling_pf_mask == nullptr);
         return;
     }

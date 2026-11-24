@@ -13218,6 +13218,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 131072, 102400, 1, 4, type_KV, false, true));
     }
 
+    // qwen35moe attention for 2 to 4 query tokens per slice (the batches that verify drafts): head size 256, GQA 8, F16 and Q8_0 K/V
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {2, 3, 4}) {
+            for (int64_t n_slices : {1, 2, 3, 4, 5, 6}) {
+                for (int64_t kv : {256, 512, 1024}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4*kv, kv, nb, n_slices, type_KV));
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 16384, 4096, nb, n_slices, type_KV, false, true));
+            }
+            // other numbers of K/V heads and of slices, a list of 102400 rows
+            for (int64_t nh : {1, 4}) {
+                for (int64_t n_slices : {1, 2, 3, 5}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, nh, 8, 4096, 1024, nb, n_slices, type_KV));
+                    test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, nh, 8, 16384, 4096, nb, n_slices, type_KV, false, true));
+                }
+            }
+            for (int64_t n_slices : {8, 12}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 16384, 4096, nb, n_slices, type_KV, false, true));
+            }
+            for (int64_t n_slices : {1, 2}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 131072, 102400, nb, n_slices, type_KV));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(512, 32, 4, 32, 2));
 
