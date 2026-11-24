@@ -1,5 +1,9 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
+
+#include <atomic>
+#include <cstdlib>
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 #include "ggml-q35moe-ffn.h"
@@ -1235,6 +1239,38 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cu
 #endif
 }
 
+// GGML_Q35MOE_MTPSTORE=1: a graph of the MTP head without outputs only stores K and V
+// such a graph is the catch-up after a target decode: nothing reads what the block computes for these tokens,
+// later graphs only need their K and V, and those do not depend on the attention or on the feed-forward
+static bool q35moe_mtpstore(const llama_cparams & cparams, const int64_t n_outputs) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_Q35MOE_MTPSTORE");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    if (!enabled || n_outputs != 0) {
+        return false;
+    }
+
+    const char * why =
+        cparams.training                                             ? "the graph is for training" :
+        cparams.cb_eval != nullptr                                   ? "an eval callback is set" :
+        cparams.embeddings                                           ? "the context outputs embeddings" :
+        cparams.embeddings_nextn && !cparams.embeddings_nextn_masked ? "the hidden rows of all tokens are read" : nullptr;
+
+    // one line when it is used, one per reason when it is not (string literals)
+    static std::atomic<const char *> logged { nullptr };
+    const char * state = why != nullptr ? why : "used";
+    if (logged.exchange(state) != state) {
+        if (why != nullptr) {
+            LLAMA_LOG_WARN("qwen35moe: no effect of GGML_Q35MOE_MTPSTORE: %s\n", why);
+        } else {
+            LLAMA_LOG_INFO("qwen35moe: GGML_Q35MOE_MTPSTORE is used, MTP graphs without outputs only store K and V\n");
+        }
+    }
+
+    return why == nullptr;
+}
+
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE
 llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     : llm_graph_context(params) {
@@ -1280,8 +1316,10 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
 
     res->add_input(std::move(inp));
 
+    const bool store_only = q35moe_mtpstore(cparams, n_outputs);
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = store_only ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -1334,6 +1372,32 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
 
     Qcur = build_rope(Qcur, inp_pos, il);
     Kcur = build_rope(Kcur, inp_pos, il);
+
+    if (store_only) {
+        // the K and V nodes of build_attn() in its order, without the query and the attention
+        const auto * mctx_cur = inp_attn->mctx;
+
+        if (inp_attn->self_k_rot[il]) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
+        }
+        if (inp_attn->self_v_rot[il]) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
+        }
+        if (ggml_tensor * scale = mctx_cur->get_k_scale(il)) {
+            Kcur = ggml_div(ctx0, Kcur, scale);
+        }
+        if (ggml_tensor * scale = mctx_cur->get_v_scale(il)) {
+            Vcur = ggml_div(ctx0, Vcur, scale);
+        }
+
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+
+        return;
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
