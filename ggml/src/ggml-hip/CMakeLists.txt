@@ -102,6 +102,7 @@ if (NOT CXX_IS_HIPCC AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1103")
     target_sources(ggml-base PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-inkling-ctrl1.cpp")
     target_sources(ggml-base PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-qwen35-decode.cpp")
     target_sources(ggml-base PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-qwen35-convpf.cpp")
+    target_sources(ggml-base PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-q35moe-ffn.cpp")
     set_property(TARGET ggml-hip PROPERTY INKLING_DEPTHMIX_GFX1103 ON)
 endif()
 

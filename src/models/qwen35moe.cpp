@@ -2,13 +2,14 @@
 #include "llama-memory-recurrent.h"
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
+#include "ggml-q35moe-ffn.h"
 #include "ggml-qwen35-decode.h"
 
 #include <cstring>
 
-// the fused one-token ops exist on a single ROCm device only; returns that device or nullptr
+// the fused ops exist on a single ROCm device only; returns that device or nullptr
 // not with tensor overrides: an op next to a weight in host memory can go to the CPU backend, the new state is then lost
-static ggml_backend_dev_t q35moe_rec_rocm_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
+static ggml_backend_dev_t q35moe_rocm_dev(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras) {
     if (cparams.cb_eval || cparams.optimizer_graph || !loras->empty() || model.devices.size() != 1 || model.devices.front().is_meta ||
             model.has_tensor_overrides() ||
             (model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER)) {
@@ -225,12 +226,15 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // MOE FFN layer
-        cur = build_layer_ffn(attn_post_norm, il);
-        cb(cur, "ffn_out", il);
+        // MOE FFN layer; one token on a ROCm device can take the feed-forward and its residual as one op
+        cur = build_layer_ffn_one(attn_post_norm, ffn_residual, il);
+        if (cur == nullptr) {
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "ffn_out", il);
 
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
+            // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+            cur = ggml_add(ctx0, cur, ffn_residual);
+        }
         cb(cur, "post_moe", il);
 
         cur = build_cvec(cur, il);
@@ -506,7 +510,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
         return nullptr;
     }
     // a layer that is not on that device keeps the stock ops
-    const auto dev = q35moe_rec_rocm_dev(cparams, model, loras);
+    const auto dev = q35moe_rocm_dev(cparams, model, loras);
     if (!dev || model.dev_layer(il) != dev) {
         return nullptr;
     }
@@ -785,6 +789,57 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     }
 
     return cur;
+}
+
+// build_layer_ffn() plus the residual as the fused op of ggml-q35moe-ffn.h, nullptr if the op does not take this layer
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cur, ggml_tensor * residual, const int il) {
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    const auto & layer = model.layers[il];
+
+    if (!ggml_q35moe_ffn1_enabled() || moe_cache != nullptr) {
+        return nullptr;
+    }
+    const auto dev = q35moe_rocm_dev(cparams, model, loras);
+    if (dev == nullptr || model.dev_layer(il) != dev) {
+        return nullptr;
+    }
+
+    // the op replays build_moe_ffn() and build_ffn() with these settings only
+    constexpr float eps = 1e-6f;
+    const bool plain_graph = n_expert == ggml_q35moe_n_expert && n_expert_used == ggml_q35moe_n_used &&
+        hparams.n_expert_used(il) == (uint32_t) ggml_q35moe_n_used && hparams.n_expert_groups <= 1 &&
+        (hparams.expert_weights_scale == 0.0f || hparams.expert_weights_scale == 1.0f) && hparams.expert_weights_norm_eps <= 0.0f &&
+        !hparams.expert_router_f32 && !(hparams.swiglu_clamp_exp[il] > eps) && !(hparams.swiglu_clamp_shexp[il] > eps) &&
+        !layer.ffn_gate_up_exps && !layer.ffn_up_exps_s && !layer.ffn_gate_exps_s && !layer.ffn_down_exps_s &&
+        !layer.ffn_up_shexp_s && !layer.ffn_gate_shexp_s && !layer.ffn_down_shexp_s;
+    if (!plain_graph) {
+        return nullptr;
+    }
+
+    ggml_tensor * w[] = {
+        layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+        layer.ffn_gate_inp_shexp, layer.ffn_up_shexp, layer.ffn_gate_shexp, layer.ffn_down_shexp,
+    };
+    for (const ggml_tensor * m : w) {
+        // no rotated input and no precision request for a product
+        if (m == nullptr || (hdmd && hdmd->rot.count(m)) || (prec_policy && (prec_policy->prec_src1.count(m) || prec_policy->prec_acc.count(m)))) {
+            return nullptr;
+        }
+    }
+
+    ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+    auto * candidate = ggml_q35moe_try_ffn1(probe.get(), cur, residual, w);
+    if (candidate == nullptr || !ggml_backend_dev_supports_op(dev, candidate)) {
+        return nullptr;
+    }
+
+    return ggml_q35moe_try_ffn1(ctx0, cur, residual, w);
+#else
+    GGML_UNUSED(cur);
+    GGML_UNUSED(residual);
+    GGML_UNUSED(il);
+    return nullptr;
+#endif
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE

@@ -86,6 +86,7 @@
 #include "ggml-cuda/top-k-mask.cuh"
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
 #include "ggml-cuda/qwen35-decode.cuh"
+#include "ggml-cuda/q35moe-ffn.cuh"
 #endif
 #include "ggml.h"
 
@@ -2955,6 +2956,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 q35moe_mvf_launch(ctx, dst);
             } else if (qwen35_convpf_supported(ctx.device, dst)) {
                 qwen35_convpf_launch(ctx, dst);
+            } else if (q35moe_ffn1_supported(ctx.device, dst)) {
+                q35moe_ffn1_launch(ctx, dst);
             } else {
                 return false;
             }
@@ -6750,7 +6753,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 qwen35_mvshare_supported(dev_ctx->device, op) || qwen35_prep1_supported(dev_ctx->device, op) ||
                 qwen35_gdn1_supported(dev_ctx->device, op) || qwen35_post1_supported(dev_ctx->device, op) ||
                 q35moe_mvf_supported(dev_ctx->device, op) ||
-                qwen35_convpf_supported(dev_ctx->device, op);
+                qwen35_convpf_supported(dev_ctx->device, op) || q35moe_ffn1_supported(dev_ctx->device, op);
 #endif
         case GGML_OP_CONCAT:
             {
