@@ -4282,7 +4282,8 @@ void llm_graph_context::build_conv_state_store(
         ggml_tensor * s,
         ggml_tensor * conv_x,
             int64_t   n_cols,
-             size_t   offs) const {
+             size_t   offs,
+               bool   one_slot) const {
     const auto * mctx_cur = inp->mctx;
 
     const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
@@ -4292,7 +4293,7 @@ void llm_graph_context::build_conv_state_store(
     const size_t row_size  = s->nb[1];
     const size_t cell_offs = mctx_cur->get_head()*row_size + offs;
 
-    if (cparams.n_rs_seq == 0) {
+    if (cparams.n_rs_seq == 0 || one_slot) {
         ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
                 n_cols, channels, n_seqs,
                 conv_x->nb[1], conv_x->nb[2],

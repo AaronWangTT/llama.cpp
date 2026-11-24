@@ -76,6 +76,13 @@ GGML_API bool ggml_q35moe_is_gdnn(const ggml_tensor * op);
 
 // GGML_Q35MOE_POSTN=1: ggml_qwen35_try_post1 takes the heads of several tokens in the qwen35moe graph
 GGML_API bool ggml_q35moe_postn_enabled();
+
+// GGML_Q35MOE_GDNPF=1: a batch of more than n_rs_seq + 1 tokens per sequence in the qwen35moe graph (a prompt batch).
+// The memory takes no rollback after such a batch, so the graph writes rollback slot 0 only, like a context without snapshots.
+// The graph marks its GGML_OP_GATED_DELTA_NET node (one slot, head_dim 128, scalar gate) for the kernel of q35moe-gdnpf.cuh.
+GGML_API bool ggml_q35moe_gdnpf_enabled();
+GGML_API void ggml_q35moe_gdnpf_mark(ggml_tensor * gdn);
+GGML_API bool ggml_q35moe_is_gdnpf(const ggml_tensor * gdn);
 }
 
 constexpr int ggml_qwen35_mvshare_max = 8;
@@ -93,3 +100,5 @@ constexpr int ggml_qwen35_prep1_slot_scale  = 11;
 constexpr int ggml_qwen35_post1_slot_eps    = 8;
 constexpr int ggml_q35moe_prepn_slot_slot_rows = 12;
 constexpr int ggml_q35moe_gdnn_slot_slot_rows  = 8;
+// op_params slot of GGML_OP_GATED_DELTA_NET after the slot count
+constexpr int ggml_q35moe_gdnpf_slot_mark      = 1;

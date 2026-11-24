@@ -705,3 +705,29 @@ bool ggml_q35moe_postn_enabled() {
     static const bool enabled = env_on("GGML_Q35MOE_POSTN");
     return enabled;
 }
+
+bool ggml_q35moe_gdnpf_enabled() {
+    static const bool enabled = env_on("GGML_Q35MOE_GDNPF");
+    return enabled;
+}
+
+// the shape that the kernel replays: one slot, heads of 128, scalar gate, more than one token
+static bool gdnpf_layout(const ggml_tensor * gdn) {
+    if (!gdn || gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1) {
+        return false;
+    }
+    const ggml_tensor * q = gdn->src[0];
+    const ggml_tensor * v = gdn->src[2];
+    const ggml_tensor * g = gdn->src[3];
+    return q->ne[0] == head_dim && v->ne[0] == head_dim && g->ne[0] == 1 && v->ne[2] > 1;
+}
+
+void ggml_q35moe_gdnpf_mark(ggml_tensor * gdn) {
+    if (ggml_q35moe_gdnpf_enabled() && gdnpf_layout(gdn)) {
+        ggml_set_op_params_i32(gdn, ggml_q35moe_gdnpf_slot_mark, 1);
+    }
+}
+
+bool ggml_q35moe_is_gdnpf(const ggml_tensor * gdn) {
+    return ggml_q35moe_gdnpf_enabled() && gdnpf_layout(gdn) && ggml_get_op_params_i32(gdn, ggml_q35moe_gdnpf_slot_mark) == 1;
+}

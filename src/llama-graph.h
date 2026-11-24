@@ -1521,12 +1521,14 @@ struct llm_graph_context {
 
     // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
     // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch
+    // one_slot: slot 0 only, for a ubatch after which the memory takes no rollback (more than n_rs_seq + 1 tokens per sequence)
     void build_conv_state_store(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
             ggml_tensor * conv_x,
                 int64_t   n_cols,
-                 size_t   offs) const;
+                 size_t   offs,
+                   bool   one_slot = false) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

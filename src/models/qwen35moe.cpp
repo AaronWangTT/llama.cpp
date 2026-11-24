@@ -60,6 +60,27 @@ static void q35moe_log_off(const char * switches, const char * why) {
     seen.emplace_back(switches, why);
     LLAMA_LOG_WARN("qwen35moe: no effect of %s: %s\n", switches, why);
 }
+
+// GGML_Q35MOE_GDNPF=1: a ubatch of more than n_rs_seq + 1 tokens per sequence. The memory takes no rollback after it
+// (llama_memory_recurrent::find_slot() sets rs_max to 0), so the recurrent blocks write slot 0 only, and the delta net node is marked for its prompt kernel
+static bool q35moe_gdnpf(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras,
+        const int il, const int64_t n_seq_tokens) {
+    if (!ggml_q35moe_gdnpf_enabled() || n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1) {
+        return false;
+    }
+    const char * why = nullptr;
+    if (!q35moe_rocm_dev(cparams, model, loras, il, false, &why)) {
+        q35moe_log_off("GGML_Q35MOE_GDNPF", why);
+        return false;
+    }
+    static std::atomic<bool> logged[2];
+    const bool rs = cparams.n_rs_seq > 0;
+    if (!logged[rs].exchange(true)) {
+        LLAMA_LOG_INFO("qwen35moe: GGML_Q35MOE_GDNPF: delta net prompt kernel for ubatches of more than %u tokens per sequence%s\n",
+            cparams.n_rs_seq + 1, rs ? ", they write rollback slot 0 only" : "");
+    }
+    return true;
+}
 #endif
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -467,6 +488,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * conv_output_silu = nullptr;
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    const bool gdnpf = q35moe_gdnpf(cparams, model, loras, il, n_seq_tokens);
+#else
+    const bool gdnpf = false;
+#endif
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
     // GGML_Q35MOE_CONVPF=1, many tokens of one sequence: one op reads the conv state and qkv_mixed, there is no concat tensor
     if (ggml_q35moe_convpf_enabled()) {
         // a reason that holds for the whole context goes to the log once; the shape of the batch does not
@@ -477,7 +504,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
             why = "the conv kernel size or the channel count";
         }
         // slots that build_conv_state_store() writes; all their windows must lie in qkv_mixed
-        const int64_t n_slots = std::min<int64_t>(n_seq_tokens, (int64_t) cparams.n_rs_seq + 1);
+        const int64_t n_slots = gdnpf ? 1 : std::min<int64_t>(n_seq_tokens, (int64_t) cparams.n_rs_seq + 1);
         if (why) {
             q35moe_log_off("GGML_Q35MOE_CONVPF", why);
         } else if (n_seqs == 1 && n_seq_tokens >= ggml_qwen35_convpf_min_n_tokens && n_seq_tokens >= n_slots + conv_kernel_size - 1) {
@@ -509,7 +536,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     }
 #endif
 
-    ggml_tensor * conv_input = conv_output_silu ? nullptr : build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    ggml_tensor * conv_input = conv_output_silu ? nullptr : build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il, gdnpf);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -566,7 +593,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il, gdnpf);
+
+#ifdef GGML_INKLING_DEPTHMIX_GFX1103
+    if (gdnpf) {
+        // output is a view of the delta net node
+        ggml_q35moe_gdnpf_mark(output->view_src);
+    }
+#endif
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

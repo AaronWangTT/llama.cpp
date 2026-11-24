@@ -8,6 +8,8 @@
 // rollback slots. One token (the one-token ops, as with GGML_Q35MOE_RS1) and 2 to 5 tokens (the ops for a few tokens) against the
 // stock graph that writes the snapshots, also when the state row is one of the rows that the batch writes.
 // With GGML_Q35MOE_CONVPF=1: the store of the conv state for many tokens, one copy per slot against the stock SET_ROWS store.
+// With GGML_Q35MOE_GDNPF=1: the delta net of a prompt batch, the node with the mark of the qwen35moe graph against the node without it,
+// and the one-slot stores of such a batch against slot 0 of the stores with rollback slots.
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-qwen35-convpf.h"
@@ -701,12 +703,117 @@ static long run_store_keep(ggml_backend_t be) {
     return n_diff;
 }
 
+// The delta net of a prompt batch as build_recurrent_attn() builds it for one slot, with the state copy into the cache.
+// mark: the node gets the mark of the qwen35moe graph (GGML_Q35MOE_GDNPF). k_slots > 1: the stock node with rollback slots.
+// Returns the attention output followed by the whole state cache
+static std::vector<float> run_gdn_prompt(ggml_backend_t be, const states_keep & st, const bool mark, const int64_t k_slots, const int n_t, const int n_seqs,
+        const int cell, const std::vector<float> & qk, const std::vector<float> & conv, const std::vector<float> & gb, const std::vector<float> & s0,
+        const std::vector<float> & s_all) {
+    const size_t   fs = sizeof(float);
+    ggml_context * c  = ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+    ggml_cgraph *  gf = ggml_new_graph(c);
+    ggml_tensor * q    = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, H_K, n_t, n_seqs); ggml_set_input(q);
+    ggml_tensor * k    = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, H_K, n_t, n_seqs); ggml_set_input(k);
+    ggml_tensor * cv   = ggml_new_tensor_3d(c, GGML_TYPE_F32, C, n_t, n_seqs);      ggml_set_input(cv);
+    ggml_tensor * g    = ggml_new_tensor_4d(c, GGML_TYPE_F32, 1, H, n_t, n_seqs);   ggml_set_input(g);
+    ggml_tensor * b    = ggml_new_tensor_4d(c, GGML_TYPE_F32, 1, H, n_t, n_seqs);   ggml_set_input(b);
+    ggml_tensor * s    = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, S, H, n_seqs);     ggml_set_input(s);
+    // v is a part of the conv output, as in build_layer_attn_linear()
+    ggml_tensor * v    = ggml_view_4d(c, cv, S, H, n_t, n_seqs, S*fs, C*fs, C*fs*n_t, 2*KEY*fs);
+    ggml_tensor * gdn  = ggml_gated_delta_net(c, q, k, v, g, b, s, k_slots);
+    if (mark) {
+        ggml_q35moe_gdnpf_mark(gdn);
+        check(ggml_q35moe_is_gdnpf(gdn), "the node must take the mark");
+    }
+    const int64_t n_written = std::min<int64_t>(n_t, k_slots);
+    ggml_tensor * src = ggml_view_3d(c, gdn, D_S, n_seqs, n_written, D_S*fs, D_S*fs*n_seqs, (size_t) VAL*n_t*n_seqs*fs);
+    ggml_tensor * dst = k_slots == 1 ?
+        ggml_view_2d(c, st.s, D_S, n_seqs, st.s->nb[1], cell*st.s->nb[1]) :
+        ggml_view_3d(c, st.s, D_S, n_seqs, n_written, st.s->nb[1], N_CELLS*st.s->nb[1], cell*st.s->nb[1]);
+    ggml_build_forward_expand(gf, ggml_cpy(c, src, dst));
+    ggml_tensor * out = ggml_cont(c, ggml_view_4d(c, gdn, S, H, n_t, n_seqs, S*fs, VAL*fs, VAL*fs*n_t, 0));
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+    check(ggml_gallocr_alloc_graph(ga, gf), "alloc");
+    ggml_backend_tensor_set(q,    qk.data(),                 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k,    qk.data() + ggml_nelements(q), 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(cv,   conv.data(),               0, ggml_nbytes(cv));
+    ggml_backend_tensor_set(g,    gb.data(),                 0, ggml_nbytes(g));
+    ggml_backend_tensor_set(b,    gb.data() + ggml_nelements(g), 0, ggml_nbytes(b));
+    ggml_backend_tensor_set(s,    s0.data(),                 0, ggml_nbytes(s));
+    ggml_backend_tensor_set(st.s, s_all.data(),              0, ggml_nbytes(st.s));
+    check(ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS, "compute");
+    std::vector<float> res((size_t) ggml_nelements(out) + s_all.size());
+    ggml_backend_tensor_get(out,  res.data(),                       0, ggml_nbytes(out));
+    ggml_backend_tensor_get(st.s, res.data() + ggml_nelements(out), 0, ggml_nbytes(st.s));
+    ggml_gallocr_free(ga);
+    ggml_free(c);
+    return res;
+}
+
+// GGML_Q35MOE_GDNPF: the marked node against the stock node with one slot (all bits) and against the stock node with rollback slots
+// (attention output and slot 0), on the device; the stock node on the CPU is the reference for the size of the values
+static long run_gdnpf(ggml_backend_t hip, ggml_backend_t cpu, double & worst_cpu) {
+    const states_keep st     = make_states_keep(hip);
+    const states_keep st_cpu = make_states_keep(cpu);
+    std::mt19937 rng(4096);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+    struct tcase { int n_t, n_seqs, cell; };
+    const tcase cases[] = { { 512, 1, 0 }, { 508, 1, 1 }, { 5, 1, 2 }, { 6, 1, 0 }, { 33, 1, 1 }, { 129, 1, 2 }, { 2, 1, 0 }, { 64, 2, 0 }, { 37, 2, 1 } };
+    long n_diff = 0;
+    for (const tcase & tc : cases) {
+        const size_t n_qk = (size_t) KEY*tc.n_t*tc.n_seqs;
+        std::vector<float> qk(2*n_qk), conv((size_t) C*tc.n_t*tc.n_seqs), gb((size_t) 2*H*tc.n_t*tc.n_seqs), s0((size_t) D_S*tc.n_seqs), s_all((size_t) D_S*N_ROWS);
+        // q and k are unit vectors per head, the gate is negative, beta is a sigmoid
+        for (size_t i = 0; i < qk.size(); i += S) {
+            float n2 = 0.0f;
+            for (int j = 0; j < S; ++j) { qk[i + j] = nd(rng); n2 += qk[i + j]*qk[i + j]; }
+            for (int j = 0; j < S; ++j) { qk[i + j] /= std::sqrt(n2); }
+        }
+        for (auto & val : conv)  { val = nd(rng); }
+        for (size_t i = 0; i < gb.size(); ++i) { gb[i] = i < gb.size()/2 ? -4.0f*ud(rng)*ud(rng) : ud(rng); }
+        for (auto & val : s0)    { val = 0.1f*nd(rng); }
+        for (auto & val : s_all) { val = nd(rng); }
+
+        const std::vector<float> ref  = run_gdn_prompt(hip, st, false, 1, tc.n_t, tc.n_seqs, tc.cell, qk, conv, gb, s0, s_all);
+        const std::vector<float> got  = run_gdn_prompt(hip, st, true,  1, tc.n_t, tc.n_seqs, tc.cell, qk, conv, gb, s0, s_all);
+        const std::vector<float> keep = run_gdn_prompt(hip, st, false, N_SLOTS, tc.n_t, tc.n_seqs, tc.cell, qk, conv, gb, s0, s_all);
+        const std::vector<float> host = run_gdn_prompt(cpu, st_cpu, false, 1, tc.n_t, tc.n_seqs, tc.cell, qk, conv, gb, s0, s_all);
+        const size_t n_out = (size_t) VAL*tc.n_t*tc.n_seqs;
+        long diff = 0, diff_keep = 0, changed = 0;
+        double err = 0.0, norm = 0.0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            diff += std::memcmp(&ref[i], &got[i], sizeof(float)) != 0;
+            err  += ((double) got[i] - host[i])*((double) got[i] - host[i]);
+            norm += (double) host[i]*host[i];
+        }
+        // rows of slot 0 and the attention output of the node with rollback slots; the other rows of the one-slot store must keep their values
+        for (size_t i = 0; i < n_out + (size_t) D_S*N_CELLS; ++i) {
+            diff_keep += std::memcmp(&keep[i], &got[i], sizeof(float)) != 0;
+        }
+        for (size_t i = 0; i < s_all.size(); ++i) {
+            const bool written = i >= (size_t) D_S*tc.cell && i < (size_t) D_S*(tc.cell + tc.n_seqs);
+            changed += !written && std::memcmp(&got[n_out + i], &s_all[i], sizeof(float)) != 0;
+        }
+        const double rel = std::sqrt(err/norm);
+        worst_cpu = std::max(worst_cpu, rel);
+        std::printf("delta net prompt kernel, %d tokens, %d sequences, cell %d: %ld/%zu differ from the stock node, %ld from slot 0 of the node with %d slots, "
+                "%ld values outside the cell changed, cpu reference error %.2e\n", tc.n_t, tc.n_seqs, tc.cell, diff, ref.size(), diff_keep, N_SLOTS, changed, rel);
+        n_diff += diff + diff_keep + changed;
+    }
+    return n_diff;
+}
+
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: qwen35-hip-decode ABS_LIBDIR");
     const bool run_qwen35 = ggml_qwen35_mvshare_enabled() && ggml_qwen35_prep1_enabled() && ggml_qwen35_gdn1_enabled() && ggml_qwen35_post1_enabled();
     const bool run_moe    = ggml_q35moe_mvshare_enabled() && ggml_q35moe_ba1_enabled() && ggml_q35moe_prep1_enabled() && ggml_q35moe_gdn1_enabled() &&
         ggml_q35moe_post1_enabled();
-    check(run_qwen35 || run_moe, "set GGML_QWEN35_MVSHARE=1 GGML_QWEN35_PREP1=1 GGML_QWEN35_GDN1=1 GGML_QWEN35_POST1=1 or the five GGML_Q35MOE_* switches");
+    const bool run_pf    = ggml_q35moe_gdnpf_enabled();
+    check(run_qwen35 || run_moe || run_pf, "set GGML_QWEN35_MVSHARE=1 GGML_QWEN35_PREP1=1 GGML_QWEN35_GDN1=1 GGML_QWEN35_POST1=1 or the five GGML_Q35MOE_* switches or GGML_Q35MOE_GDNPF=1");
     const bool run_keep  = run_moe && ggml_q35moe_prepn_enabled() && ggml_q35moe_gdnn_enabled() && ggml_q35moe_postn_enabled();
     const bool run_store = ggml_q35moe_convpf_enabled();
     ggml_backend_load_all_from_path(argv[1]);
@@ -729,10 +836,13 @@ int main(int argc, char ** argv) {
     if (run_store) {
         n_diff += run_store_keep(hip);
     }
+    if (run_pf) {
+        n_diff += run_gdnpf(hip, cpu, worst_cpu);
+    }
     check(n_diff == 0, "a fused op is not bit-exact");
     check(worst_cpu < 1e-3, "cpu reference error above 1e-3");
-    std::printf("PASS bit-exact%s%s%s%s, worst cpu reference error %.2e\n", run_qwen35 ? " qwen35" : "", run_moe ? " qwen35moe" : "",
-            run_keep ? " qwen35moe-snapshots" : "", run_store ? " conv-store" : "", worst_cpu);
+    std::printf("PASS bit-exact%s%s%s%s%s, worst cpu reference error %.2e\n", run_qwen35 ? " qwen35" : "", run_moe ? " qwen35moe" : "",
+            run_keep ? " qwen35moe-snapshots" : "", run_store ? " conv-store" : "", run_pf ? " delta-net-prompt" : "", worst_cpu);
     ggml_backend_free(hip);
     ggml_backend_free(cpu);
     return 0;
