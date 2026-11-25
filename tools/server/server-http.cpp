@@ -754,6 +754,8 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         res.status = response->status;
         // Tell Nginx to not buffer any streamed response
         response->headers["X-Accel-Buffering"] = "no";
+        // httplib closes the connection after the stream (the provider returns false at the end), tell the client not to reuse it
+        response->headers["Connection"] = "close";
         set_headers(res, response->headers);
         const std::string content_type = response->content_type;
         // convert to shared_ptr as both chunked_content_provider() and on_complete() need to use it

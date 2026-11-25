@@ -2612,7 +2612,8 @@ static bool should_strip_proxy_header(const std::string & header_name) {
     if (header_name == "server" ||
         header_name == "transfer-encoding" ||
         header_name == "content-length" || // quick fix for https://github.com/ggml-org/llama.cpp/issues/17710
-        header_name == "keep-alive") {
+        header_name == "keep-alive" ||
+        header_name == "connection") {
         return true;
     }
 
