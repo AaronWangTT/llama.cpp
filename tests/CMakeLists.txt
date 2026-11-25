@@ -277,6 +277,24 @@ llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
     -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
+# Model for test-recurrent-rollback: with this weight scale a wrong recurrent state moves the logits by 1 or more
+set(RS_ROLLBACK_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-recurrent-rollback-models")
+file(MAKE_DIRECTORY "${RS_ROLLBACK_DIR}")
+llama_test(
+    test-llama-archs
+    NAME test-generate-recurrent-rollback-model
+    LABEL main
+    ARGS -a qwen35moe -s 4711 -d 0.5 -o "${RS_ROLLBACK_DIR}"
+)
+set_tests_properties(
+    test-generate-recurrent-rollback-model
+    PROPERTIES FIXTURES_SETUP recurrent-rollback-model
+)
+
+llama_build_and_test(test-recurrent-rollback.cpp LINK llama ARGS
+    -m "${RS_ROLLBACK_DIR}/qwen35moe-moe.gguf")
+set_tests_properties(test-recurrent-rollback PROPERTIES FIXTURES_REQUIRED recurrent-rollback-model)
+
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context
