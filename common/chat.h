@@ -199,15 +199,6 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
-
-    int32_t first_user_message_pos() const {
-        for (auto it = spans.begin(); it != spans.end(); ++it) {
-            if (it->role == COMMON_CHAT_ROLE_USER) {
-                return (int32_t) it->pos;
-            }
-        }
-        return -1;
-    }
 };
 
 struct common_chat_msg_delimiter {

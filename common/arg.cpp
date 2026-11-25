@@ -1716,7 +1716,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--checkpoint-keep-system"},
         {"--no-checkpoint-keep-system"},
-        "keep the context checkpoint at the start of the first user message (the end of the system prompt and the tools) when --ctx-checkpoints is reached, so that a later prompt with the same system prompt and tools can start from it; it counts toward --ctx-checkpoints (default: disabled)",
+        "make a context checkpoint 64 tokens before the end of the prefix that a prompt shares with the state of a slot or of the prompt cache (the system prompt and the tools of an agent) when it is at least --checkpoint-min-step tokens past the restored part, and keep the first context checkpoint of a state when --ctx-checkpoints is reached, so that later prompts with that prefix start from it; it counts toward --ctx-checkpoints (default: disabled)",
         [](common_params & params, bool value) {
             params.checkpoint_keep_system = value;
         }

@@ -668,7 +668,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     std::vector<int32_t> checkpoint_offsets;     // context checkpoints that many tokens before the end of the prompt, empty = default
     bool    checkpoint_mid_prompt = false; // context checkpoints between the batches of a prompt, min step apart
-    bool    checkpoint_keep_system = false; // keep the context checkpoint at the start of the first user message when the list is full
+    bool    checkpoint_keep_system = false; // context checkpoint at the end of a prefix shared with another state, the first checkpoint stays
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 

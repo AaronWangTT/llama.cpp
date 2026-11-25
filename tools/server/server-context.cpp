@@ -412,6 +412,9 @@ struct server_slot {
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
+    // --checkpoint-keep-system: the prompt gets a context checkpoint at this n_tokens, near the end of the prefix it shares with another state
+    int32_t n_tokens_ckpt_shared = -1;
+
     // sampling
     json json_schema;
 
@@ -484,6 +487,8 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        n_tokens_ckpt_shared = -1;
 
         // clear multimodal state
         mbatch.reset();
@@ -1868,6 +1873,25 @@ private:
         return 0;
     }
 
+    // --checkpoint-keep-system: the longest prefix that a prompt shares with the state of another slot or of the prompt cache
+    int32_t n_shared_other(const server_slot & slot_cur, const server_tokens & tokens) const {
+        size_t res = 0;
+
+        for (const auto & slot : slots) {
+            if (&slot != &slot_cur) {
+                res = std::max(res, slot.prompt.tokens.get_common_prefix(tokens));
+            }
+        }
+
+        if (prompt_cache) {
+            for (const auto & state : prompt_cache->states) {
+                res = std::max(res, state.prompt.tokens.get_common_prefix(tokens));
+            }
+        }
+
+        return (int32_t) res;
+    }
+
     // two different prompt_cache_key values prove two conversations, equal or missing ones prove nothing
     static bool is_other_key(const server_prompt & prompt, const server_task & task) {
         return !prompt.cache_key.empty() && !task.cache_key.empty() && prompt.cache_key != task.cache_key;
@@ -3055,9 +3079,6 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // --checkpoint-keep-system: the checkpoint at the start of the first user message stays, a prompt with the same system prompt and tools starts from it
-        const int64_t n_tokens_keep = params_base.checkpoint_keep_system ? slot.task->params.message_spans.first_user_message_pos() : -1;
-
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -3066,7 +3087,7 @@ private:
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
-            if (cur.id_task != id_task && cur.n_tokens != n_tokens_keep && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
+            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
@@ -3074,15 +3095,16 @@ private:
                 continue;
             }
 
-            last = cur.n_tokens;
+            // --checkpoint-keep-system: the first checkpoint stays anyway, the next one is not too close to it
+            last = params_base.checkpoint_keep_system && it == slot.prompt.checkpoints.begin() ? -1 : cur.n_tokens;
             ++it;
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            // the checkpoint to keep goes only when it is the only one
+            // --checkpoint-keep-system: the first checkpoint stays unless it is the only one, other prompts can start there
             auto it = slot.prompt.checkpoints.begin();
-            if ((*it)->n_tokens == n_tokens_keep && slot.prompt.checkpoints.size() > 1) {
+            if (params_base.checkpoint_keep_system && slot.prompt.checkpoints.size() > 1) {
                 ++it;
             }
 
@@ -3248,7 +3270,12 @@ private:
             }
             checkpoints.push_back(std::move(ckpt));
             if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
-                checkpoints.pop_front();
+                // --checkpoint-keep-system: the first one stays, as in create_checkpoint()
+                auto it = checkpoints.begin();
+                if (params_base.checkpoint_keep_system && checkpoints.size() > 1) {
+                    ++it;
+                }
+                checkpoints.erase(it);
             }
         }
         // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
@@ -4692,6 +4719,15 @@ private:
                                     }
                                 }
                             }
+
+                            // --checkpoint-keep-system: a context checkpoint near the end of the prefix shared with this or another state (system prompt and tools), the next prompt with that prefix starts there
+                            // it is 64 tokens before the end: a prompt that differs a little earlier (another value in the same line) can start there too
+                            if (params_base.checkpoint_keep_system) {
+                                const int32_t n_ckpt = std::max(n_prefix, n_shared_other(slot, input_tokens)) - 64;
+                                if (n_ckpt - n_past >= std::max(1, params_base.checkpoint_min_step)) {
+                                    slot.n_tokens_ckpt_shared = n_ckpt;
+                                }
+                            }
                         }
 
                         // [TAG_PROMPT_LOGITS]
@@ -4896,6 +4932,11 @@ private:
                             }
                         }
 
+                        // --checkpoint-keep-system: break near the end of the prefix shared with another state
+                        if (do_checkpoint && slot.prompt.n_tokens() == slot.n_tokens_ckpt_shared) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4937,6 +4978,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_shared_end = n_tokens_start == slot.n_tokens_ckpt_shared;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4955,7 +4997,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end && !is_offset_start && !params_base.checkpoint_mid_prompt) {
+                        if (!is_user_start && !near_prompt_end && !is_offset_start && !is_shared_end && !params_base.checkpoint_mid_prompt) {
                             do_checkpoint = false;
                         }
                     }
@@ -4975,7 +5017,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end || is_offset_start ||
+                            is_last_user_message || near_prompt_end || is_offset_start || is_shared_end ||
                             n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -4983,6 +5025,10 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+
+                        if (is_shared_end) {
+                            SLT_INF(slot, "created context checkpoint near the end of the prefix shared with another state (n_tokens = %d)\n", n_tokens_start);
+                        }
                     }
                 }
 
