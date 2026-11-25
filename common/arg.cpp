@@ -1714,6 +1714,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MID_PROMPT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-keep-system"},
+        {"--no-checkpoint-keep-system"},
+        "keep the context checkpoint at the start of the first user message (the end of the system prompt and the tools) when --ctx-checkpoints is reached, so that a later prompt with the same system prompt and tools can start from it; it counts toward --ctx-checkpoints (default: disabled)",
+        [](common_params & params, bool value) {
+            params.checkpoint_keep_system = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_KEEP_SYSTEM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
