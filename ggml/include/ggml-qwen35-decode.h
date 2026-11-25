@@ -53,7 +53,8 @@ GGML_API bool ggml_q35moe_is_mvf(const ggml_tensor * op);
 // The ops read the row that the memory names (a rollback slot or slot 0) and write slot 0, as the stock graph of one token does.
 GGML_API bool ggml_q35moe_rs1_enabled();
 
-// The ops below take 2 to ggml_q35moe_few_max tokens of one sequence in a context with rollback snapshots (a draft verification batch).
+// The ops below are for a few tokens of one sequence in a context with rollback snapshots (a draft verification batch).
+// The graph of qwen35moe gives them 2 to 5 tokens, the counts that are checked against the stock graph. They would take up to ggml_q35moe_few_max.
 // A state tensor holds slot s of cell c in row s*slot_rows + c. cell is the row of slot 0, a view of states. An op writes one slot
 // per token: slot s gets the state of s tokens before the end of the batch. The row ids[0] can be one of these rows.
 
@@ -87,7 +88,7 @@ GGML_API bool ggml_q35moe_is_gdnpf(const ggml_tensor * gdn);
 
 constexpr int ggml_qwen35_mvshare_max = 8;
 constexpr int ggml_q35moe_mvf_max     = 4;
-// most tokens of a batch that PREPN and GDNN take; the dense products of such a batch are vector kernels
+// most tokens of a batch that PREPN and GDNN have a kernel for (6 to 8 are not checked, the graph stops at 5); the dense products of such a batch are vector kernels
 constexpr int ggml_q35moe_few_max     = 8;
 // the kernels replay the stock kernels of these sizes only
 constexpr int ggml_qwen35_head_dim = 128;

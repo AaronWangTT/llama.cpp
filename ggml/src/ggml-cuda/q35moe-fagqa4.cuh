@@ -745,6 +745,7 @@ static void ggml_cuda_flash_attn_ext_q35moe_fagqa4_launch(ggml_backend_cuda_cont
     const int     ntiles_KV  = n_kv / nbatch_fa;
 
     // Shared memory of the kernel that this one replaces, as in ggml_cuda_flash_attn_ext_mma_f16_case. The number of blocks comes from it.
+    // ref is the copy of that kernel in this translation unit (fattn.cu). The library has more copies with the same code, only the hash gate checks that.
     const size_t nbytes_shared_KV      = nbatch_fa                                         * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_Q       = ncols                                             * (DKQ/2 + 4)                            * sizeof(half2);
     const size_t nbytes_shared_mask    = ncols1                                            * (nbatch_fa/2 + 4)                      * sizeof(half2);

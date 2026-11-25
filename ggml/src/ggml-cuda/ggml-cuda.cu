@@ -5459,6 +5459,7 @@ static void ggml_cuda_qshare_reset(ggml_backend_cuda_context & ctx, const ggml_c
 // GGML_Q35MOE_QSHARE: the nodes first..last were computed. Drops the kept Q8_1 input if one of them may have written into the
 // memory of the kept src1 or ids. A product that is a node of its own writes its output only. Any other op may also write into
 // a source (a copy or an in-place op through its view, a fused or custom op into a state tensor), so its sources count as well.
+// A new product path that writes into one of its sources needs a change here, else the next product takes a stale copy.
 static void ggml_cuda_qshare_written(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int first, const int last) {
     ggml_cuda_qshare & qs = ctx.qshare;
     qs.node = nullptr;

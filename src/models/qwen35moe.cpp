@@ -289,7 +289,7 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // MOE FFN layer; one token on a ROCm device can take the feed-forward and its residual as one op
+        // MOE FFN layer; 1 to 4 tokens on a ROCm device can take the feed-forward and its residual as one op (5 tokens with GGML_Q35MOE_FFNM5)
         cur = build_layer_ffn_one(attn_post_norm, ffn_residual, il);
         if (cur == nullptr) {
             cur = build_layer_ffn(attn_post_norm, il);
