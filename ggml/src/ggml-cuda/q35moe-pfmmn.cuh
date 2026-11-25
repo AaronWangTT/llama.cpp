@@ -3,11 +3,13 @@
 // include after mmf.cuh and mmvf.cuh
 #include "inkling-pfmm.cuh"
 
-// GGML_Q35MOE_PFMMN=1: F32 products of a prefill ubatch of qwen35moe (router, beta, alpha) for every token count that goes to SGEMM, not only the 512 of GGML_Q35MOE_PFMM.
+// GGML_Q35MOE_PFMMN=1: F32 products of a prefill ubatch of qwen35moe (router, beta, alpha) for q35moe_pfmmn_min_tokens to q35moe_pfmmn_max_tokens tokens, not only the 512 of GGML_Q35MOE_PFMM.
 // rocBLAS has one SGEMM kernel for gfx1103 (Tensile MT32x32x8, StaggerU 32 on the row tile), so a token column has the same bits whatever the token count.
 
 // the largest batch of the server; the fixture tests/q35moe-hip-pfmmn.cpp compares every token count up to it with SGEMM
 constexpr int q35moe_pfmmn_max_tokens = 2048;
+// a partial block does the work of 128 tokens, so SGEMM is faster for small batches (bench of the fixture): they stay with SGEMM
+constexpr int q35moe_pfmmn_min_tokens = 128;
 
 static bool q35moe_pfmmn_enabled() {
     static const bool enabled = [] { const char * p = getenv("GGML_Q35MOE_PFMMN"); return p && strcmp(p, "1") == 0; }();
@@ -109,7 +111,7 @@ static __global__ void q35moe_pfmmn(const float * w_ptr, const float * x_ptr, fl
     }
 }
 
-// the F32 weights of the architecture, [2048, rows]: router with 256 rows, beta and alpha with 32 rows; any token count that the stock path gives to SGEMM
+// the F32 weights of the architecture, [2048, rows]: router with 256 rows, beta and alpha with 32 rows; token counts from q35moe_pfmmn_min_tokens that the stock path gives to SGEMM
 static bool q35moe_pfmmn_supported(int device, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * dst) {
     const auto & info = ggml_cuda_info().devices[device];
     if (info.cc != GGML_CUDA_CC_OFFSET_AMD + 0x1103 || info.warp_size != 32 || !q35moe_pfmmn_enabled()) {
@@ -127,7 +129,7 @@ static bool q35moe_pfmmn_supported(int device, const ggml_tensor * w, const ggml
         return false;
     }
     if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || x->ne[0] != n_k || dst->ne[0] != n_rows || dst->ne[1] != n_tokens ||
-            n_tokens > q35moe_pfmmn_max_tokens) {
+            n_tokens < q35moe_pfmmn_min_tokens || n_tokens > q35moe_pfmmn_max_tokens) {
         return false;
     }
     // few tokens take the vector kernels (other bits than SGEMM), see ggml_cuda_mul_mat

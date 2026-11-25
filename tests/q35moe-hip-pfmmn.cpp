@@ -1,12 +1,14 @@
 // Fixture for GGML_Q35MOE_PFMMN: the F32 products of qwen35moe (router with 256 rows, beta and alpha with 32 rows, k = 2048) for
 // every token count from 1 to 2048. Each product is computed twice in one graph: on a float4 aligned x (the kernel, when the switch
-// is set and the stock path is SGEMM) and on an x that starts one float into its buffer (always the stock path).
+// is set and the batch has 128 tokens or more) and on an x that starts one float into its buffer (always the stock path).
 //   q35moe-hip-pfmmn ABS_LIBDIR [rep1]                                            stock path only, prints the hashes (rep1: only the second data set)
 //   GGML_Q35MOE_PFMMN=1 GGML_Q35MOE_PFMMN_TRACE=1 q35moe-hip-pfmmn ABS_LIBDIR      kernel against SGEMM, counts the kernel calls
 //   [GGML_Q35MOE_PFMMN=1] q35moe-hip-pfmmn ABS_LIBDIR bench                       time of the 99 products of a prompt ubatch, aligned and shifted x in turn
-// Checks, from 9 tokens on (up to 8 the stock path is the vector kernel and the switch must not take the product): aligned =
-// shifted for every value; a token column of SGEMM has the same bits whatever the token count (against the product with 2048
-// tokens); the product with 2048 tokens against a fused multiply-add chain on the CPU in the order of the rocBLAS kernel.
+// Checks, from 9 tokens on (up to 8 the stock path is the vector kernel): aligned = shifted for every value; a token column of
+// SGEMM has the same bits whatever the token count (against the product with 2048 tokens); the product with 2048 tokens against a
+// fused multiply-add chain on the CPU in the order of the rocBLAS kernel. The switch must take the aligned products from T_MIN
+// tokens on and no other: below it SGEMM is faster. The bench with the switch on and off shows from which token count the kernel
+// wins; run against a library without the lower bound (commit 5f3b5a7) it times the kernel for the small batches too.
 // The hash_aligned of a data set must be the same with and without the switch.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -25,6 +27,7 @@
 
 constexpr int K     = 2048;
 constexpr int T_MAX = 2048;
+constexpr int T_MIN = 128; // q35moe_pfmmn_min_tokens
 constexpr int N_W   = 3;
 
 static const char * const w_name[N_W] = { "blk.7.ffn_gate_inp.weight", "blk.7.ssm_beta.weight", "blk.7.ssm_alpha.weight" };
@@ -97,7 +100,7 @@ static void bench(ggml_backend_t hip, bool on) {
     for (ggml_tensor * t : w) {
         ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
     }
-    for (int n : { 188, 316, 508, 512, 828, 1020, 1024, 2048 }) {
+    for (int n : { 9, 16, 32, 64, 96, 112, 127, 128, 129, 160, 188, 256, 316, 508, 512, 828, 1020, 1024, 2048 }) {
         ggml_context * c = ggml_init({(4*n_w + 8)*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true});
         ggml_cgraph * g[2];
         ggml_gallocr_t ga[2];
@@ -123,8 +126,8 @@ static void bench(ggml_backend_t hip, bool on) {
             }
         }
         for (int v = 0; v < 2; ++v) { std::sort(ms[v].begin(), ms[v].end()); }
-        std::printf("bench tokens %4d: %d products, aligned x (%s) median %.2f ms (min %.2f, max %.2f), shifted x (SGEMM) median %.2f ms (min %.2f, max %.2f), %zu runs each\n",
-            n, n_w, on ? "kernel" : "SGEMM", ms[0][ms[0].size()/2], ms[0].front(), ms[0].back(), ms[1][ms[1].size()/2], ms[1].front(), ms[1].back(), ms[0].size());
+        std::printf("bench tokens %4d: %d products, aligned x (switch %s) median %.2f ms (min %.2f, max %.2f), shifted x (SGEMM) median %.2f ms (min %.2f, max %.2f), %zu runs each\n",
+            n, n_w, on ? "on" : "off", ms[0][ms[0].size()/2], ms[0].front(), ms[0].back(), ms[1][ms[1].size()/2], ms[1].front(), ms[1].back(), ms[0].size());
         ggml_gallocr_free(ga[0]);
         ggml_gallocr_free(ga[1]);
         ggml_free(c);
@@ -206,8 +209,8 @@ int main(int argc, char ** argv) {
             const long hit0 = n_hit;
             check(ggml_backend_graph_compute(hip, gf) == GGML_STATUS_SUCCESS, "compute");
             n_graphs++;
-            // the kernel takes the aligned products that the stock path gives to SGEMM
-            const long want = on && sgemm ? N_W : 0;
+            // the kernel takes the aligned products of T_MIN tokens and more
+            const long want = on && n >= T_MIN ? N_W : 0;
             if (n_hit - hit0 != want) {
                 std::printf("tokens %d: %ld kernel calls, expected %ld\n", n, n_hit - hit0, want);
                 check(false, "kernel call count");
