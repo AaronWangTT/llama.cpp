@@ -3656,6 +3656,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TIMEOUT"));
     add_opt(common_arg(
+        {"--http-keep-alive-timeout"}, "N",
+        string_format("seconds before the server closes an idle keep-alive HTTP connection; set it above the idle time of the client's connection pool (default: %d)", params.timeout_keep_alive),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("http-keep-alive-timeout must be at least 1");
+            }
+            params.timeout_keep_alive = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_HTTP_KEEP_ALIVE_TIMEOUT"));
+    add_opt(common_arg(
         {"--sse-ping-interval"}, "N",
         string_format("server SSE ping interval in seconds (-1 = disabled, default: %d)", params.sse_ping_interval),
         [](common_params & params, int value) {
