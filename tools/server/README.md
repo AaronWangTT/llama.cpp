@@ -2176,6 +2176,7 @@ We also offer additional options that are exclusive to presets (these aren't tre
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts. Only applies at startup: if the model list is reloaded later (for example after editing the preset file), a newly added model is listed but not loaded
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
 - `dedup-cache-models` (boolean): When the preset uses `hf-repo` pointing to a model that is already downloaded, hide the corresponding cached model entry from `GET /models` (the preset entry remains visible). Set it in the `[*]` section to apply to all presets.
+- `env` (string): Environment variables of the model instance, as `NAME=VALUE` pairs separated by spaces, for example `env = GPU_MAX_HW_QUEUES=2 OMP_NUM_THREADS=4`. A variable given here replaces the value the instance inherits from `llama-server`, for this model only. Like any other key, `env` in a model section replaces the whole `env` of the `[*]` section. A value cannot contain spaces, `;` or `#`. `LLAMA_SERVER_ROUTER_PORT` and `LLAMA_SERVER_CHILD_ROLE` are set by the router and cannot be set here. The log shows the names only, and `GET /models` does not show this key.
 
 ### Routing requests
 

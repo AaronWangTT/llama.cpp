@@ -419,8 +419,7 @@ void server_models_sched::measure_next() {
         // same args as the instance, --offline: never download
         std::vector<std::string> child_args = meta.args;
         child_args.push_back("--offline");
-        std::vector<std::string> child_env = models.base_env;
-        child_env.push_back(std::string(SERVER_ENV_ROUTER_PORT) + "=" + std::to_string(models.base_params.port));
+        std::vector<std::string> child_env = models.get_child_env(meta);
         child_env.push_back(std::string(SERVER_ENV_CHILD_ROLE) + "=" + server_role_type_to_str(SERVER_ROLE_MEASURE));
 
         auto proc = std::make_shared<server_subproc>();

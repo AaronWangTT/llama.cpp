@@ -258,6 +258,9 @@ private:
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
 
+    // environment of a child process of this model
+    std::vector<std::string> get_child_env(const server_model_meta & meta) const;
+
     // request queue (models_max) and memory accounting
     std::unique_ptr<server_models_sched> sched;
 

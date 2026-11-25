@@ -574,6 +574,51 @@ static void set_child_env(std::vector<std::string> & env, const std::string & ke
     env.push_back(key + "=" + value);
 }
 
+// the env preset key: NAME=VALUE pairs separated by spaces
+// errors name the variable but never show a value, it can be a secret
+static std::vector<std::pair<std::string, std::string>> parse_preset_env(const std::string & model, const common_preset & preset) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::string val;
+    if (!preset.get_option(COMMON_ARG_PRESET_ENV, val)) {
+        return out;
+    }
+    std::istringstream ss(val);
+    std::string item;
+    while (ss >> item) {
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            throw std::invalid_argument(string_format("model '%s': env entry %zu is not NAME=VALUE (a value cannot contain spaces)",
+                model.c_str(), out.size() + 1));
+        }
+        const std::string name = item.substr(0, eq);
+        const bool valid = !std::isdigit((unsigned char) name[0]) &&
+            std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; });
+        if (!valid) {
+            throw std::invalid_argument(string_format("model '%s': env name '%s' is not valid", model.c_str(), name.c_str()));
+        }
+        if (name == SERVER_ENV_ROUTER_PORT || name == SERVER_ENV_CHILD_ROLE) {
+            throw std::invalid_argument(string_format("model '%s': env cannot set %s, the router sets it", model.c_str(), name.c_str()));
+        }
+        out.emplace_back(name, item.substr(eq + 1));
+    }
+    return out;
+}
+
+// the router environment, the env preset key of the model on top, then the router port
+std::vector<std::string> server_models::get_child_env(const server_model_meta & meta) const {
+    std::vector<std::string> env = base_env; // copy
+    std::string names;
+    for (const auto & [name, value] : parse_preset_env(meta.name, meta.preset)) {
+        set_child_env(env, name, value);
+        names += " " + name;
+    }
+    if (!names.empty()) {
+        SRV_INF("model %s: env sets%s\n", meta.name.c_str(), names.c_str());
+    }
+    env.push_back(std::string(SERVER_ENV_ROUTER_PORT) + "=" + std::to_string(base_params.port));
+    return env;
+}
+
 // where the unfinished downloads are remembered, inside the model cache
 static std::string unfinished_downloads_path() {
     return hf_cache::get_cache_path() + "/unfinished-downloads.json";
@@ -792,6 +837,11 @@ void server_models::load_models() {
     // e.g. `llama-server --temp 0` is honoured by all child processes
     for (auto & [name, preset] : final_presets) {
         preset.merge(base_preset);
+    }
+
+    // a bad env key stops here, before any model changes
+    for (const auto & [name, preset] : final_presets) {
+        parse_preset_env(name, preset);
     }
 
     auto get_source = [&](const std::string & name) {
@@ -1251,8 +1301,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         inst.meta.update_args(ctx_preset, bin_path); // render args
 
         std::vector<std::string> child_args = inst.meta.args; // copy
-        std::vector<std::string> child_env  = base_env; // copy
-        child_env.push_back(std::string(SERVER_ENV_ROUTER_PORT) + "=" + std::to_string(base_params.port));
+        std::vector<std::string> child_env  = get_child_env(inst.meta);
 
         if (opts.role == SERVER_ROLE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
@@ -2189,6 +2238,7 @@ void server_models_routes::init_routes() {
                 preset_copy.unset_option("LLAMA_ARG_PORT");
                 preset_copy.unset_option("LLAMA_ARG_ALIAS");
                 preset_copy.unset_option("LLAMA_ARG_TAGS");
+                preset_copy.unset_option(COMMON_ARG_PRESET_ENV); // values can be secrets
                 status["preset"] = preset_copy.to_ini();
             }
             if (meta.is_failed()) {
