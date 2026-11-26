@@ -227,7 +227,9 @@ size_t ggml_kperf_describe(const char * arch, char * buf, size_t size) {
     std::string line;
     append(line, "arch %s, gfx1103 %s, on %d:", arch && arch[0] ? arch : "?", g_device_ok ? "yes" : "no", n_on);
     line += on;
-    append(line, "; off: %s; lossy on: %s; legacy variables ignored: %d",
-        off.empty() ? "none" : off.c_str(), lossy.empty() ? "none" : lossy.c_str(), s.n_ignored);
+    // the lists can be longer than the buffer of append()
+    line += "; off: " + (off.empty() ? std::string("none") : off);
+    line += "; lossy on: " + (lossy.empty() ? std::string("none") : lossy);
+    append(line, "; legacy variables ignored: %d", s.n_ignored);
     return (size_t) std::snprintf(buf, size, "%s", line.c_str());
 }
