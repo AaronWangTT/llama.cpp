@@ -1,15 +1,14 @@
 // Fixture for the one-token ops of the gated delta net blocks (ggml-qwen35-decode.h).
 // Each fused op on ROCm0 must match the stock ops it replaces bit for bit, also when the state row of the sequence
 // is not the cell that gets the new state. The CPU callbacks must stay close to the stock ops on CPU.
-// The switches select the shapes: the four GGML_QWEN35_* switches run qwen3.5-4b, the five GGML_Q35MOE_* switches run qwen3.6-35b.
-//   GGML_QWEN35_MVSHARE=1 GGML_QWEN35_PREP1=1 GGML_QWEN35_GDN1=1 GGML_QWEN35_POST1=1 qwen35-hip-decode ABS_LIBDIR
-//   GGML_Q35MOE_MVSHARE=1 GGML_Q35MOE_BA1=1 GGML_Q35MOE_PREP1=1 GGML_Q35MOE_GDN1=1 GGML_Q35MOE_POST1=1 qwen35-hip-decode ABS_LIBDIR
-// With GGML_Q35MOE_PREPN=1 GGML_Q35MOE_GDNN=1 GGML_Q35MOE_POSTN=1 in addition to the five GGML_Q35MOE_* switches: state caches with
-// rollback slots. One token (the one-token ops, as with GGML_Q35MOE_RS1) and 2 to 5 tokens (the ops for a few tokens) against the
-// stock graph that writes the snapshots, also when the state row is one of the rows that the batch writes.
-// With GGML_Q35MOE_CONVPF=1: the store of the conv state for many tokens, one copy per slot against the stock SET_ROWS store.
-// With GGML_Q35MOE_GDNPF=1: the delta net of a prompt batch, the node with the mark of the qwen35moe graph against the node without it,
-// and the one-slot stores of such a batch against slot 0 of the stores with rollback slots.
+// The kperf entries select the parts (all run by default):   qwen35-hip-decode ABS_LIBDIR
+//   qwen35.mvshare, prep1, gdn1, post1: the shapes of qwen3.5-4b. qwen35moe.mvshare, ba1, prep1, gdn1, post1: the shapes of qwen3.6-35b.
+//   qwen35moe.prepn, gdnn, postn in addition: state caches with rollback slots. One token (the one-token ops, as with qwen35moe.rs1) and
+//   2 to 5 tokens (the ops for a few tokens) against the stock graph that writes the snapshots, also when the state row is one of the rows that the batch writes.
+//   qwen35moe.convpf: the store of the conv state for many tokens, one copy per slot against the stock SET_ROWS store.
+//   qwen35moe.gdnpf: the delta net of a prompt batch, the node with the mark of the qwen35moe graph against the node without it,
+//   and the one-slot stores of such a batch against slot 0 of the stores with rollback slots.
+// GGML_KPERF_OFF=<entries or family> leaves out the parts of the entries it turns off, e.g. GGML_KPERF_OFF=qwen35 runs qwen3.6-35b only.
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-qwen35-convpf.h"
@@ -44,7 +43,7 @@ struct shape {
     const char * name;
     int          n;
     ggml_type    types[4]; // qkv, z, beta, alpha
-    bool         ba_f32;   // beta and alpha are F32: not in mvshare, GGML_Q35MOE_BA1 takes them
+    bool         ba_f32;   // beta and alpha are F32: not in mvshare, qwen35moe.ba1 takes them
 };
 static const shape SHAPE_QWEN35 = { "qwen35",      2560, { GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0 }, false };
 static const shape SHAPE_MOE    = { "qwen35moe",   2048, { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_F32,  GGML_TYPE_F32  }, true  };
@@ -704,7 +703,7 @@ static long run_store_keep(ggml_backend_t be) {
 }
 
 // The delta net of a prompt batch as build_recurrent_attn() builds it for one slot, with the state copy into the cache.
-// mark: the node gets the mark of the qwen35moe graph (GGML_Q35MOE_GDNPF). k_slots > 1: the stock node with rollback slots.
+// mark: the node gets the mark of the qwen35moe graph (qwen35moe.gdnpf). k_slots > 1: the stock node with rollback slots.
 // Returns the attention output followed by the whole state cache
 static std::vector<float> run_gdn_prompt(ggml_backend_t be, const states_keep & st, const bool mark, const int64_t k_slots, const int n_t, const int n_seqs,
         const int cell, const std::vector<float> & qk, const std::vector<float> & conv, const std::vector<float> & gb, const std::vector<float> & s0,
@@ -753,7 +752,7 @@ static std::vector<float> run_gdn_prompt(ggml_backend_t be, const states_keep & 
     return res;
 }
 
-// GGML_Q35MOE_GDNPF: the marked node against the stock node with one slot (all bits) and against the stock node with rollback slots
+// qwen35moe.gdnpf: the marked node against the stock node with one slot (all bits) and against the stock node with rollback slots
 // (attention output and slot 0), on the device; the stock node on the CPU is the reference for the size of the values
 static long run_gdnpf(ggml_backend_t hip, ggml_backend_t cpu, double & worst_cpu) {
     const states_keep st     = make_states_keep(hip);
