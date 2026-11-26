@@ -86,7 +86,7 @@ endif()
 add_compile_definitions(GGML_USE_HIP)
 
 # Compile the kperf paths (ggml-kperf.h) into native gfx1103 HIP builds only.
-# Keep this local to mmq.cu so the stock template instances remain unchanged.
+# GGML_INKLING_TAIL16_GFX1103 stays local to mmq.cu so the stock template instances remain unchanged.
 if (NOT CXX_IS_HIPCC AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1103")
     get_filename_component(INKLING_MMQ_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/mmq.cu" ABSOLUTE)
     set_property(SOURCE "${INKLING_MMQ_SOURCE}" APPEND PROPERTY COMPILE_DEFINITIONS GGML_INKLING_TAIL16_GFX1103)
