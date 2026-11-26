@@ -2238,7 +2238,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(pf_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, QWEN35_PF_NBYTES_SHARED));
                 same_split[id] = occupancy_ref == occupancy_pf ? 1 : -1;
                 if (same_split[id] < 0) {
-                    GGML_LOG_INFO("%s: %s is not used, occupancy %d instead of %d\n", __func__, ggml_kperf_name(pf_switch), occupancy_pf, occupancy_ref);
+                    GGML_LOG_WARN("%s: %s is not used, occupancy %d instead of %d\n", __func__, ggml_kperf_name(pf_switch), occupancy_pf, occupancy_ref);
                 }
             }
             if (same_split[id] > 0) {

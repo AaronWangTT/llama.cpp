@@ -669,7 +669,7 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ct
     const auto stock = [&](const int reason, const char * why) {
         if (candidate && !logged[reason]) {
             logged[reason] = true;
-            GGML_LOG_INFO("%s: qwen35moe.fagqa is not used: %s (sequences = %lld, K %s, V %s)\n",
+            GGML_LOG_WARN("%s: qwen35moe.fagqa is not used: %s (sequences = %lld, K %s, V %s)\n",
                 func, why, (long long) Q->ne[3], ggml_type_name(K->type), ggml_type_name(V->type));
         }
         return false;

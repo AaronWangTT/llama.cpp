@@ -43,7 +43,7 @@ static bool q35moe_qshare_node(const ggml_backend_cuda_context & ctx, const ggml
         static bool logged = false;
         if (!logged) {
             logged = true;
-            GGML_LOG_INFO("%s: qwen35moe.qshare is not used: the device is not gfx1103\n", __func__);
+            GGML_LOG_WARN("%s: qwen35moe.qshare is not used: the device is not gfx1103\n", __func__);
         }
         return false;
     }
@@ -59,7 +59,7 @@ static bool q35moe_qshare_not_captured(const ggml_backend_cuda_context & ctx) {
         static bool logged = false;
         if (!logged) {
             logged = true;
-            GGML_LOG_INFO("%s: qwen35moe.qshare is not used in a graph that runs as a captured graph\n", __func__);
+            GGML_LOG_WARN("%s: qwen35moe.qshare is not used in a graph that runs as a captured graph\n", __func__);
         }
         return false;
     }
@@ -88,7 +88,7 @@ static bool q35moe_qshare_experts_wanted(const ggml_backend_cuda_context & ctx, 
         static bool logged = false;
         if (!logged && !q35moe_exptail_enabled()) {
             logged = true;
-            GGML_LOG_INFO("%s: qwen35moe.qshare is not used for the routed experts: it needs qwen35moe.exptail\n", __func__);
+            GGML_LOG_WARN("%s: qwen35moe.qshare is not used for the routed experts: it needs qwen35moe.exptail\n", __func__);
         }
         return false;
     }

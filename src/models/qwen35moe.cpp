@@ -60,7 +60,7 @@ static void q35moe_log_off(const char * switches, const char * why) {
         }
     }
     seen.emplace_back(switches, why);
-    LLAMA_LOG_INFO("qwen35moe: no effect of %s: %s\n", switches, why);
+    LLAMA_LOG_WARN("qwen35moe: no effect of %s: %s\n", switches, why);
 }
 
 // qwen35moe.gdnpf: a ubatch of more than n_rs_seq + 1 tokens per sequence. The memory takes no rollback after it
@@ -1222,7 +1222,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cu
         if (first_why == nullptr) {
             LLAMA_LOG_INFO("qwen35moe: %s: %d of %d blocks take the op in a graph of %s\n", name, n_take, (int) n_layer, graph);
         } else {
-            LLAMA_LOG_INFO("qwen35moe: %s: %d of %d blocks take the op in a graph of %s, block %d does not: %s\n",
+            LLAMA_LOG_WARN("qwen35moe: %s: %d of %d blocks take the op in a graph of %s, block %d does not: %s\n",
                     name, n_take, (int) n_layer, graph, first, first_why);
         }
     };
@@ -1287,7 +1287,7 @@ static bool q35moe_mtpstore(const llama_cparams & cparams, const int64_t n_outpu
     const char * state = why != nullptr ? why : "used";
     if (logged.exchange(state) != state) {
         if (why != nullptr) {
-            LLAMA_LOG_INFO("qwen35moe: no effect of qwen35moe.mtpstore: %s\n", why);
+            LLAMA_LOG_WARN("qwen35moe: no effect of qwen35moe.mtpstore: %s\n", why);
         } else {
             LLAMA_LOG_INFO("qwen35moe: qwen35moe.mtpstore is used, MTP graphs without outputs only store K and V\n");
         }

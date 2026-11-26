@@ -44,7 +44,7 @@ static bool inkling_pfmm_stock_sgemm(const char * name) {
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: %s is not used, %s is set\n", __func__, name, var);
+        GGML_LOG_WARN("%s: %s is not used, %s is set\n", __func__, name, var);
     }
     return false;
 }
