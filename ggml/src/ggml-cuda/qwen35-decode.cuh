@@ -415,15 +415,12 @@ static void q35moe_prepn_launch_n(ggml_backend_cuda_context & ctx, ggml_tensor *
 }
 
 static void q35moe_prepn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
-    static_assert(ggml_q35moe_few_max == 8, "one kernel per token count");
+    static_assert(ggml_q35moe_few_max == 5, "one kernel per token count");
     switch (op->src[0]->ne[1]) {
         case 2: q35moe_prepn_launch_n<2>(ctx, op); break;
         case 3: q35moe_prepn_launch_n<3>(ctx, op); break;
         case 4: q35moe_prepn_launch_n<4>(ctx, op); break;
         case 5: q35moe_prepn_launch_n<5>(ctx, op); break;
-        case 6: q35moe_prepn_launch_n<6>(ctx, op); break;
-        case 7: q35moe_prepn_launch_n<7>(ctx, op); break;
-        case 8: q35moe_prepn_launch_n<8>(ctx, op); break;
         default: GGML_ABORT("fatal error");
     }
 }
