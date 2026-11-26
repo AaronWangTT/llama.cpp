@@ -203,11 +203,6 @@ public:
     // padded length of the longest cell list of the slices; 0 if kv_rows are not used (multiple streams)
     uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
-    // attend only to the cells of the last n positions up to each token (0 - all cells), see llama_set_attn_window()
-    // it acts like a standard SWA in the cell rows and in the mask only: the cells stay, the state io does not change
-    // ignored by a cache that has a SWA of its own
-    void set_attn_window(uint32_t n) { n_attn_window = n; }
-
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -321,17 +316,6 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
-
-    // see set_attn_window()
-    uint32_t n_attn_window = 0;
-
-    // the SWA of the cell rows and of the mask
-    uint32_t attn_n_swa() const {
-        return n_attn_window > 0 && swa_type == LLAMA_SWA_TYPE_NONE ? n_attn_window : n_swa;
-    }
-    llama_swa_type attn_swa_type() const {
-        return n_attn_window > 0 && swa_type == LLAMA_SWA_TYPE_NONE ? LLAMA_SWA_TYPE_STANDARD : swa_type;
-    }
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;

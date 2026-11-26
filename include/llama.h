@@ -1194,10 +1194,6 @@ extern "C" {
     // Supported: the MTP draft context of qwen35moe with a Q8_0 output head on a single ROCm device.
     LLAMA_API bool llama_set_logits_rows(struct llama_context * ctx, const llama_token * rows, int32_t n_rows);
 
-    // Attention of this context reads only the cells of the last n_window positions up to each token; 0 restores the whole sequence.
-    // The cache keeps all cells. Returns false if the context does not support it (only MTP draft contexts with a plain KV cache do).
-    LLAMA_API bool llama_set_attn_window(struct llama_context * ctx, uint32_t n_window);
-
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

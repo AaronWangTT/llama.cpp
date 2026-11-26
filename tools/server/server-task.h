@@ -740,9 +740,6 @@ struct server_prompt_cache_state {
     // llama_memory_seq_pos_min() of the saved state, tells if a prefix of it needs a context checkpoint
     llama_pos pos_min = -1;
 
-    // eviction order with --cache-evict-cost: the lowest value goes first
-    double prio = 0.0;
-
     // number of the save, keeps the order of the list when a prompt leaves it for a moment; 0 = goes first
     uint64_t seq = 0;
 
@@ -771,10 +768,6 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    // --cache-evict-cost
-    bool   evict_by_cost = false;
-    double prio_base     = 0.0; // priority of the last evicted prompt
-
     uint64_t seq_next = 1;
 
     size_t size() const;
@@ -783,13 +776,6 @@ struct server_prompt_cache {
 
     // true if a cached prompt starts with these tokens
     bool has(const server_tokens & tokens) const;
-
-    // the cached prompt that goes next when room is needed
-    // keep_last: not the newest one while there is another, it was saved a moment ago
-    std::list<server_prompt_cache_state>::iterator evict_next(bool keep_last = false);
-
-    // eviction priority of a cached prompt that is saved now
-    double prio_new(const server_prompt_cache_state & state) const;
 
     // put a prompt that was taken out of the list back at its place
     std::list<server_prompt_cache_state>::iterator put_back(std::list<server_prompt_cache_state> & taken);

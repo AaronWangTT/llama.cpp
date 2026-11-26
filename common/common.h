@@ -355,9 +355,6 @@ struct common_params_speculative_draft {
     std::string shortlist;
     int32_t     shortlist_n = 0;
 
-    // draft-mtp: the draft head attends only to the last attn_window positions (0 - the whole sequence)
-    int32_t attn_window = 0;
-
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -662,7 +659,6 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     bool    slot_select_reuse   = false; // take the idle slot or cached prompt with the longest reusable prefix, keep the states of other conversations
-    bool    cache_evict_cost    = false; // evict the cached prompt with the fewest tokens per byte instead of the oldest one
     bool    ctx_exceed_fail_one = false; // when the context is exceeded, fail only the request that does not fit
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset

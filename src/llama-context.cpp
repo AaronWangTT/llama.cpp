@@ -6,7 +6,6 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
-#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -1737,20 +1736,6 @@ bool llama_context::set_logits_rows(const llama_token * rows, int32_t n_rows) {
 
     static_assert(sizeof(llama_token) == sizeof(int32_t), "the row list is a tensor of token ids");
     ggml_backend_tensor_set(logits_rows, rows, 0, ggml_nbytes(logits_rows));
-
-    return true;
-}
-
-bool llama_context::set_attn_window(uint32_t n_window) {
-    // only the cache of an MTP head: its K and V do not depend on what the head attends to
-    auto * kv = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
-    if (kv == nullptr) {
-        return false;
-    }
-
-    synchronize();
-
-    kv->set_attn_window(n_window);
 
     return true;
 }
@@ -4850,10 +4835,6 @@ bool llama_set_ctx_state_src(llama_context * ctx, llama_context * ctx_src) {
 
 bool llama_set_logits_rows(llama_context * ctx, const llama_token * rows, int32_t n_rows) {
     return ctx->set_logits_rows(rows, n_rows);
-}
-
-bool llama_set_attn_window(llama_context * ctx, uint32_t n_window) {
-    return ctx->set_attn_window(n_window);
 }
 
 void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {

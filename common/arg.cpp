@@ -1763,14 +1763,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SELECT_REUSE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"--cache-evict-cost"},
-        {"--no-cache-evict-cost"},
-        "when the prompt cache is full, remove the prompt with the fewest tokens per byte instead of the oldest one; prompts saved after a removal rank higher, so a long prompt that waits is protected for a few removals only (default: disabled)",
-        [](common_params & params, bool value) {
-            params.cache_evict_cost = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_EVICT_COST").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"--ctx-exceed-fail-one"},
         {"--no-ctx-exceed-fail-one"},
         "when the context is exceeded, fail only the request that does not fit instead of all active requests (default: disabled)",
@@ -4389,17 +4381,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.shortlist_n = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SHORTLIST_N"));
-    add_opt(common_arg(
-        {"--spec-draft-attn-window"}, "N",
-        string_format("draft-mtp: the draft head attends only to the last N positions (default: %d, 0 = the whole sequence)",
-                      params.speculative.draft.attn_window),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            params.speculative.draft.attn_window = value;
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ATTN_WINDOW"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"

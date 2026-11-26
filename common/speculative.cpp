@@ -1764,14 +1764,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
 
         sl_init(this->params);
-
-        if (this->params.attn_window > 0) {
-            if (!is_mem_shared && llama_set_attn_window(ctx_dft, this->params.attn_window)) {
-                SPC_INF("draft attention window: the last %d positions\n", this->params.attn_window);
-            } else {
-                SPC_WRN("%s", "the draft context does not take an attention window\n");
-            }
-        }
     }
 
     ~common_speculative_impl_draft_mtp() override {

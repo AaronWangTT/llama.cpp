@@ -1754,30 +1754,6 @@ bool server_prompt_cache::has(const server_tokens & tokens) const {
     return false;
 }
 
-std::list<server_prompt_cache_state>::iterator server_prompt_cache::evict_next(bool keep_last) {
-    auto it_best = states.begin();
-
-    if (evict_by_cost) {
-        const auto it_end = keep_last && states.size() > 1 ? std::prev(states.end()) : states.end();
-
-        for (auto it = states.begin(); it != it_end; ++it) {
-            if (it->prio < it_best->prio) {
-                it_best = it;
-            }
-        }
-
-        // prompts that are saved from now on rank above the evicted one, so an old prompt does not stay forever
-        prio_base = it_best->prio;
-    }
-
-    return it_best;
-}
-
-double server_prompt_cache::prio_new(const server_prompt_cache_state & state) const {
-    // tokens per MiB: what a prompt costs to compute again against the room it takes
-    return prio_base + state.prompt.n_tokens() / (std::max<size_t>(1, state.size()) / (1024.0 * 1024.0));
-}
-
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::put_back(std::list<server_prompt_cache_state> & taken) {
     const auto it = taken.begin();
 
@@ -1792,8 +1768,7 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::put_back(std
 }
 
 void server_prompt_cache::demote(std::list<server_prompt_cache_state>::iterator it) {
-    it->prio = prio_base;
-    it->seq  = 0;
+    it->seq = 0;
 
     states.splice(states.begin(), states, it);
 }
@@ -1845,12 +1820,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            const auto it = evict_next();
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
 
-            SRV_WRN(" - making room for prompt cache entry, removing %s entry (size = %.3f MiB)\n",
-                    evict_by_cost ? "cheapest" : "oldest", it->size() / (1024.0 * 1024.0));
-
-            states.erase(it);
+            states.pop_front();
         }
     }
 
@@ -1881,8 +1854,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         },
     });
 
-    states.back().prio = prio_new(states.back());
-    states.back().seq  = seq_next++;
+    states.back().seq = seq_next++;
 
     return &states.back();
 }
@@ -1989,11 +1961,9 @@ bool server_prompt_cache::load_state(server_prompt_cache_state & state, bool kee
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            const auto it = evict_next(true);
+            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            SRV_WRN(" - cache size limit reached, removing %s entry (size = %.3f MiB)\n", evict_by_cost ? "cheapest" : "oldest", it->size() / (1024.0 * 1024.0));
-
-            states.erase(it);
+            states.pop_front();
         }
     }
 
@@ -2005,12 +1975,10 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            const auto it = evict_next(true);
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing %s entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, evict_by_cost ? "cheapest" : "oldest", it->size() / (1024.0 * 1024.0));
-
-            states.erase(it);
+            states.pop_front();
         }
     }
 
