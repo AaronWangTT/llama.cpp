@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml-kperf.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -20,7 +21,7 @@ int main(int argc,char **argv) {
     if (argc!=5) return 2; // prefix/lib, T, role, exclusive output file
     const int rows=atoi(argv[2]); const std::string role=argv[3];
     ck((rows==1||rows==256) && (role=="q"||role=="k"||role=="v"||role=="ffn"),"args");
-    const bool on=getenv("GGML_INKLING_CTRL_TAIL") && !strcmp(getenv("GGML_INKLING_CTRL_TAIL"),"1");
+    setenv("GGML_KPERF_TRACE","inkling.ctrl_tail",1); const bool on=ggml_kperf_on(GGML_KPERF_INKLING_CTRL_TAIL); // OFF arm: GGML_KPERF_OFF=inkling.ctrl_tail
     ck(!on||!getenv("GGML_CUDA_DISABLE_GRAPHS"),"positive arm needs replay");
     ggml_log_set(logger,nullptr); ggml_backend_load_all_from_path(argv[1]); auto *b=ggml_backend_init_by_name("ROCm0",nullptr); ck(b,"backend");
     std::ifstream maps("/proc/self/maps"); std::string l; bool hip=false;

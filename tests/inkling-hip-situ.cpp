@@ -1,6 +1,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml-kperf.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -74,7 +75,7 @@ int main(int argc,char **argv) {
 #ifdef HOST_LAYOUT
     (void)argc;(void)argv;
 #else
-    if(argc!=3)return 2;const char *v=getenv("GGML_INKLING_SITU");check(v && (!strcmp(v,"0")||!strcmp(v,"1")),"set arm");on=*v=='1';setenv("GGML_INKLING_SITU_TRACE","1",1);setenv("GGML_CUDA_DISABLE_GRAPHS","1",1);ggml_log_set(logger,nullptr);ggml_backend_load_all_from_path(argv[1]);be=ggml_backend_init_by_name("ROCm0",nullptr);check(be,"device");
+    if(argc!=3)return 2;setenv("GGML_KPERF_TRACE","inkling.situ",1);on=ggml_kperf_on(GGML_KPERF_INKLING_SITU);setenv("GGML_CUDA_DISABLE_GRAPHS","1",1);ggml_log_set(logger,nullptr);ggml_backend_load_all_from_path(argv[1]);be=ggml_backend_init_by_name("ROCm0",nullptr);check(be,"device");
     std::ifstream maps("/proc/self/maps");std::string l;bool hip=false;while(getline(maps,l)){auto j=l.find('/');if(j==l.npos)continue;auto p=l.substr(j),name=p.substr(p.rfind('/')+1);if(name.rfind("libggml",0)) continue;check(p.rfind(std::string(argv[1])+"/",0)==0,"foreign library");hip|=name.rfind("libggml-hip.so",0)==0;}check(hip,"HIP mapping");f=fopen(argv[2],"wbx");check(f,"new output");
 #endif
     for(int t:{1,128,256}) { one(be,f,t,NORMAL,on);one(be,f,t,UP_EARLY,on); }

@@ -813,7 +813,7 @@ int main(int argc, char ** argv) {
     const bool run_moe    = ggml_q35moe_mvshare_enabled() && ggml_q35moe_ba1_enabled() && ggml_q35moe_prep1_enabled() && ggml_q35moe_gdn1_enabled() &&
         ggml_q35moe_post1_enabled();
     const bool run_pf    = ggml_q35moe_gdnpf_enabled();
-    check(run_qwen35 || run_moe || run_pf, "set GGML_QWEN35_MVSHARE=1 GGML_QWEN35_PREP1=1 GGML_QWEN35_GDN1=1 GGML_QWEN35_POST1=1 or the five GGML_Q35MOE_* switches or GGML_Q35MOE_GDNPF=1");
+    check(run_qwen35 || run_moe || run_pf, "the qwen35 or qwen35moe entries are off (GGML_KPERF_OFF)");
     const bool run_keep  = run_moe && ggml_q35moe_prepn_enabled() && ggml_q35moe_gdnn_enabled() && ggml_q35moe_postn_enabled();
     const bool run_store = ggml_q35moe_convpf_enabled();
     ggml_backend_load_all_from_path(argv[1]);

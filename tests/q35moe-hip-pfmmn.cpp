@@ -1,9 +1,9 @@
-// Fixture for GGML_Q35MOE_PFMMN: the F32 products of qwen35moe (router with 256 rows, beta and alpha with 32 rows, k = 2048) for
-// every token count from 1 to 2048. Each product is computed twice in one graph: on a float4 aligned x (the kernel, when the switch
-// is set and the batch has 128 tokens or more) and on an x that starts one float into its buffer (always the stock path).
-//   q35moe-hip-pfmmn ABS_LIBDIR [rep1]                                            stock path only, prints the hashes (rep1: only the second data set)
-//   GGML_Q35MOE_PFMMN=1 GGML_Q35MOE_PFMMN_TRACE=1 q35moe-hip-pfmmn ABS_LIBDIR      kernel against SGEMM, counts the kernel calls
-//   [GGML_Q35MOE_PFMMN=1] q35moe-hip-pfmmn ABS_LIBDIR bench                       time of the 99 products of a prompt ubatch, aligned and shifted x in turn
+// Fixture for qwen35moe.pfmmn: the F32 products of qwen35moe (router with 256 rows, beta and alpha with 32 rows, k = 2048) for
+// every token count from 1 to 2048. Each product is computed twice in one graph: on a float4 aligned x (the kernel, when the entry
+// is on and the batch has 128 tokens or more) and on an x that starts one float into its buffer (always the stock path).
+//   GGML_KPERF_OFF=qwen35moe.pfmmn q35moe-hip-pfmmn ABS_LIBDIR [rep1]     stock path only, prints the hashes (rep1: only the second data set)
+//   q35moe-hip-pfmmn ABS_LIBDIR                                           kernel against SGEMM, counts the kernel calls
+//   [GGML_KPERF_OFF=qwen35moe.pfmmn] q35moe-hip-pfmmn ABS_LIBDIR bench    time of the 99 products of a prompt ubatch, aligned and shifted x in turn
 // Checks, from 9 tokens on (up to 8 the stock path is the vector kernel): aligned = shifted for every value; a token column of
 // SGEMM has the same bits whatever the token count (against the product with 2048 tokens); the product with 2048 tokens against a
 // fused multiply-add chain on the CPU in the order of the rocBLAS kernel. The switch must take the aligned products from T_MIN
@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-kperf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -140,10 +141,13 @@ int main(int argc, char ** argv) {
     const bool do_bench = argc == 3 && std::strcmp(argv[2], "bench") == 0;
     const bool rep1     = argc == 3 && std::strcmp(argv[2], "rep1") == 0;
     check(argc == 2 || do_bench || rep1, "usage: q35moe-hip-pfmmn ABS_LIBDIR [bench|rep1]");
-    const char * on_env = std::getenv("GGML_Q35MOE_PFMMN");
-    const bool   on     = on_env && std::strcmp(on_env, "1") == 0;
-    const char * tr_env = std::getenv("GGML_Q35MOE_PFMMN_TRACE");
-    check(do_bench || !on || (tr_env && std::strcmp(tr_env, "1") == 0), "set GGML_Q35MOE_PFMMN_TRACE=1 with the switch");
+    // qwen35moe.pfmm takes the products of 512 tokens before this kernel: off here, so that the call count of this kernel is exact
+    const char * off = std::getenv("GGML_KPERF_OFF");
+    setenv("GGML_KPERF_OFF", (std::string(off ? off : "") + " qwen35moe.pfmm").c_str(), 1);
+    if (!do_bench) {
+        setenv("GGML_KPERF_TRACE", "qwen35moe.pfmmn", 1);
+    }
+    const bool on = ggml_kperf_on(GGML_KPERF_QWEN35MOE_PFMMN);
     ggml_log_set(log_cb, nullptr);
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);

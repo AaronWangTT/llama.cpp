@@ -1,8 +1,9 @@
 // Fixture for the prefill float product kernel. The products of the three weight shapes of the model must match rocBLAS SGEMM
 // bit for bit, with F32 weights and with BF16 weights that hold the same values.
-//   GGML_INKLING_PFMM=1 inkling-hip-pfmm ABS_LIBDIR
+//   inkling-hip-pfmm ABS_LIBDIR
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-kperf.h"
 
 #include <cmath>
 #include <cstdint>
@@ -56,8 +57,7 @@ static std::vector<float> run(ggml_backend_t be, ggml_type wtype, bool shifted, 
 
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: inkling-hip-pfmm ABS_LIBDIR");
-    const char * on = std::getenv("GGML_INKLING_PFMM");
-    check(on && std::strcmp(on, "1") == 0, "set GGML_INKLING_PFMM=1");
+    check(ggml_kperf_on(GGML_KPERF_INKLING_PFMM), "inkling.pfmm is off (GGML_KPERF_OFF)");
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
     check(hip, "backend");

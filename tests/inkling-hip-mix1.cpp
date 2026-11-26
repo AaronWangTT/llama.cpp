@@ -1,5 +1,5 @@
 // Fixture for the single-token depth mix op. Compares the stock chain on ROCm0, the fused op on ROCm0 and the CPU reference.
-//   GGML_INKLING_MIX1=1 inkling-hip-mix1 ABS_LIBDIR    the fused op must equal the stock chain bit for bit
+//   inkling-hip-mix1 ABS_LIBDIR    the fused op must equal the stock chain bit for bit
 // It also reports the sum order of the last product of the stock chain.
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -122,7 +122,7 @@ static float product(int order, const float * x, const float * p, int ns) {
 
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: inkling-hip-mix1 ABS_LIBDIR");
-    check(ggml_inkling_mix1_enabled(), "set GGML_INKLING_MIX1=1");
+    check(ggml_inkling_mix1_enabled(), "inkling.mix1 is off (GGML_KPERF_OFF)");
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);

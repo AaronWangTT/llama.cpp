@@ -331,6 +331,10 @@ llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)
 llama_build_and_test(test-speculative-shortlist.cpp  LABEL behavior)
+if (NOT WIN32)
+    # the table reads the environment once per process: every case runs in a forked child
+    llama_build_and_test(test-kperf.cpp  LABEL behavior LINK ggml-base)
+endif()
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

@@ -1,19 +1,20 @@
-// Fixture for GGML_Q35MOE_QSHARE (ggml/src/ggml-cuda/q35moe-qshare.cuh): MMQ products of one graph run that read the same input
+// Fixture for qwen35moe.qshare (ggml/src/ggml-cuda/q35moe-qshare.cuh): MMQ products of one graph run that read the same input
 // share one Q8_1 copy of it, gate and up of the routed experts also their column lists.
 // Every case builds a graph in which products share an input, and a reference graph in which every product reads its own copy
 // of that input (other tensors, so nothing can be shared). Both must give the same bits.
 // Cases in which a kept copy would be stale: the input is changed in place between two products (scale, copy into it, scale of
 // the larger tensor it is a view of), the ids of the routed experts differ or are changed in place, the same graph runs again
 // with other data, the graphs get larger and smaller.
-// With GGML_Q35MOE_QSHARE_LOG=1 the backend logs per graph how many products took a kept copy. The fixture checks these counts:
-// the expected number with the switch on, none in the reference graphs and with the switch off.
+// With GGML_KPERF_TRACE=qwen35moe.qshare (the fixture sets it) the backend logs per graph how many products took a kept copy.
+// The fixture checks these counts: the expected number with the entry on, none in the reference graphs and with the entry off.
 // A second run of a graph is a captured graph, which takes no part; with GGML_CUDA_DISABLE_GRAPHS=1 it runs node by node and
 // must not see the copy that the first run kept.
-// "hash" covers all results; it must be the same with the switch on and off.
-//   GGML_Q35MOE_EXPTAIL=1 [GGML_Q35MOE_QSHARE=1 GGML_Q35MOE_QSHARE_LOG=1] [GGML_CUDA_DISABLE_GRAPHS=1] q35moe-hip-qshare ABS_LIBDIR [BACKEND]
+// "hash" covers all results; it must be the same with the entry on and off.
+//   [GGML_KPERF_OFF=qwen35moe.qshare] [GGML_CUDA_DISABLE_GRAPHS=1] q35moe-hip-qshare ABS_LIBDIR [BACKEND]
 // BACKEND (default ROCm0): with CPU the fixture only checks its own graphs against their references.
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-kperf.h"
 
 #include <cmath>
 #include <cstdint>
@@ -384,12 +385,11 @@ static const test_case cases[] = {
 
 int main(int argc, char ** argv) {
     check(argc == 2 || argc == 3, "usage: q35moe-hip-qshare ABS_LIBDIR [BACKEND]");
-    const auto is_set = [](const char * name) { const char * p = std::getenv(name); return p && std::strcmp(p, "1") == 0; };
+    setenv("GGML_KPERF_TRACE", "qwen35moe.qshare", 1);
     const bool on_cpu = argc == 3 && std::strcmp(argv[2], "CPU") == 0;
-    const bool on     = is_set("GGML_Q35MOE_QSHARE") && !on_cpu;
+    const bool on     = ggml_kperf_on(GGML_KPERF_QWEN35MOE_QSHARE) && !on_cpu;
     const bool graphs = std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr; // a second run of a graph is captured
-    check(on_cpu || is_set("GGML_Q35MOE_EXPTAIL"), "set GGML_Q35MOE_EXPTAIL=1");
-    check(!on || is_set("GGML_Q35MOE_QSHARE_LOG"), "set GGML_Q35MOE_QSHARE_LOG=1 with GGML_Q35MOE_QSHARE=1");
+    check(on_cpu || ggml_kperf_on(GGML_KPERF_QWEN35MOE_EXPTAIL), "qwen35moe.exptail must be on");
 
     ggml_log_set(log_callback, nullptr);
     ggml_backend_load_all_from_path(argv[1]);

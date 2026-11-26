@@ -2,7 +2,6 @@
 struct ggml_backend_cuda_context { int device=0; struct State { std::vector<int> concurrent_events; } ctx; State &stream_context(){return ctx;} };
 static constexpr int GGML_CUDA_CC_OFFSET_AMD=0;
 struct Info {struct {int cc=0x1103;} devices[1];}; static Info ggml_cuda_info(){return {};}
-static bool inkling_clip_switch(const char *){return true;}
 static ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int){return ggml_backend_cpu_buffer_type();}
 static bool inkling_maskepi_separate(const ggml_tensor * a,const ggml_tensor * b) {
     const uintptr_t p=reinterpret_cast<uintptr_t>(a->data), q=reinterpret_cast<uintptr_t>(b->data);
@@ -10,7 +9,7 @@ static bool inkling_maskepi_separate(const ggml_tensor * a,const ggml_tensor * b
 }
 
 static int inkling_situ_dispatch(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
-    static const bool enabled = inkling_clip_switch("GGML_INKLING_SITU");
+    static const bool enabled = true; // ggml_kperf_on(GGML_KPERF_INKLING_SITU) in the backend
     if (!enabled || i + 8 >= graph->n_nodes || !ctx.stream_context().concurrent_events.empty()) { return 0; }
     auto ** n = graph->nodes + i;
     auto * gate = n[0]->src[0];

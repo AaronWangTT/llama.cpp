@@ -1,6 +1,7 @@
 // Inject x immediately after the optional scale/conv; execute ONLY the graph slice
 // starting at SQR, with its original use counts. The prefix is structural metadata,
 // not a test of Q/R scaling or K convolution. Compare separate OFF/ON processes.
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -88,8 +89,8 @@ static void one(ggml_backend_t be, FILE * dump, int cols,int rows,Case test,floa
 }
 int main(int argc,char **argv) {
     if(argc!=3) return 2;
-    const char * a=getenv("GGML_INKLING_ROWCLIP"); insist(a && (!strcmp(a,"0")||!strcmp(a,"1")),"select OFF or ON"); bool on=*a=='1';
-    setenv("GGML_INKLING_ROWCLIP_TRACE","1",1); setenv("GGML_CUDA_DISABLE_GRAPHS","1",1);
+    // the OFF arm runs with GGML_KPERF_OFF=inkling.rowclip
+    setenv("GGML_KPERF_TRACE","inkling.rowclip",1); setenv("GGML_CUDA_DISABLE_GRAPHS","1",1); bool on=ggml_kperf_on(GGML_KPERF_INKLING_ROWCLIP);
     ggml_log_set(logger,nullptr); ggml_backend_load_all_from_path(argv[1]); auto be=ggml_backend_init_by_name("ROCm0",nullptr); insist(be,"no HIP");
     std::ifstream maps("/proc/self/maps"); std::string line; bool found=false;
     while(getline(maps,line)) if(line.find("libggml-hip.so")!=line.npos) { insist(line.find(std::string(argv[1])+"/libggml-hip.so")!=line.npos,"foreign mapping"); found=true; } insist(found,"missing mapping");

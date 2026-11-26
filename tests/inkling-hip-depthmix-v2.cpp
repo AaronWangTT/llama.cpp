@@ -5,6 +5,7 @@
 #include <rocprofiler-sdk-roctx/roctx.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>

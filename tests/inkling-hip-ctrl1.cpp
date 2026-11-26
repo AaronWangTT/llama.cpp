@@ -1,6 +1,6 @@
 // Fixture for the single-token loop controller op. The fused op on ROCm0 must match the stock chain on ROCm0 bit for bit.
 // BF16 weights that hold the same values must give the bits of the F32 weights, in the fused op and in the stock chain of any batch size.
-//   GGML_INKLING_CTRL1=1 [GGML_INKLING_CTRL_TAIL=1] inkling-hip-ctrl1 ABS_LIBDIR
+//   [GGML_KPERF_OFF=inkling.ctrl_tail] inkling-hip-ctrl1 ABS_LIBDIR
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-inkling-ctrl1.h"
@@ -100,7 +100,7 @@ static std::vector<float> run(ggml_backend_t be, bool fused, const inputs & in, 
 
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: inkling-hip-ctrl1 ABS_LIBDIR");
-    check(ggml_inkling_ctrl1_enabled(), "set GGML_INKLING_CTRL1=1");
+    check(ggml_inkling_ctrl1_enabled(), "inkling.ctrl1 is off (GGML_KPERF_OFF)");
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);

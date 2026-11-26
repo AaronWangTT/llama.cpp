@@ -21,7 +21,7 @@ def main():
          +span(cu/'inkling-gather-hip.cuh','static bool inkling_gather_layout','static bool inkling_gather_match')
          +span(mq,'static bool inkling_maskepi_match',begin)+separate
          +span(cu/'ggml-cuda.cu','static bool inkling_gather_disjoint','static bool inkling_gather_ready')
-         +span(cu/'inkling-rawmask.cuh','static bool inkling_rawmask_layout','// Called with exactly'))
+         +span(cu/'inkling-rawmask.cuh','static bool inkling_rawmask_layout','// True if the mask of the site i'))
     out.mkdir(exist_ok=False); (out/'rawmask-layout.inc').write_text(inc)
     shutil.copyfile(tree/'tests/inkling-hip-rawmask.cpp',out/'fixture.cpp')
     subprocess.run(['c++','-std=c++17','-O2','-I'+str(gg/'include'),'-I'+str(gg/'src'),'-I'+str(ro/'include'),str(out/'fixture.cpp'),'-L'+str(lib),'-L'+str(ro/'lib'),'-Wl,-rpath-link,'+str(lib),'-Wl,-rpath-link,'+str(ro/'lib'),'-lggml','-lggml-base','-lrocprofiler-sdk-roctx','-o',str(out/'fixture')],check=True)

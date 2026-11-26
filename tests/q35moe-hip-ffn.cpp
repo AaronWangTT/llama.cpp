@@ -5,7 +5,7 @@
 // topk_moe_cuda, the form that the op replays (without the scheduler the chain runs node by node and rounds differently).
 // Cases with a zero router, a zero shared expert, zero routed experts and a zero input show which part differs.
 // The CPU callback must stay close to the stock nodes on CPU.
-//   GGML_Q35MOE_FFN1=1 GGML_Q35MOE_FFNM=1 [GGML_Q35MOE_EXPONCE=1] q35moe-hip-ffn ABS_LIBDIR
+//   [GGML_KPERF_OFF=qwen35moe.exponce] q35moe-hip-ffn ABS_LIBDIR
 #include "ggml-backend.h"
 #include "ggml-q35moe-ffn.h"
 
@@ -199,7 +199,7 @@ static std::vector<float> run(const model & m, bool fused, const std::vector<flo
 
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: q35moe-hip-ffn ABS_LIBDIR");
-    check(ggml_q35moe_ffn1_enabled() && ggml_q35moe_ffnm_enabled(), "set GGML_Q35MOE_FFN1=1 and GGML_Q35MOE_FFNM=1");
+    check(ggml_q35moe_ffn1_enabled() && ggml_q35moe_ffnm_enabled(), "qwen35moe.ffn1 and qwen35moe.ffnm are off (GGML_KPERF_OFF)");
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);

@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml-kperf.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -125,9 +126,10 @@ g.size=0;g.n_leafs=0;g.leafs=nullptr;g.grads=nullptr;g.grad_accs=nullptr;
     ggml_backend_buffer_free(buf);ggml_free(c);
 }
 int main(int argc,char**argv){
-    if(argc==2 && !strcmp(argv[1],"--layout")){setenv("GGML_INKLING_MASKEPI","1",1);test(nullptr,nullptr,false,65,3,2,true);test(nullptr,nullptr,false,256,256,1,false);test(nullptr,nullptr,false,65,1,1,false);return 0;}
-    if(argc!=3)return 2;auto flag=[](const char*s){return getenv(s)&&!strcmp(getenv(s),"1");};bool on=flag("GGML_INKLING_RAWMASK");
-    ck(flag("GGML_INKLING_MASKEPI") && flag("GGML_INKLING_GATHER") && flag("GGML_INKLING_RAWMASK_TRACE"),"missing flags");
+    if(argc==2 && !strcmp(argv[1],"--layout")){test(nullptr,nullptr,false,65,3,2,true);test(nullptr,nullptr,false,256,256,1,false);test(nullptr,nullptr,false,65,1,1,false);return 0;}
+    // the OFF arm runs with GGML_KPERF_OFF=inkling.rawmask, MASKEPI and GATHER stay on
+    if(argc!=3)return 2;setenv("GGML_KPERF_TRACE","inkling.rawmask",1);bool on=ggml_kperf_on(GGML_KPERF_INKLING_RAWMASK);
+    ck(ggml_kperf_on(GGML_KPERF_INKLING_MASKEPI) && ggml_kperf_on(GGML_KPERF_INKLING_GATHER),"inkling.maskepi and inkling.gather must be on");
     ggml_log_set(logfn,nullptr);ggml_backend_load_all_from_path(argv[1]);auto*b=ggml_backend_init_by_name("ROCm0",nullptr);ck(b,"GPU");
     std::ifstream maps("/proc/self/maps");bool hip=false;std::string l;while(std::getline(maps,l)){auto i=l.find('/');if(i==l.npos)continue;auto p=l.substr(i),name=p.substr(p.rfind('/')+1);if(name.rfind("libggml",0))continue;
         ck(p.rfind(std::string(argv[1])+"/",0)==0,"mixed ggml mappings");hip|=!name.rfind("libggml-hip.so",0);}ck(hip,"HIP unmapped");
