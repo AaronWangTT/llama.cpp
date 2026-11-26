@@ -10,10 +10,8 @@
 // Kernel variants, bits of pf:
 // FAR: KV_rows_ptr is the buffer of inkling_pfmask_24. A set flag means that every mask value of the tile is the far bias of its (head, query).
 // FAST: same results with less work. The softmax weights go to shared memory as pairs, so the V loop needs no broadcast. One K.Q step goes over all accumulators before the next step. A warp with no new maximum in a tile does not reduce the maxima and does not rescale: the scale would be expf(0) == 1.
-// ZERO: skip work that adds +0 to the accumulators. The V loop skips a K row if its softmax weight is +0 in half precision for the 8 queries of the warp. A block skips a tile that none of its queries can see. This needs finite K, Q and V. Only the sign of a result that is zero can differ.
 #define INKLING_PF_FAR  1
 #define INKLING_PF_FAST 2
-#define INKLING_PF_ZERO 4
 
 // Prefill attention, head size 128, F16 K and V, one block per 64 queries of one head, mask with one bias per head.
 // For each query the float operations and their order are the same as in flash_attn_tile<128, 128, 64, 1, false>.
@@ -136,9 +134,6 @@ static __global__ void inkling_pfattn_tile(
 
     __syncthreads();
 
-    // flash_attn_combine_results adds the parts of all blocks to +0, so the sign of a zero part has no effect.
-    [[maybe_unused]] const bool zero_skip = gridDim.y != 1;
-
     // Main loop over KV cache:
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     int k_VKQ_0 = blockIdx.y*nbatch_fa;
@@ -170,11 +165,6 @@ static __global__ void inkling_pfattn_tile(
         }
     }
     for (; k_VKQ_0 <= k_VKQ_max - nbatch_fa; k_VKQ_0 += gridDim.y*nbatch_fa) {
-        if constexpr (pf & INKLING_PF_ZERO) {
-            // An empty tile leaves the maxima and the sums as they are (expf(0) == 1), and all its V rows have the weight +0.
-            if (zero_skip && tile_empty(k_VKQ_0)) { continue; }
-        }
-
         float KQ_max_new[cpw];
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
@@ -308,10 +298,7 @@ static __global__ void inkling_pfattn_tile(
         __syncthreads();
 
         // Calculate KQ softmax, write to shared KQ buffer, re-scale VKQ accumulators:
-        [[maybe_unused]] uint32_t rows_used[nrow];
         {
-            [[maybe_unused]] uint32_t nonzero[nrow] = {0};
-
             // One 16 byte store per K row and group of Q columns.
             constexpr int cpg = cpw/KQ_ne;
 #pragma unroll
@@ -336,9 +323,6 @@ static __global__ void inkling_pfattn_tile(
                         for (int l = 0; l < KQ_ne; ++l) {
                             tmp[i][KQ_ne*(jc - g*cpg) + l] = val_h;
                         }
-                        if constexpr (pf & INKLING_PF_ZERO) {
-                            nonzero[i] |= __half_as_ushort(val_h);
-                        }
                     }
                     KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
 
@@ -357,13 +341,6 @@ static __global__ void inkling_pfattn_tile(
                     ggml_cuda_memcpy_1<cpy_nb>(KQ + (threadIdx.y*nbatch_fa + i_KQ)*(cpw*KQ_ne) + g*cpw, tmp[i]);
                 }
             }
-            if constexpr (pf & INKLING_PF_ZERO) {
-                // One bit per K row of the tile, the same value in all threads of the warp.
-#pragma unroll
-                for (int i = 0; i < nrow; ++i) {
-                    rows_used[i] = zero_skip ? uint32_t(__ballot(nonzero[i] != 0)) : 0xFFFFFFFFu;
-                }
-            }
         }
 
         // VKQ = V @ KQ matrix multiplication:
@@ -376,10 +353,6 @@ static __global__ void inkling_pfattn_tile(
 
 #pragma unroll
             for (int k1 = 0; k1 < nbatch_V; ++k1) {
-                if constexpr (pf & INKLING_PF_ZERO) {
-                    // V*0 is a zero for a finite V, so the accumulators keep their values.
-                    if (((rows_used[(k0 + k1)/warp_size] >> ((k0 + k1) % warp_size)) & 1) == 0) { continue; }
-                }
                 __align__(16) half2 V_k[(DV/2)/warp_size];
                 __align__(16) half2 KQ_k[cpw];
 

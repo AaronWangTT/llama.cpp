@@ -65,13 +65,7 @@ fattn_kernel_t ggml_hip_inkling_ppskip_kernel() {
 }
 
 int ggml_hip_inkling_pfattn_mode(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const int ** aux) {
-    const bool fast = ggml_kperf_on(GGML_KPERF_INKLING_PFATTN);
-    const bool zero = ggml_kperf_on(GGML_KPERF_INKLING_PFZERO);
-    int pf = fast ? INKLING_PF_FAST : 0;
-    // The zero skip is compiled with the fast kernel only. Its empty tile test loads the mask in pairs.
-    if (fast && zero && (mask->nb[1] | mask->nb[2] | mask->nb[3] | uintptr_t(mask->data)) % 4 == 0) {
-        pf |= INKLING_PF_ZERO;
-    }
+    int pf = ggml_kperf_on(GGML_KPERF_INKLING_PFATTN) ? INKLING_PF_FAST : 0;
     if (ctx.inkling_pf_mask == mask) {
         pf |= INKLING_PF_FAR;
         *aux = ctx.inkling_pf_aux;
@@ -79,8 +73,8 @@ int ggml_hip_inkling_pfattn_mode(ggml_backend_cuda_context & ctx, const ggml_ten
     }
     const bool trace = ggml_kperf_trace(GGML_KPERF_INKLING_PFATTN);
     if (trace && pf) {
-        GGML_LOG_INFO("INKLING_PFATTN_HIT %s K=%lld fast=%d flags=%d zero=%d\n", mask->name, (long long) mask->ne[0],
-            int((pf & INKLING_PF_FAST) != 0), int((pf & INKLING_PF_FAR) != 0), int((pf & INKLING_PF_ZERO) != 0));
+        GGML_LOG_INFO("INKLING_PFATTN_HIT %s K=%lld fast=%d flags=%d\n", mask->name, (long long) mask->ne[0],
+            int((pf & INKLING_PF_FAST) != 0), int((pf & INKLING_PF_FAR) != 0));
     }
     return pf;
 }
@@ -91,8 +85,6 @@ fattn_kernel_t ggml_hip_inkling_pfattn_kernel(const bool skip_empty_prefix, cons
         INKLING_PFATTN_CASE(INKLING_PF_FAR)
         INKLING_PFATTN_CASE(INKLING_PF_FAST)
         INKLING_PFATTN_CASE(INKLING_PF_FAR | INKLING_PF_FAST)
-        INKLING_PFATTN_CASE(INKLING_PF_FAST | INKLING_PF_ZERO)
-        INKLING_PFATTN_CASE(INKLING_PF_FAR | INKLING_PF_FAST | INKLING_PF_ZERO)
         default: GGML_ABORT("no Inkling prefill kernel for this mode");
     }
 }

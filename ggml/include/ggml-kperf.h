@@ -40,7 +40,6 @@ extern "C" {
     X(INKLING_FAGQA,         "inkling.fagqa",         true,  "",                    "GGML_INKLING_FAGQA",           "decode attention, one block takes the 3 query heads of a KV head") \
     X(INKLING_PPSKIP,        "inkling.ppskip",        true,  "",                    "GGML_INKLING_PPSKIP",          "prefill attention skips fully masked prefix tiles (finite K/V)") \
     X(INKLING_PFATTN,        "inkling.pfattn",        true,  "",                    "GGML_INKLING_PFATTN",          "prefill attention kernel for 256 queries") \
-    X(INKLING_PFZERO,        "inkling.pfzero",        false, "inkling.pfattn",      "GGML_INKLING_PFZERO",          "prefill attention skips V rows of weight +0 (exact only for finite K/Q/V)") \
     X(INKLING_PFMM,          "inkling.pfmm",          true,  "",                    "GGML_INKLING_PFMM",            "prefill router/controller float products") \
     X(QWEN35_MVSHARE,        "qwen35.mvshare",        true,  "",                    "GGML_QWEN35_MVSHARE",          "one-token products that share one input") \
     X(QWEN35_PREP1,          "qwen35.prep1",          true,  "",                    "GGML_QWEN35_PREP1",            "one-token conv, SiLU, norm, beta and gate in one op") \
