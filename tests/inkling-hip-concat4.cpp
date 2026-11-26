@@ -1,12 +1,11 @@
 // Run CPU or one native ROCm backend directly, never a scheduler fallback.
-// In a private native Linux gfx1103 d82 build, add -DLLAMA_INKLING_CONCAT4_FIXTURE=ON.
-//   cmake --build "$B" --target ggml-base llama ggml-hip ggml-cpu test-inkling-concat4
+// Not a CMake target: compile it like the other inkling-hip-* fixtures against a native gfx1103 build (c++ -std=c++17, -lggml -lggml-base) into the dir $X.
 // CPU checks outside the GPU window use the separate CPU-only GGML_BACKEND_DL build.
 // On anchor run the HIP-linked binaries ONLY through the protected locked runner,
 // with llama-server and apport inactive, no unified memory, and its pinned ROCm env.
 // Set L to the real staged bin dir, LD_LIBRARY_PATH="$L:$ROCM_PATH/lib"; do not mix DSOs.
-//   GGML_KPERF_OFF=inkling.concat4 "$L/test-inkling-concat4" "$L" disabled
-//   for k in 0 1; do GGML_CUDA_DISABLE_GRAPHS=1 rocprofv3 --preload "$ROCM_PATH/lib/libamdhip64.so" --kernel-trace -f csv -d "$TRACE/$k" -- "$L/test-inkling-concat4" "$L" ROCm0 "$k" || exit 1; done
+//   GGML_KPERF_OFF=inkling.concat4 "$X/inkling-hip-concat4" "$L" disabled
+//   for k in 0 1; do GGML_CUDA_DISABLE_GRAPHS=1 rocprofv3 --preload "$ROCM_PATH/lib/libamdhip64.so" --kernel-trace -f csv -d "$TRACE/$k" -- "$X/inkling-hip-concat4" "$L" ROCm0 "$k" || exit 1; done
 //   python3 tests/inkling-hip-concat4-coverage.py --fixture "$TRACE/0" "$TRACE/1"
 // Same staged build, same tokens and batching, separate synchronized 4k model captures;
 // keep graph settings and inkling.depthmix_raw fixed; toggle only GGML_KPERF_OFF=inkling.concat4.
@@ -48,7 +47,7 @@ static void check_maps(const std::string & dir, const std::string & mode, bool l
 }
 
 int main(int argc, char ** argv) {
-    check(argc >= 3, "usage: test-inkling-concat4 ABS_LIBDIR CPU|disabled|ROCm0 [payload]");
+    check(argc >= 3, "usage: inkling-hip-concat4 ABS_LIBDIR CPU|disabled|ROCm0 [payload]");
     const std::string mode = argv[2];
     const bool hip = mode == "ROCm0";
     check(hip ? argc == 4 && (std::string(argv[3]) == "0" || std::string(argv[3]) == "1")
