@@ -47,7 +47,7 @@ struct state {
     bool        trace[GGML_KPERF_COUNT] = {};
     int         needs[GGML_KPERF_COUNT] = {};
     int         n_ignored = 0;
-    std::string off_list; // the value of GGML_KPERF_OFF, "none" when unset
+    std::string off_list; // the names in GGML_KPERF_OFF, "none" when it names none
 };
 
 state             g_state;
@@ -79,8 +79,9 @@ bool legacy_set_to_1(const char * var) {
     return p && std::strcmp(p, "1") == 0;
 }
 
-// marks the entries that a list names; aborts at an unknown name
-void parse_list(const char * var, const char * value, bool * mark) {
+// marks the entries that a list names; aborts at an unknown name. Returns the names of the list in lower case, separated by spaces
+std::string parse_list(const char * var, const char * value, bool * mark) {
+    std::string names_read;
     std::string list = value ? value : "";
     for (char & c : list) {
         if (c == ',') {
@@ -94,6 +95,7 @@ void parse_list(const char * var, const char * value, bool * mark) {
         if (token == "none") {
             continue;
         }
+        names_read += (names_read.empty() ? "" : " ") + token;
         bool known = false;
         for (int k = 0; k < GGML_KPERF_COUNT; ++k) {
             const entry & e = entries[k];
@@ -113,6 +115,7 @@ void parse_list(const char * var, const char * value, bool * mark) {
             GGML_ABORT("%s: unknown name '%s'; known: all none%s (or the legacy variable of an entry)", var, token.c_str(), names.c_str());
         }
     }
+    return names_read;
 }
 
 void init() {
@@ -124,9 +127,11 @@ void init() {
 
     const char * off   = std::getenv("GGML_KPERF_OFF");
     const char * trace = std::getenv("GGML_KPERF_TRACE");
-    parse_list("GGML_KPERF_OFF", off, s.off);
+    s.off_list = parse_list("GGML_KPERF_OFF", off, s.off);
     parse_list("GGML_KPERF_TRACE", trace, s.trace);
-    s.off_list = off && off[0] ? off : "none";
+    if (s.off_list.empty()) {
+        s.off_list = "none";
+    }
 
     for (int k = 0; k < GGML_KPERF_COUNT; ++k) {
         const entry & e = entries[k];
@@ -202,24 +207,25 @@ size_t ggml_kperf_describe(const char * arch, char * buf, size_t size) {
     std::string on, off, lossy;
     int n_on = 0;
     for (int k = 0; k < GGML_KPERF_COUNT; ++k) {
-        const std::string f = family_of(entries[k].name);
+        const char * name = entries[k].name;
+        // a lossy entry acts on any architecture that reaches its path, so it is listed for every family
+        if (s.on[k] && !entries[k].exact) {
+            lossy += std::string(lossy.empty() ? "" : " ") + name;
+        }
+        const std::string f = family_of(name);
         if (f != "hip" && f != family) {
             continue;
         }
-        const char * name = entries[k].name;
         if (s.on[k]) {
             n_on++;
             on += std::string(" ") + name;
-            if (!entries[k].exact) {
-                lossy += std::string(lossy.empty() ? "" : " ") + name;
-            }
         } else if (s.off[k]) {
             off += std::string(off.empty() ? "" : " ") + name;
         }
     }
 
     std::string line;
-    append(line, "arch %s, gfx1103 %s, on %d:", arch ? arch : "?", g_device_ok ? "yes" : "no", n_on);
+    append(line, "arch %s, gfx1103 %s, on %d:", arch && arch[0] ? arch : "?", g_device_ok ? "yes" : "no", n_on);
     line += on;
     append(line, "; off: %s; lossy on: %s; legacy variables ignored: %d",
         off.empty() ? "none" : off.c_str(), lossy.empty() ? "none" : lossy.c_str(), s.n_ignored);

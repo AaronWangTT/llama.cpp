@@ -90,7 +90,7 @@ GGML_API const char * ggml_kperf_name(enum ggml_kperf k);
 // the HIP backend calls this when it has a gfx1103 device with warp size 32 (for the log only)
 GGML_API void ggml_kperf_set_device_ok(bool ok);
 
-// one line for a model architecture: the entries of its family that are on, the ones turned off, the lossy ones on
+// one line for a model architecture: the entries of its family that are on, the ones turned off, and the lossy entries of any family that are on
 // returns the length as snprintf does
 GGML_API size_t ggml_kperf_describe(const char * arch, char * buf, size_t size);
 
