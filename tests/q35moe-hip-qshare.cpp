@@ -65,8 +65,8 @@ static int g_taken = 0;
 
 static void log_callback(ggml_log_level level, const char * text, void *) {
     int nodes = 0, kept = 0, taken = 0;
-    const char * p = std::strstr(text, "GGML_Q35MOE_QSHARE: graph of ");
-    if (p && std::sscanf(p, "GGML_Q35MOE_QSHARE: graph of %d nodes, %d products quantized their input, %d took", &nodes, &kept, &taken) == 3) {
+    const char * p = std::strstr(text, "qwen35moe.qshare: graph of ");
+    if (p && std::sscanf(p, "qwen35moe.qshare: graph of %d nodes, %d products quantized their input, %d took", &nodes, &kept, &taken) == 3) {
         g_kept  += kept;
         g_taken += taken;
         return;
