@@ -1030,12 +1030,11 @@ static __global__ void mul_mat_q(
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntj) {
 
-    // WMMA of RDNA3: the fused kernel is only taken with GGML_QWEN35_GLUFUSE=1, see ggml_cuda_mul_mat_q_fusion_matches.
-#if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_256B_AVAILABLE)
+#ifdef TURING_MMA_AVAILABLE
     constexpr bool fusion_available = true;
 #else
     constexpr bool fusion_available = false;
-#endif // defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_256B_AVAILABLE)
+#endif // TURING_MMA_AVAILABLE
 #ifdef BLACKWELL_MMA_AVAILABLE
     constexpr bool native_fp4_available = true;
 #else
