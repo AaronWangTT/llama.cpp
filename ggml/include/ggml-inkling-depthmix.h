@@ -3,7 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-kperf.h"
 
-// Private experiment: MUL_MAT words 0..3 remain standard precision and hint fields.
+// inkling.depthmix_raw and inkling.concat4: MUL_MAT words 0..3 remain standard precision and hint fields.
 constexpr int inkling_depthmix_slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
 
 // Optional, versioned constructor exported only by the native gfx1103 HIP module.

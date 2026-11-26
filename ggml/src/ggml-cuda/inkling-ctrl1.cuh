@@ -2,7 +2,7 @@
 #include "ggml-inkling-ctrl1.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private CTRL1 experiment for gfx1103 only"
+#error "inkling.ctrl1: compile this kernel for gfx1103 only"
 #endif
 
 // weights col2 and col2 + 1 of a row; a BF16 weight is the high half of the F32 value

@@ -2,7 +2,7 @@
 
 #include "ggml.h"
 
-// Private to the native gfx1103 experiment. One ggml-base owns the CPU callback
+// inkling.concat4, native gfx1103 HIP builds only. One ggml-base owns the CPU callback
 // and checks its identity, including when llama and the HIP plugin are separate DSOs.
 extern "C" {
 GGML_API bool ggml_inkling_concat4_enabled();

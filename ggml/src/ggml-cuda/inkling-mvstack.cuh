@@ -6,7 +6,7 @@
 #include <climits>
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private MVSTACK experiment for gfx1103 only"
+#error "inkling.mvstack: compile this kernel for gfx1103 only"
 #endif
 
 struct inkling_mvstack_args {

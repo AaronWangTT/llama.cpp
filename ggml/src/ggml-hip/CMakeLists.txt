@@ -85,7 +85,7 @@ endif()
 
 add_compile_definitions(GGML_USE_HIP)
 
-# Compile the opt-in short expert tile into native gfx1103 HIP builds only.
+# Compile the kperf paths (ggml-kperf.h) into native gfx1103 HIP builds only.
 # Keep this local to mmq.cu so the stock template instances remain unchanged.
 if (NOT CXX_IS_HIPCC AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1103")
     get_filename_component(INKLING_MMQ_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/mmq.cu" ABSOLUTE)

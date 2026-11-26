@@ -1,6 +1,6 @@
 // C++17/Linux ROCm; link -lggml -lggml-base -ldl. No private ggml headers.
 // fixture LIBDIR GGUF gate|down ROUTE_FILE OUT   (OUT must not exist)
-// Use separate processes with the selected build's LD_LIBRARY_PATH and dispatch settings.
+// Use separate processes with the selected build's LD_LIBRARY_PATH and GGML_KPERF_OFF arm (inkling.hotpair_gate / hotpair_down).
 // HOTPAIR_PASS=check (default): raw F32 [case][token][slot][output row], no header.
 //   Run independently against the pinned d82+layout parent, ORIGINAL, and candidate.
 //   Compare with check.py. No reference values are read by this program.

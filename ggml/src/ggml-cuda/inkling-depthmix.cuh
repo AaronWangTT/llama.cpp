@@ -3,7 +3,7 @@
 #include "ggml-inkling-concat4.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private MMVF experiment for gfx1103 only"
+#error "inkling.depthmix_raw: compile this kernel for gfx1103 only"
 #endif
 
 static __device__ __forceinline__ float depthmix_add(float a, float b) {

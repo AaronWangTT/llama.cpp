@@ -872,7 +872,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 // build_layer_attn_linear() for 2 to n_rs_seq + 1 tokens of one sequence in a context with rollback snapshots (a draft verification
-// batch) on a single ROCm device. qwen35moe.prepn, GDNN and POSTN give one part each to an op of ggml-qwen35-decode.h,
+// batch) on a single ROCm device. qwen35moe.prepn, gdnn and postn give one part each to an op of ggml-qwen35-decode.h,
 // a part whose op is off or not usable gets the stock nodes
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_few(
         llm_graph_input_rs * inp,

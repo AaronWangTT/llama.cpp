@@ -2,7 +2,7 @@
 #include "ggml-inkling-bias1.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private BIAS1 experiment for gfx1103 only"
+#error "inkling.bias1: compile this kernel for gfx1103 only"
 #endif
 
 // one thread per output element out[h, d]

@@ -2,7 +2,7 @@
 #include "ggml-inkling-concat4.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private CONCAT4 experiment for gfx1103 only"
+#error "inkling.concat4: compile this kernel for gfx1103 only"
 #endif
 
 static __global__ void inkling_concat4_pack(const float * a, const float * b, const float * c, const float * d, float * dst) {

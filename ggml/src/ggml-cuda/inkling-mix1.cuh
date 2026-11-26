@@ -2,7 +2,7 @@
 #include "ggml-inkling-mix1.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private MIX1 experiment for gfx1103 only"
+#error "inkling.mix1: compile this kernel for gfx1103 only"
 #endif
 
 // the bit-exact kernel copies the stock kernels of this row size

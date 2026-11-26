@@ -1274,7 +1274,7 @@ static fattn_kernel_t ggml_cuda_fattn_tile_get_kernel(const ggml_tensor * dst) {
 }
 
 #ifdef GGML_USE_HIP
-// Compile the experiment separately so LLVM does not reschedule the reference kernel.
+// inkling.ppskip: compiled in fattn-tile.cu so LLVM does not reschedule the reference kernel.
 fattn_kernel_t ggml_hip_inkling_ppskip_kernel();
 // Inkling prefill kernel (inkling-pfattn.cuh). The mode is 0 when the op stays on the generic kernel.
 // aux is set when the mask kernel left the tile flags of this mask in the context.

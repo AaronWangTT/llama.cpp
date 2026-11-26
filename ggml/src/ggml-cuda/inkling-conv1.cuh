@@ -2,7 +2,7 @@
 #include "ggml-inkling-conv1.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private CONV1 experiment for gfx1103 only"
+#error "inkling.conv1: compile this kernel for gfx1103 only"
 #endif
 
 // one thread per channel; the arithmetic follows ssm_conv_f32, op_add and scale_f32 step by step

@@ -1,4 +1,4 @@
-// Experimental HIP-only bit gather into final [K, Q, H, S] attention layout.
+// inkling.gather: HIP-only bit gather into final [K, Q, H, S] attention layout.
 // A CTA reads a [32 keys, 24 heads] tile by head and writes it by key.
 static __global__ void inkling_bias_gather_24(const uint32_t * __restrict__ table, const int32_t * __restrict__ ids,
                                              uint32_t * __restrict__ dst, int K, int E, int Q) {

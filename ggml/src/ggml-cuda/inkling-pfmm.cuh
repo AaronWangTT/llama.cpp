@@ -4,7 +4,7 @@
 #include <string>
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error "Compile this private PFMM experiment for gfx1103 only"
+#error "inkling.pfmm: compile this kernel for gfx1103 only"
 #endif
 
 // Float products of a full prefill batch: dst[i, j] = sum_k w[k, i]*x[k, j], for the router and the loop controller weights.

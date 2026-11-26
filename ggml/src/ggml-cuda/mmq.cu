@@ -167,7 +167,7 @@ static int ggml_cuda_mmq_get_J_best(
 
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
-#error This experiment must be built natively for gfx1103 only
+#error "the inkling tail16 and hotpair MMQ kernels: compile them for gfx1103 only"
 #endif
 
 // This direct, row-innermost kernel consumes the *original J32* mmid specs and packed Q8_1.
