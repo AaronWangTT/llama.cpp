@@ -5,12 +5,21 @@
 #include <stddef.h>
 
 // Private fast paths of the native gfx1103 HIP build: one table for all of them.
-// A bit-exact entry is on by default. A lossy entry is off by default, its legacy variable set to 1 turns it on (per model, in models.ini).
+// A bit-exact entry is on by default. A lossy entry is off by default, its variable set to 1 turns it on.
+// Set a lossy variable per model with the env key of the models.ini section, not for the whole service: a lossy entry acts on every architecture that reaches its path.
+//   qwen3.5-4b:                                                      env = GPU_MAX_HW_QUEUES=1 GGML_QWEN35_Q6K_MMQ=1
+//   Inkling-2-Mini with BF16 router and controller weights (D5-BF16):  env = GGML_INKLING_BF16_F32ACC=1
 // Each path keeps its own guards (device, architecture, shapes); an entry that is on only allows the path.
+// Upstream variables that also keep paths off: GGML_CUDA_DISABLE_FUSION, GGML_CUDA_DISABLE_GRAPHS, GGML_CUDA_GRAPH_OPT (here any value but 0, upstream only 1), GGML_CUDA_ENABLE_UNIFIED_MEMORY, GGML_CUDA_CUBLAS_COMPUTE_TYPE, ROCBLAS_USE_HIPBLASLT, ROCBLAS_TENSILE_LIBPATH, ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH, LLAMA_KV_ROWS_DISABLE.
+// Fork changes with no entry are always on, also with GGML_KPERF_OFF=all:
+//   mmvq.cu: the RDNA2 parameter table and the gfx11-generic launch width for gfx1103
+//   mmq.cu: the rolled k01 loop of the tail16 kernels (MMQ_PRIVATE_TAIL16_ROLL)
+//   fattn.cu: the kernel choice for K/V row lists on WMMA, the tile kernel for D256 with GQA 2 and for D512 (Gemma 4), WMMA from 7 columns for D <= 128 (gpt-oss)
 //   GGML_KPERF_OFF=all | none | <list>     turn entries off for A/B runs
 //   GGML_KPERF_TRACE=all | <list>          log lines when a path runs (for fixtures)
 // <list>: names, families or legacy variables, separated by ',' or spaces, case is ignored. An unknown name aborts.
 // Turning off an entry also turns off the entries that need it.
+// The old variables of the bit-exact entries are not read any more. A set one is counted in "legacy variables ignored" of the start-up lines: ggml_kperf (INFO, at the first use) and the server's "kperf: arch ..." line of each model instance.
 #ifdef __cplusplus
 extern "C" {
 #endif
