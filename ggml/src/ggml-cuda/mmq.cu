@@ -1,5 +1,5 @@
 #include "common.cuh"
-#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_GFX1103)
 #define MMQ_PRIVATE_TAIL16_ROLL
 #endif
 #include "mmq.cuh"
@@ -165,7 +165,7 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
-#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_GFX1103)
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1103__)
 #error "the inkling tail16 and hotpair MMQ kernels: compile them for gfx1103 only"
 #endif
@@ -334,7 +334,7 @@ void ggml_cuda_mul_mat_q(
     }
     GGML_ASSERT(J_best > 0);
 
-#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_GFX1103)
     // qwen35moe.exptail: the kernel of q35moe-exptail.cuh sets the width of the tile specs
     const bool q35moe_exptail = ids &&
         q35moe_exptail_wanted(src0, src1, ids, dst, cc, ggml_cuda_info().devices[id].warp_size, fallback, prec_src1, fusion != nullptr);
@@ -357,7 +357,7 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         char * src1_q8_1_d   = nullptr;
         bool   quantize_src1 = true;
-#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_GFX1103)
         // qwen35moe.qshare: the Q8_1 copy of src1 stays in the context, a product with the same src1 takes it
         if (q35moe_qshare_dense_wanted(ctx, src0, src1, dst, cc, fallback, prec_src1, fusion != nullptr)) {
             quantize_src1 = !q35moe_qshare_take(ctx, src1, nullptr, mmq_get_q8_1_ds_layout(src0->type), ne10_padded, 0, 0,
@@ -434,7 +434,7 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mm_id_tile_spec * tile_spec_d = nullptr;
     char *                      src1_q8_1_d = nullptr;
     bool                        make_src1   = true; // column lists and Q8_1 copy of src1
-#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_GFX1103)
     // qwen35moe.qshare: the column lists and the Q8_1 copy of src1 stay in the context, gate takes the ones of up
     if (q35moe_qshare_experts_wanted(ctx, src1, ids, dst, cc, q35moe_exptail, dedup_bcast)) {
         make_src1 = !q35moe_qshare_take(ctx, src1, ids, mmq_get_q8_1_ds_layout(src0->type), ne10_padded, ne02, J_best,
@@ -510,7 +510,7 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ntj, J_best, fusion_device};
 
-#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
+#if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_GFX1103)
     const bool tail16 = ggml_kperf_on(GGML_KPERF_INKLING_GATE_TAIL16);
     const bool trace = ggml_kperf_trace(GGML_KPERF_INKLING_GATE_TAIL16);
     const bool down_tail = ggml_kperf_on(GGML_KPERF_INKLING_DOWN_TAIL16);
