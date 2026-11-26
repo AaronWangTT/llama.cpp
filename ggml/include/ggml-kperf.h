@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-// X(id, name, exact, needs, legacy variable, description); an entry that needs another one comes after it
+// X(id, name, exact, needs, legacy variable, description); an entry that needs another one comes after it; an entry added after the table has no legacy variable ("")
 #define GGML_KPERF_LIST(X) \
     X(HIP_MOE_NCOLS32,       "hip.moe_ncols32",       true,  "",                    "GGML_CUDA_MMQ_MOE_NCOLS",      "MUL_MAT_ID on MMQ: tile width chosen for 32 columns per expert") \
     X(INKLING_GATHER,        "inkling.gather",        true,  "",                    "GGML_INKLING_GATHER",          "relative bias GET_ROWS/RESHAPE/PERMUTE/CONT in one kernel") \
@@ -77,6 +77,7 @@ extern "C" {
     X(QWEN35MOE_FAGQA,       "qwen35moe.fagqa",       true,  "",                    "GGML_Q35MOE_FAGQA",            "one-token attention, D256, 8 query heads per KV head") \
     X(QWEN35MOE_FAGQA4,      "qwen35moe.fagqa4",      true,  "",                    "GGML_Q35MOE_FAGQA4",           "attention of 2 to 4 tokens, D256, 8 query heads per KV head") \
     X(QWEN35MOE_PFATTN,      "qwen35moe.pfattn",      true,  "",                    "GGML_Q35MOE_PFATTN",           "prefill attention, D256, 8 query heads per KV head") \
+    X(QWEN35MOE_PFLOAD,      "qwen35moe.pfload",      true,  "qwen35moe.pfattn",    "",                             "inside pfattn: the row numbers of a warp in one 16-byte load, the second K half tile loaded before the QK products") \
     X(QWEN35MOE_EXPTAIL,     "qwen35moe.exptail",     true,  "",                    "GGML_Q35MOE_EXPTAIL",          "expert products on MMQ, 16 to 64 columns per tile") \
     X(QWEN35MOE_QSHARE,      "qwen35moe.qshare",      true,  "",                    "GGML_Q35MOE_QSHARE",           "MMQ products of one input share one Q8_1 copy") \
     X(QWEN35MOE_PFMMN,       "qwen35moe.pfmmn",       true,  "",                    "GGML_Q35MOE_PFMMN",            "F32 router/beta/alpha products of 128 to 2048 tokens") \

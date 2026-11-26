@@ -432,7 +432,7 @@ If your host reaches the internet through a corporate proxy, export `HTTP_PROXY`
 A HIP build for `gfx1103` only (`-DGPU_TARGETS=gfx1103 -DGGML_NATIVE=ON`) has private fast paths for some model architectures. They are listed in one table, `ggml/include/ggml-kperf.h`. The bit-exact paths are on by default. A lossy path is off by default; turn it on for one model with the `env` key of its preset section, for example `env = GGML_QWEN35_Q6K_MMQ=1`. Each model instance logs its state after `initializing`:
 
 ```
-srv  load_model: kperf: arch qwen35moe, gfx1103 yes, on 23: hip.moe_ncols32 qwen35moe.mvshare ...; off: none; lossy on: none; legacy variables ignored: 0
+srv  load_model: kperf: arch qwen35moe, gfx1103 yes, on 24: hip.moe_ncols32 qwen35moe.mvshare ...; off: none; lossy on: none; legacy variables ignored: 0
 ```
 
 - `GGML_KPERF_OFF=all | none | <list>`: turn paths off, for A/B runs. A list item is an entry name (`qwen35moe.fagqa4`), a family (`hip`, `inkling`, `qwen35`, `qwen35moe`) or the old variable of an entry; items are separated by `,` or spaces. `all` also turns off the lossy paths. An unknown name aborts the process.

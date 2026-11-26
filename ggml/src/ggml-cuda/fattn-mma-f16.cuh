@@ -2221,7 +2221,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
 #if defined(GGML_USE_HIP)
     // Prefill kernel for head size 256 on gfx1103 (qwen35-pfattn.cuh), same results.
-    // qwen35.pfattn: 4 query heads per KV head. qwen35moe.pfattn: 8 query heads per KV head.
+    // qwen35.pfattn: 4 query heads per KV head. qwen35moe.pfattn: 8 query heads per KV head, qwen35moe.pfload: its variant with the faster loads.
     if constexpr (DKQ == 256 && DV == 256 && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8))) {
         constexpr ggml_kperf pf_switch = ncols2 == 4 ? GGML_KPERF_QWEN35_PFATTN : GGML_KPERF_QWEN35MOE_PFATTN;
         if (ggml_kperf_on(pf_switch) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && logit_softcap == 0.0f && !use_sparse &&
@@ -2242,8 +2242,34 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             if (same_split[id] > 0) {
+                fattn_kernel_t run_kernel = pf_kernel;
+                if constexpr (ncols2 == 8) {
+                    // qwen35moe.pfload loads the 4 row numbers of a warp at once: the row list of each sequence must start 16-byte aligned
+                    const ggml_tensor * kv_rows = KQV->src[5];
+                    if (ggml_kperf_on(GGML_KPERF_QWEN35MOE_PFLOAD) && kv_rows != nullptr && uintptr_t(kv_rows->data) % 16 == 0 && kv_rows->ne[0] % 4 == 0) {
+                        const fattn_kernel_t load_kernel = qwen35_pfattn_f16<DKQ, DV, ncols1, ncols2, true>;
+                        static int load_same_split[GGML_CUDA_MAX_DEVICES] = {0};
+                        if (load_same_split[id] == 0) {
+                            int occupancy_ref  = 0;
+                            int occupancy_load = 0;
+                            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy_ref,  fattn_kernel, nthreads, nbytes_shared_total));
+                            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy_load, load_kernel,  nthreads, QWEN35_PF_NBYTES_SHARED));
+                            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(load_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, QWEN35_PF_NBYTES_SHARED));
+                            load_same_split[id] = occupancy_ref == occupancy_load ? 1 : -1;
+                            if (load_same_split[id] < 0) {
+                                GGML_LOG_WARN("%s: %s is not used, occupancy %d instead of %d\n", __func__, ggml_kperf_name(GGML_KPERF_QWEN35MOE_PFLOAD), occupancy_load, occupancy_ref);
+                            }
+                        }
+                        if (load_same_split[id] > 0) {
+                            run_kernel = load_kernel;
+                            if (ggml_kperf_trace(GGML_KPERF_QWEN35MOE_PFLOAD)) {
+                                GGML_LOG_INFO("Q35MOE_PFLOAD_HIT %s kv=%lld q=%lld s=%lld\n", KQV->name, (long long) kv_rows->ne[0], (long long) KQV->src[0]->ne[1], (long long) KQV->src[0]->ne[3]);
+                            }
+                        }
+                    }
+                }
                 launch_fattn<DV, ncols1, ncols2>
-                    (ctx, dst, pf_kernel, nwarps, QWEN35_PF_NBYTES_SHARED, nbatch_fa, true, true, true, false, warp_size_host, false);
+                    (ctx, dst, run_kernel, nwarps, QWEN35_PF_NBYTES_SHARED, nbatch_fa, true, true, true, false, warp_size_host, false);
                 return;
             }
         }
