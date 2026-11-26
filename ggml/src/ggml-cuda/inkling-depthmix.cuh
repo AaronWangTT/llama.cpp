@@ -36,14 +36,6 @@ static __device__ __forceinline__ void depthmix_store(Pack v, const float * scor
 }
 
 template<int S, int Q>
-static __global__ void inkling_depthmix_cont(const float * __restrict__ packed, const float * __restrict__ scores, float * __restrict__ out) {
-    constexpr int D = 2304;
-    const int d = blockIdx.x * 128 + threadIdx.x, t = blockIdx.y;
-    using pack = std::conditional_t<S == 2, float2, float4>;
-    depthmix_store<S,Q>(reinterpret_cast<const pack *>(packed)[t*D + d], scores, out, d, t);
-}
-
-template<int S, int Q>
 static __global__ void inkling_depthmix_raw_v2(const float * __restrict__ states, const float * __restrict__ scores, float * __restrict__ out) {
     constexpr int D = 2304;
     const int d = blockIdx.x * 128 + threadIdx.x, t = blockIdx.y;
@@ -110,22 +102,6 @@ static void depthmix_dispatch(int s, int q, Launch launch) {
     };
     if (s == 2) { for_s(std::integral_constant<int, 2>{}); }
     else        { for_s(std::integral_constant<int, 4>{}); }
-}
-
-static bool inkling_depthmix_try(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, ggml_tensor * y) {
-    constexpr int D = 2304, T = 256;
-    if (!depthmix_pattern(x, w, y)) { return false; }
-    const int s = x->ne[0], q = w->ne[1];
-    // Ancestors above are metadata only. Pass only live MUL_MAT operands to the device.
-    const size_t alignment = s == 2 ? alignof(float2) : alignof(float4);
-    if (!x->data || !w->data || !y->data || uintptr_t(x->data) % alignment || uintptr_t(w->data) % 4 || uintptr_t(y->data) % 4) {
-        return false;
-    }
-    depthmix_dispatch(s, q, [&](auto S, auto Q) {
-        inkling_depthmix_cont<S.value, Q.value><<<dim3(D/128, T), 128, 0, ctx.stream()>>>(
-                static_cast<const float *>(x->data), static_cast<const float *>(w->data), static_cast<float *>(y->data));
-    });
-    return true;
 }
 
 bool ggml_cuda_depthmix_reference_site(int device, const ggml_tensor * ref) {

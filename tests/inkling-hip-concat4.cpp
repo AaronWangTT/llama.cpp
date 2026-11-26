@@ -9,7 +9,7 @@
 //   for k in 0 1; do GGML_CUDA_DISABLE_GRAPHS=1 GGML_INKLING_CONCAT4=1 rocprofv3 --preload "$ROCM_PATH/lib/libamdhip64.so" --kernel-trace -f csv -d "$TRACE/$k" -- "$L/test-inkling-concat4" "$L" ROCm0 "$k" || exit 1; done
 //   python3 tests/inkling-hip-concat4-coverage.py --fixture "$TRACE/0" "$TRACE/1"
 // Same staged build, same tokens and batching, separate synchronized 4k model captures;
-// keep graph settings and GGML_INKLING_DEPTHMIX_CONT=1 fixed; toggle only CONCAT4=0/1.
+// keep graph settings and GGML_INKLING_DEPTHMIX_RAW_V2=1 fixed; toggle only CONCAT4=0/1.
 // Compare both binary PP logits against the d82 oracle, and pass the untraced full model gate.
 //   python3 tests/inkling-hip-concat4-coverage.py "$OFF_TRACE" "$ON_TRACE"
 #include "ggml-alloc.h"

@@ -30,7 +30,7 @@ def kernels(trace):
 
 def model(trace, on):
     # Reuse the unmodified d82 gate: exact S/Q counts, grids and range attribution.
-    runpy.run_path(str(Path(__file__).with_name("inkling-hip-depthmix-coverage.py")))["check"](trace, "model")
+    runpy.run_path(str(Path(__file__).with_name("inkling-hip-depthmix-coverage.py")))["check"](trace, "raw-model")
     ks = list(kernels(trace))
     marks = read(trace, "marker_api")
     answer = []

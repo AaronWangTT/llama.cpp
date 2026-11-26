@@ -5,7 +5,7 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
-#include "inkling-depthmix-cont.cuh"
+#include "inkling-depthmix.cuh"
 #endif
 
 static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t * x, const int col2) {
@@ -711,13 +711,6 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(src0->type != GGML_TYPE_F8_E4M3 || (uintptr_t) src0->data % alignof(uint16_t) == 0);
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-#if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
-    if (!ids && !fusion && dst->op_params[inkling_depthmix_slot] == inkling_depthmix_tag &&
-            cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
-            inkling_depthmix_enabled() && inkling_depthmix_try(ctx, src0, src1, dst)) {
-        return;
-    }
-#endif
     // the fused GLU path gets the GLU node as dst, which carries no matmul precision, so it accumulates in F32
     const enum ggml_prec prec = fast_fp16_available(cc) && !(fusion && fusion->gate) ? ggml_prec_get_acc(dst) : GGML_PREC_F32;
 

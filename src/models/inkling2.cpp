@@ -227,7 +227,7 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
         (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER) &&
         !cparams.ctx_other && !cparams.ctx_state_src && !cparams.pipeline_parallel && !cparams.moe_cache_size;
     const bool want_pack = ggml_inkling_concat4_enabled() && blocks.size() == 3 && !cparams.cb_eval && !cparams.optimizer_graph;
-    bool eligible = (inkling_depthmix_enabled() || want_pack || raw) && n_embd == 2304 && n_tokens == 256 &&
+    bool eligible = (want_pack || raw) && n_embd == 2304 && n_tokens == 256 &&
         (blocks.size() == 1 || blocks.size() == 3) && (query->ne[1] == 1 || query->ne[1] == 3 || query->ne[1] == 4) &&
         ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.n_seq_tokens == 256 && loras->empty();
     for (uint32_t il = 0; eligible && il < hparams.n_layer(); ++il) {
@@ -283,11 +283,6 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
                     }
                 }
             }
-        }
-        if (inkling_depthmix_enabled()) {
-            auto * mixed = original(ctx0);
-            mixed->op_params[inkling_depthmix_slot] = inkling_depthmix_tag;
-            return mixed;
         }
     }
 #endif
