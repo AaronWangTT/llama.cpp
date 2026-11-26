@@ -7,13 +7,9 @@
 
 // One-token attention with grouped query heads, F16 K and V.
 // One block takes one KV head and one KV split. It computes the G query heads of this KV head from one load of each K and V row.
-// For each head the float operations and their order are the same as in flash_attn_ext_vec<D, 1, F16, F16, false, true>.
-//
-// VSKIP == n > 0 does not load a V row if its stored weight is below 2^-n for all G heads, so the result is not the same.
-// The stored weight is relative to the running maximum plus FATTN_KQ_MAX_OFFSET: the best row has 2^-3, the cutoff is 2^-(n-3) of the best row.
-// The V rows of a tile are then loaded one tile later, together with the K rows of the next tile.
-// The weights have to be known first, and V rows that wait for the weights of their own tile are slow.
-template<int D, int G, int VSKIP = 0> // D == head size, G == query heads per KV head
+// For each head the float operations and their order are the same as in flash_attn_ext_vec<D, 1, F16, F16, false>.
+// A tile that no head can see is skipped, this does not change the accumulators.
+template<int D, int G> // D == head size, G == query heads per KV head
 __launch_bounds__(128, 1)
 static __global__ void inkling_fagqa_vec(
         const char * Q_ptr,
@@ -68,8 +64,6 @@ static __global__ void inkling_fagqa_vec(
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
     static_assert(nthreads_KQ*sizeof(half) == cpy_nb, "the mask of one thread group must be one copy");
-    static_assert(VSKIP >= 0 && VSKIP <= 14, "bad VSKIP");
-    static_assert(VSKIP == 0 || nthreads_KQ*V_cols_per_iter == WARP_SIZE, "VSKIP needs as many K steps as V steps");
 
     const int ic0 = blockIdx.x; // Index of the Q column to work on.
 
@@ -91,7 +85,6 @@ static __global__ void inkling_fagqa_vec(
     static_assert(G*nthreads <= ne_combine, "KQ too small");
     half2           VKQ[G][ne_VKQ_thread] = {{{0.0f, 0.0f}}};
     __shared__ half KQ[ne_combine];
-    __shared__ uint8_t V_row[nthreads]; // VSKIP: the V row to load for a row of the tile
 
     float KQ_max[G];
     float KQ_sum[G];
@@ -130,16 +123,6 @@ static __global__ void inkling_fagqa_vec(
     V     += split*nthreads * nb21;
     maskh += split*nthreads;
 
-    // VSKIP: the tile whose V rows are still to be added, its weights are in KQ. Before the first tile the weights are zero.
-    [[maybe_unused]] const char * V_pend = nullptr;
-    if constexpr (VSKIP > 0) {
-#pragma unroll
-        for (int j = 0; j < G; ++j) {
-            KQ[j*nthreads + tid] = __float2half(0.0f);
-        }
-        V_row[tid] = tid;
-    }
-
     // The V rows of one tile, with the weights in KQ.
     const auto add_V_tile = [&](const char * GGML_CUDA_RESTRICT V_tile) {
 #pragma unroll
@@ -151,12 +134,11 @@ static __global__ void inkling_fagqa_vec(
             for (int j = 0; j < G; ++j) {
                 KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
             }
-            const int k_V = VSKIP > 0 ? int(V_row[k]) : k;
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 // One load of the V row for all heads:
                 half2 tmp[V_rows_per_thread/2];
-                dequantize_V_f16<half, V_rows_per_thread>(V_tile + k_V*nb21, tmp, 2*i_VKQ_0 + (threadIdx.x % nthreads_V)*V_rows_per_thread);
+                dequantize_V_f16<half, V_rows_per_thread>(V_tile + k*nb21, tmp, 2*i_VKQ_0 + (threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -211,24 +193,6 @@ static __global__ void inkling_fagqa_vec(
                 ggml_cuda_memcpy_1<cpy_nb>(&K_reg[k_KQ_0/nthreads_KQ], K_h2 + k_KQ_0 + (threadIdx.x % nthreads_KQ)*cpy_ne);
             }
 
-            // VSKIP: one step of V rows of the tile before, loaded together with the K row.
-            // The first tile takes its own V rows with weights of zero.
-            [[maybe_unused]] half2 V_reg[ne_VKQ_thread];
-            [[maybe_unused]] half2 KQ_V[G];
-            if constexpr (VSKIP > 0) {
-                const char * V_step = V_pend ? V_pend : V;
-                const int k_step = threadIdx.y*WARP_SIZE + i_KQ_0*V_cols_per_iter + threadIdx.x / nthreads_V;
-#pragma unroll
-                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
-                    dequantize_V_f16<half, V_rows_per_thread>(V_step + int(V_row[k_step])*nb21, &V_reg[i_VKQ_0/nthreads_V],
-                        2*i_VKQ_0 + (threadIdx.x % nthreads_V)*V_rows_per_thread);
-                }
-#pragma unroll
-                for (int j = 0; j < G; ++j) {
-                    KQ_V[j] = __half2half2(KQ[j*nthreads + k_step]);
-                }
-            }
-
 #pragma unroll
             for (int j = 0; j < G; ++j) {
                 float sum = 0.0f;
@@ -244,16 +208,6 @@ static __global__ void inkling_fagqa_vec(
 
                 if (threadIdx.x % nthreads_KQ == uint32_t(i_KQ_0)) {
                     KQ_reg[j] = sum;
-                }
-            }
-
-            if constexpr (VSKIP > 0) {
-#pragma unroll
-                for (int i = 0; i < ne_VKQ_thread; ++i) {
-#pragma unroll
-                    for (int j = 0; j < G; ++j) {
-                        VKQ[j][i] += V_reg[i]*KQ_V[j];
-                    }
                 }
             }
         }
@@ -278,31 +232,7 @@ static __global__ void inkling_fagqa_vec(
             }
         }
 
-        if constexpr (VSKIP > 0) {
-            // A row with small weights for all heads gets weights of zero and takes the first V row of its warp instead.
-            // The weights are not negative, their order is the order of their bits.
-            constexpr uint16_t w_min = (15 - VSKIP) << 10;
-            bool live = false;
-#pragma unroll
-            for (int j = 0; j < G; ++j) {
-                live |= __half_as_ushort(KQ[j*nthreads + tid]) >= w_min;
-            }
-#pragma unroll
-            for (int j = 0; j < G; ++j) {
-                KQ[j*nthreads + tid] = live ? KQ[j*nthreads + tid] : __float2half(0.0f);
-            }
-            V_row[tid] = live ? tid : threadIdx.y*WARP_SIZE;
-            V_pend = V;
-        } else {
-            add_V_tile(V);
-        }
-    }
-
-    if constexpr (VSKIP > 0) {
-        // The V rows of the last tile.
-        if (V_pend) {
-            add_V_tile(V_pend);
-        }
+        add_V_tile(V);
     }
 
     // Only the first warp takes the sinks, as with one query column per block.

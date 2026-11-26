@@ -1,6 +1,5 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
-#include "inkling-headorder.cuh"
 #include "inkling-fagqa.cuh"
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
@@ -18,7 +17,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked_tile = false, bool head_order = false> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -107,19 +106,8 @@ static __global__ void flash_attn_ext_vec(
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
 
-    int sequence, head;
-    unsigned split;
-    if constexpr (head_order) {
-        static_assert(skip_masked_tile && D == 128 && ncols == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap);
-        const auto logical = inkling_headorder_coords(blockIdx.y, blockIdx.z, gridDim.y);
-        sequence = logical.sequence;
-        head     = logical.head;
-        split    = logical.split;
-    } else {
-        sequence = blockIdx.z / ne02;
-        head     = blockIdx.z - sequence*ne02;
-        split    = blockIdx.y;
-    }
+    const int sequence = blockIdx.z / ne02;
+    const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
@@ -284,22 +272,12 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += split*nthreads * nb11;
-    V     += split*nthreads * nb21;
-    maskh += split*nthreads;
-    for (int k_VKQ_0 = split*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+    K     += blockIdx.y*nthreads * nb11;
+    V     += blockIdx.y*nthreads * nb21;
+    maskh += blockIdx.y*nthreads;
+    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
-
-#if defined(GGML_USE_HIP)
-        if constexpr (skip_masked_tile) {
-            // Preserve the accumulator incl. its neutral empty state. Every thread must vote:
-            // the physical order may wrap and each head can have a different mask.
-            if (!__syncthreads_or(reinterpret_cast<const uint16_t *>(maskh)[tid] != uint16_t(0xfc00))) {
-                continue;
-            }
-        }
-#endif
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -424,7 +402,7 @@ static __global__ void flash_attn_ext_vec(
         ggml_cuda_syncwarp(); // Needed for KQ synchronization.
     }
 
-    if (sinks && split == 0) {
+    if (sinks && blockIdx.y == 0) {
         const float sink = ((const float *) sinks)[head];
 
 #pragma unroll
@@ -546,7 +524,7 @@ static __global__ void flash_attn_ext_vec(
                 if (gridDim.y == 1) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + split)*D + i0 + tid] = dst_val;
+                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
             }
         }
 
@@ -557,7 +535,7 @@ static __global__ void flash_attn_ext_vec(
     }
 
     if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
-        dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + split] = make_float2(KQ_max[tid], KQ_sum[tid]);
+        dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -584,66 +562,30 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const int nwarps   = nthreads / WARP_SIZE;
     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
     const fattn_kernel_t split_ref = fattn_kernel;
-    bool check_geometry = false;
     int kv_heads_per_block = 0; // 0: one block per query head
 #if defined(GGML_USE_HIP)
     if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap) {
         const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
-        static const bool enable = [] { const char * s = getenv("GGML_INKLING_MASKSKIP"); return s && strcmp(s, "1") == 0; }();
-        static const bool fagqa = enable && [] { const char * s = getenv("GGML_INKLING_FAGQA"); return s && strcmp(s, "1") == 0; }();
-        // The sliding-window KV of 2 slots has 2304 cells and the used part can go down to 1024. FAGQA takes these sizes too, the older paths keep their limit.
-        const int64_t n_kv_min = fagqa ? 1024 : 2048;
-        if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && dst->src[4] && !dst->src[5] && mask &&
+        static const bool fagqa = [] { const char * s = getenv("GGML_INKLING_FAGQA"); return s && strcmp(s, "1") == 0; }();
+        // The sliding-window KV of 2 slots has 2304 cells and the used part can go down to 1024.
+        if (fagqa && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && dst->src[4] && !dst->src[5] && mask &&
             q->ne[1] == 1 && q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 &&
             k->ne[0] == 128 && v->ne[0] == 128 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
-            k->ne[1] >= n_kv_min && k->ne[1] % 128 == 0 && v->ne[1] == k->ne[1] &&
+            k->ne[1] >= 1024 && k->ne[1] % 128 == 0 && v->ne[1] == k->ne[1] &&
             mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(uint16_t) &&
             strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
-            static const bool trace = getenv("GGML_INKLING_MASKSKIP_TRACE") != nullptr;
-            static const bool geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
-            check_geometry = geometry;
-            if (enable && trace) { GGML_LOG_INFO("INKLING_MASKSKIP_HIT %s kv=%lld\n", mask->name, (long long)k->ne[1]); }
-            if (enable) {
-                static const bool reorder = [] {
-                    const char * order = getenv("GGML_INKLING_HEADORDER");
-                    const char * epi   = getenv("GGML_INKLING_MASKEPI");
-                    return order && strcmp(order, "1") == 0 && epi && strcmp(epi, "1") == 0;
-                }();
-                if (fagqa) {
-                    // One block per KV head and split. It takes the 3 query heads from one load of each K and V row.
-                    fattn_kernel = inkling_fagqa_vec<D, 3>;
-                    // GGML_INKLING_VSKIP=8, 10 or 12 leaves out V rows with a weight below 2^-n. The result is not the same.
-                    static const int vskip = [] { const char * s = getenv("GGML_INKLING_VSKIP"); return s ? atoi(s) : 0; }();
-                    switch (vskip) {
-                        case  8: fattn_kernel = inkling_fagqa_vec<D, 3,  8>; break;
-                        case 10: fattn_kernel = inkling_fagqa_vec<D, 3, 10>; break;
-                        case 12: fattn_kernel = inkling_fagqa_vec<D, 3, 12>; break;
-                        default: break;
-                    }
-                    kv_heads_per_block = 1;
-                    static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
-                    if (trace_fagqa) {
-                        GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
-                    }
-                } else if (reorder) {
-                    fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, true>;
-                    static const bool trace_order = getenv("GGML_INKLING_HEADORDER_TRACE") != nullptr;
-                    if (trace_order) {
-                        GGML_LOG_INFO("INKLING_HEADORDER_HIT %s kv=%lld s=%lld\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
-                    }
-                } else {
-                    fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>;
-                }
+            // One block per KV head and split. It takes the 3 query heads from one load of each K and V row.
+            fattn_kernel = inkling_fagqa_vec<D, 3>;
+            kv_heads_per_block = 1;
+            static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
+            if (trace_fagqa) {
+                GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
             }
         }
     }
     if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0 && !use_logit_softcap) {
         const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
-        static const bool fagqa = [] {
-            const char * skip = getenv("GGML_INKLING_MASKSKIP");
-            const char * s    = getenv("GGML_INKLING_FAGQA");
-            return skip && strcmp(skip, "1") == 0 && s && strcmp(s, "1") == 0;
-        }();
+        static const bool fagqa = [] { const char * s = getenv("GGML_INKLING_FAGQA"); return s && strcmp(s, "1") == 0; }();
         // Same conditions as for F16 K and V.
         if (fagqa && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && dst->src[4] && !dst->src[5] && mask &&
             q->ne[1] == 1 && q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 &&
@@ -653,26 +595,19 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 24 && mask->nb[0] == sizeof(uint16_t) &&
             strncmp(mask->name, "kq_mask_rel_pos-", 16) == 0 && ggml_get_op_params_f32(dst, 1) == 0.0f) {
             // One block per 4 KV heads and split. It takes the 3 query heads of each KV head from one load of each K and V row.
-            // GGML_INKLING_FAGQA_Q8_HEADS=1 or 2 sets the KV heads per block for tests.
-            static const int heads = [] { const char * s = getenv("GGML_INKLING_FAGQA_Q8_HEADS"); return s ? atoi(s) : 4; }();
-            switch (heads) {
-                case 1:  fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 1>; kv_heads_per_block = 1; break;
-                case 2:  fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 2>; kv_heads_per_block = 2; break;
-                default: fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 4>; kv_heads_per_block = 4; break;
-            }
+            fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 4>;
+            kv_heads_per_block = 4;
             static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
             if (trace_fagqa) {
                 GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld q8\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
             }
-            static const bool geometry = getenv("GGML_INKLING_MASKSKIP_GEOMETRY") != nullptr;
-            check_geometry = geometry;
         }
     }
 #endif
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, split_ref, check_geometry, kv_heads_per_block);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, split_ref, kv_heads_per_block);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

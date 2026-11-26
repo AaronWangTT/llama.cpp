@@ -1330,7 +1330,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                     if (trace && skip) { GGML_LOG_INFO("INKLING_PPSKIP_SELECT %s K=%lld Q=%lld S=%lld enabled=%d\n",
                         mask->name, (long long) k->ne[1], (long long) Q->ne[1], (long long) Q->ne[3], int(enable)); }
                     launch_fattn<DV, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared,
-                        nbatch_fa, true, true, false, false, warp_size, false, reference, trace && skip, false, aux);
+                        nbatch_fa, true, true, false, false, warp_size, false, reference, 0, aux);
                     return;
                 }
             }
