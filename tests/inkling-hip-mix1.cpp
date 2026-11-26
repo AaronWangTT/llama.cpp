@@ -1,6 +1,5 @@
 // Fixture for the single-token depth mix op. Compares the stock chain on ROCm0, the fused op on ROCm0 and the CPU reference.
 //   GGML_INKLING_MIX1=1 inkling-hip-mix1 ABS_LIBDIR    the fused op must equal the stock chain bit for bit
-//   GGML_INKLING_MIX1=2 inkling-hip-mix1 ABS_LIBDIR    the fused op must be within a relative error of 2e-5
 // It also reports the sum order of the last product of the stock chain.
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -123,8 +122,7 @@ static float product(int order, const float * x, const float * p, int ns) {
 
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: inkling-hip-mix1 ABS_LIBDIR");
-    const int mode = ggml_inkling_mix1_mode();
-    check(mode != 0, "set GGML_INKLING_MIX1 to 1 or 2");
+    check(ggml_inkling_mix1_enabled(), "set GGML_INKLING_MIX1=1");
     ggml_backend_load_all_from_path(argv[1]);
     ggml_backend_t hip = ggml_backend_init_by_name("ROCm0", nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_name("CPU", nullptr);
@@ -199,8 +197,8 @@ int main(int argc, char ** argv) {
         }
     }
     check(worst < 2e-5, "relative error above 2e-5");
-    check(mode != 1 || total_diff == 0, "the exact op differs from the stock chain");
-    std::printf("PASS mode %d, %zu values differ, worst relative error %.2e\n", mode, total_diff, worst);
+    check(total_diff == 0, "the exact op differs from the stock chain");
+    std::printf("PASS %zu values differ, worst relative error %.2e\n", total_diff, worst);
     ggml_backend_free(hip);
     ggml_backend_free(cpu);
     return 0;
