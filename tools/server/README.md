@@ -171,6 +171,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--checkpoint-keep-system, --no-checkpoint-keep-system` | make a context checkpoint 64 tokens before the end of the prefix that a prompt shares with the state of a slot or of the prompt cache (the system prompt and the tools of an agent) when it is at least --checkpoint-min-step tokens past the restored part, and keep the first context checkpoint of a state when --ctx-checkpoints is reached, so that later prompts with that prefix start from it; it counts toward --ctx-checkpoints (default: disabled)<br/>(env: LLAMA_ARG_CHECKPOINT_KEEP_SYSTEM) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
+| `--split-batch-by-seq, --no-split-batch-by-seq` | decode the tokens of each slot in their own sub-batch instead of one mixed batch; for models whose single-sequence graphs are faster than a mixed batch (default: disabled)<br/>(env: LLAMA_ARG_SPLIT_BATCH_BY_SEQ) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--slot-select-reuse, --no-slot-select-reuse` | give a request the idle slot or cached prompt with the longest prefix that it can reuse, and save the state of another conversation before the request changes it; --slot-prompt-similarity is then the smallest share of the prompt that a state must make reusable; a request waits when its cached prompt has no room next to the active requests (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SELECT_REUSE) |
 | `--ctx-exceed-fail-one, --no-ctx-exceed-fail-one` | when the context is exceeded, fail only the request that does not fit instead of all active requests (default: disabled)<br/>(env: LLAMA_ARG_CTX_EXCEED_FAIL_ONE) |
@@ -425,6 +426,18 @@ Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-cre
 ### Running behind a proxy
 
 If your host reaches the internet through a corporate proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before running commands that download models (e.g. `export HTTPS_PROXY=http://proxy.example.com:8080`). Hosts listed in `NO_PROXY` and loopback addresses are contacted directly.
+
+### Fast paths of the native gfx1103 HIP build (kperf)
+
+A HIP build for `gfx1103` only (`-DGPU_TARGETS=gfx1103 -DGGML_NATIVE=ON`) has private fast paths for some model architectures. They are listed in one table, `ggml/include/ggml-kperf.h`. The bit-exact paths are on by default. A lossy path is off by default; turn it on for one model with the `env` key of its preset section, for example `env = GGML_QWEN35_Q6K_MMQ=1`. Each model instance logs its state after `initializing`:
+
+```
+srv  load_model: kperf: arch qwen35moe, gfx1103 yes, on 24: hip.moe_ncols32 qwen35moe.mvshare ...; off: none; lossy on: none; legacy variables ignored: 0
+```
+
+- `GGML_KPERF_OFF=all | none | <list>`: turn paths off, for A/B runs. A list item is an entry name (`qwen35moe.fagqa4`), a family (`hip`, `inkling`, `qwen35`, `qwen35moe`) or the old variable of an entry; items are separated by `,` or spaces. `all` also turns off the lossy paths. An unknown name aborts the process.
+- `GGML_KPERF_TRACE=all | <list>`: log a line when a path runs (the fixtures in `tests/` use it).
+- A service sets neither variable. The old variables of the bit-exact paths are not read; a set one is counted in "legacy variables ignored".
 
 ## Build
 
