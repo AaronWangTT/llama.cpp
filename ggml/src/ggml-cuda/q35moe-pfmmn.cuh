@@ -3,7 +3,7 @@
 // include after mmf.cuh and mmvf.cuh
 #include "inkling-pfmm.cuh"
 
-// qwen35moe.pfmmn: F32 products of a prefill ubatch of qwen35moe (router, beta, alpha) for q35moe_pfmmn_min_tokens to q35moe_pfmmn_max_tokens tokens, not only the 512 of qwen35moe.pfmm.
+// qwen35moe.pfmmn: F32 products of a prefill ubatch of qwen35moe (router, beta, alpha) for q35moe_pfmmn_min_tokens to q35moe_pfmmn_max_tokens tokens.
 // rocBLAS has one SGEMM kernel for gfx1103 (Tensile MT32x32x8, StaggerU 32 on the row tile), so a token column has the same bits whatever the token count.
 
 // the largest batch of the server; the fixture tests/q35moe-hip-pfmmn.cpp compares every token count up to it with SGEMM

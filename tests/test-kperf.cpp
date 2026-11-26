@@ -129,7 +129,7 @@ int main() {
               GGML_KPERF_QWEN35MOE_POST1, GGML_KPERF_QWEN35MOE_RS1, GGML_KPERF_QWEN35MOE_PREPN, GGML_KPERF_QWEN35MOE_GDNN, GGML_KPERF_QWEN35MOE_POSTN,
               GGML_KPERF_QWEN35MOE_CONVPF, GGML_KPERF_QWEN35MOE_CONVPFRS, GGML_KPERF_QWEN35MOE_GDNPF, GGML_KPERF_QWEN35MOE_FFN1, GGML_KPERF_QWEN35MOE_FFNM,
               GGML_KPERF_QWEN35MOE_EXPONCE, GGML_KPERF_QWEN35MOE_FAGQA, GGML_KPERF_QWEN35MOE_FAGQA4, GGML_KPERF_QWEN35MOE_PFATTN,
-              GGML_KPERF_QWEN35MOE_EXPTAIL, GGML_KPERF_QWEN35MOE_QSHARE, GGML_KPERF_QWEN35MOE_PFMM, GGML_KPERF_QWEN35MOE_PFMMN,
+              GGML_KPERF_QWEN35MOE_EXPTAIL, GGML_KPERF_QWEN35MOE_QSHARE, GGML_KPERF_QWEN35MOE_PFMMN,
               GGML_KPERF_QWEN35MOE_MTPSTORE },
             nullptr, nullptr },
         { "trace off entry", { { "GGML_KPERF_TRACE", "inkling.ppskip" }, { "GGML_KPERF_OFF", "inkling.ppskip" } }, false,
@@ -138,6 +138,7 @@ int main() {
         { "unknown name in OFF aborts", { { "GGML_KPERF_OFF", "qwen35moe.fagqa,qwen35moe.fagqa5" } }, true, {}, {}, {}, nullptr, nullptr },
         { "removed switch aborts", { { "GGML_KPERF_OFF", "GGML_INKLING_MASKSKIP" } }, true, {}, {}, {}, nullptr, nullptr },
         { "removed lossy switch aborts", { { "GGML_KPERF_OFF", "inkling.pfzero" } }, true, {}, {}, {}, nullptr, nullptr },
+        { "removed entry aborts", { { "GGML_KPERF_OFF", "qwen35moe.pfmm" } }, true, {}, {}, {}, nullptr, nullptr },
         { "unknown name in TRACE aborts", { { "GGML_KPERF_TRACE", "inkling.bogus" } }, true, {}, {}, {}, nullptr, nullptr },
     };
 

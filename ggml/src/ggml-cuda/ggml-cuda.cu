@@ -23,7 +23,6 @@
 #include "ggml-cuda/inkling-mvstack.cuh"
 #include "ggml-cuda/inkling-ctrl1.cuh"
 #include "ggml-cuda/inkling-pfmm.cuh"
-#include "ggml-cuda/q35moe-pfmm.cuh"
 #include "ggml-cuda/qwen35-convpf.cuh"
 #endif
 #include "ggml-cuda/conv-transpose-1d.cuh"
@@ -2519,10 +2518,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
     if (inkling_pfmm_supported(ctx.device, src0, src1, dst)) {
         inkling_pfmm_launch(ctx, src0, src1, dst);
-        return;
-    }
-    if (q35moe_pfmm_supported(ctx.device, src0, src1, dst)) {
-        q35moe_pfmm_launch(ctx, src0, src1, dst);
         return;
     }
     if (q35moe_pfmmn_supported(ctx.device, src0, src1, dst)) {

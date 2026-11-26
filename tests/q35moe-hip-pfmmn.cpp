@@ -141,9 +141,6 @@ int main(int argc, char ** argv) {
     const bool do_bench = argc == 3 && std::strcmp(argv[2], "bench") == 0;
     const bool rep1     = argc == 3 && std::strcmp(argv[2], "rep1") == 0;
     check(argc == 2 || do_bench || rep1, "usage: q35moe-hip-pfmmn ABS_LIBDIR [bench|rep1]");
-    // qwen35moe.pfmm takes the products of 512 tokens before this kernel: off here, so that the call count of this kernel is exact
-    const char * off = std::getenv("GGML_KPERF_OFF");
-    setenv("GGML_KPERF_OFF", (std::string(off ? off : "") + " qwen35moe.pfmm").c_str(), 1);
     if (!do_bench) {
         setenv("GGML_KPERF_TRACE", "qwen35moe.pfmmn", 1);
     }
