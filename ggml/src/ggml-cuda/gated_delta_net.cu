@@ -365,7 +365,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
     }
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_DEPTHMIX_GFX1103)
-    // GGML_Q35MOE_GDNPF=1: a prompt batch of the qwen35moe graph, same results
+    // qwen35moe.gdnpf: a prompt batch of the qwen35moe graph, same results
     if (q35moe_gdnpf_supported(ctx.device, dst)) {
         q35moe_gdnpf_launch(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs,
             sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, stream);

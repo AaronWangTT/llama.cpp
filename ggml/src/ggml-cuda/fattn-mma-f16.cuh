@@ -2221,11 +2221,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
 #if defined(GGML_USE_HIP)
     // Prefill kernel for head size 256 on gfx1103 (qwen35-pfattn.cuh), same results.
-    // GGML_QWEN35_PFATTN=1: 4 query heads per KV head. GGML_Q35MOE_PFATTN=1: 8 query heads per KV head.
+    // qwen35.pfattn: 4 query heads per KV head. qwen35moe.pfattn: 8 query heads per KV head.
     if constexpr (DKQ == 256 && DV == 256 && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8))) {
-        constexpr const char * pf_switch = ncols2 == 4 ? "GGML_QWEN35_PFATTN" : "GGML_Q35MOE_PFATTN";
-        static const bool pf_enabled = [] { const char * s = getenv(pf_switch); return s && strcmp(s, "1") == 0; }();
-        if (pf_enabled && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && logit_softcap == 0.0f && !use_sparse &&
+        constexpr ggml_kperf pf_switch = ncols2 == 4 ? GGML_KPERF_QWEN35_PFATTN : GGML_KPERF_QWEN35MOE_PFATTN;
+        if (ggml_kperf_on(pf_switch) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && logit_softcap == 0.0f && !use_sparse &&
                 KQV->src[3] != nullptr && KQV->src[4] == nullptr) {
             const fattn_kernel_t pf_kernel = qwen35_pfattn_f16<DKQ, DV, ncols1, ncols2>;
 
@@ -2239,7 +2238,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(pf_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, QWEN35_PF_NBYTES_SHARED));
                 same_split[id] = occupancy_ref == occupancy_pf ? 1 : -1;
                 if (same_split[id] < 0) {
-                    GGML_LOG_WARN("%s: %s is not used, occupancy %d instead of %d\n", __func__, pf_switch, occupancy_pf, occupancy_ref);
+                    GGML_LOG_INFO("%s: %s is not used, occupancy %d instead of %d\n", __func__, ggml_kperf_name(pf_switch), occupancy_pf, occupancy_ref);
                 }
             }
             if (same_split[id] > 0) {

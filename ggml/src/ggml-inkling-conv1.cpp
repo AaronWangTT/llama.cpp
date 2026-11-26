@@ -1,4 +1,5 @@
 #include "ggml-inkling-conv1.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cmath>
@@ -54,11 +55,7 @@ void conv1_cpu(ggml_tensor * dst, int ith, int, void *) {
 } // namespace
 
 bool ggml_inkling_conv1_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_INKLING_CONV1");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_CONV1);
 }
 
 ggml_tensor * ggml_inkling_try_conv1(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * past, ggml_tensor * weight, ggml_tensor * cell) {

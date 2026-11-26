@@ -1,4 +1,5 @@
 #include "ggml-inkling-ctrl1.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cmath>
@@ -79,11 +80,7 @@ void ctrl1_cpu(ggml_tensor * dst, int ith, int, void *) {
 } // namespace
 
 bool ggml_inkling_ctrl1_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_INKLING_CTRL1");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_CTRL1);
 }
 
 ggml_tensor * ggml_inkling_try_ctrl1(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * message,

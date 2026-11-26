@@ -1,4 +1,5 @@
 #include "ggml-qwen35-convpf.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cmath>
@@ -48,27 +49,15 @@ void convpf_cpu(ggml_tensor * dst, int ith, int, void *) {
 } // namespace
 
 bool ggml_qwen35_convpf_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_QWEN35_CONVPF");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35_CONVPF);
 }
 
 bool ggml_q35moe_convpf_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_Q35MOE_CONVPF");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_CONVPF);
 }
 
 bool ggml_q35moe_convpfrs_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_Q35MOE_CONVPFRS");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_CONVPFRS);
 }
 
 ggml_tensor * ggml_qwen35_try_convpf(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * past, ggml_tensor * weight) {

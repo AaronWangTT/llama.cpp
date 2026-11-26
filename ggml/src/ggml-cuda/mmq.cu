@@ -322,11 +322,12 @@ void ggml_cuda_mul_mat_q(
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
 
-            // Tuning aid: GGML_CUDA_MMQ_MOE_NCOLS overrides the column count the MoE tile width is chosen for (inert when unset).
-            static const int moe_ncols_env = getenv("GGML_CUDA_MMQ_MOE_NCOLS") ? atoi(getenv("GGML_CUDA_MMQ_MOE_NCOLS")) : 0;
-            if (moe_ncols_env > 0) {
-                ncols_opt = moe_ncols_env;
+#if defined(GGML_USE_HIP)
+            // hip.moe_ncols32: on gfx1103 the MoE tile width is chosen for 32 columns. The tiling does not change the K order of a value.
+            if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && ggml_kperf_on(GGML_KPERF_HIP_MOE_NCOLS32)) {
+                ncols_opt = 32;
             }
+#endif // defined(GGML_USE_HIP)
         }
 
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
@@ -334,7 +335,7 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(J_best > 0);
 
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
-    // GGML_Q35MOE_EXPTAIL=1: the kernel of q35moe-exptail.cuh sets the width of the tile specs
+    // qwen35moe.exptail: the kernel of q35moe-exptail.cuh sets the width of the tile specs
     const bool q35moe_exptail = ids &&
         q35moe_exptail_wanted(src0, src1, ids, dst, cc, ggml_cuda_info().devices[id].warp_size, fallback, prec_src1, fusion != nullptr);
     if (q35moe_exptail) {
@@ -357,7 +358,7 @@ void ggml_cuda_mul_mat_q(
         char * src1_q8_1_d   = nullptr;
         bool   quantize_src1 = true;
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
-        // GGML_Q35MOE_QSHARE=1: the Q8_1 copy of src1 stays in the context, a product with the same src1 takes it
+        // qwen35moe.qshare: the Q8_1 copy of src1 stays in the context, a product with the same src1 takes it
         if (q35moe_qshare_dense_wanted(ctx, src0, src1, dst, cc, fallback, prec_src1, fusion != nullptr)) {
             quantize_src1 = !q35moe_qshare_take(ctx, src1, nullptr, mmq_get_q8_1_ds_layout(src0->type), ne10_padded, 0, 0,
                 nbytes_src1_q8_1, 0, 0, 0, stream);
@@ -434,7 +435,7 @@ void ggml_cuda_mul_mat_q(
     char *                      src1_q8_1_d = nullptr;
     bool                        make_src1   = true; // column lists and Q8_1 copy of src1
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
-    // GGML_Q35MOE_QSHARE=1: the column lists and the Q8_1 copy of src1 stay in the context, gate takes the ones of up
+    // qwen35moe.qshare: the column lists and the Q8_1 copy of src1 stay in the context, gate takes the ones of up
     if (q35moe_qshare_experts_wanted(ctx, src1, ids, dst, cc, q35moe_exptail, dedup_bcast)) {
         make_src1 = !q35moe_qshare_take(ctx, src1, ids, mmq_get_q8_1_ds_layout(src0->type), ne10_padded, ne02, J_best,
             nbytes_src1_q8_1, ne_get_rows*sizeof(int32_t), (ne_get_rows + J_best-1)*sizeof(int32_t), ntj*sizeof(ggml_cuda_mm_id_tile_spec), stream);
@@ -510,9 +511,9 @@ void ggml_cuda_mul_mat_q(
         ntj, J_best, fusion_device};
 
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
-    static const bool tail16 = [] { const char * v = getenv("GGML_INKLING_GATE_TAIL16"); return v && !strcmp(v,"1"); }();
+    const bool tail16 = ggml_kperf_on(GGML_KPERF_INKLING_GATE_TAIL16);
     static const bool trace = [] { const char * v = getenv("GGML_INKLING_GATE_TAIL16_TRACE"); return v && !strcmp(v,"1"); }();
-    static const bool down_tail = [] { const char * v = getenv("GGML_INKLING_DOWN_TAIL16"); return v && !strcmp(v,"1"); }();
+    const bool down_tail = ggml_kperf_on(GGML_KPERF_INKLING_DOWN_TAIL16);
     static const bool down_trace = [] { const char * v = getenv("GGML_INKLING_DOWN_TAIL16_TRACE"); return v && !strcmp(v,"1"); }();
     const bool down = ne00 == 1152 && ne10 == 1152 && ne11 == 8;
     const bool active = down ? down_tail : tail16;
@@ -547,9 +548,7 @@ void ggml_cuda_mul_mat_q(
                         args.ncols_y == 2048 && args.nrows_dst == 2304 && args.stride_row_x == ne00/32 && args.stride_channel_x == 2304*(ne00/32));
             if (report) { GGML_LOG_INFO("%s phys=%d virt=%d on=%d J=32 ntj=192\n", down ? "INKLING_DOWN_TAIL16" : "INKLING_GATE_TAIL16", p, v, int(active)); }
             if (active) {
-                static const bool hot_gate = [] { const char * e=getenv("GGML_INKLING_HOTPAIR_GATE"); return e && !strcmp(e,"1"); }();
-                static const bool hot_down = [] { const char * e=getenv("GGML_INKLING_HOTPAIR_DOWN"); return e && !strcmp(e,"1"); }();
-                if (down ? hot_down : hot_gate) {
+                if (ggml_kperf_on(down ? GGML_KPERF_INKLING_HOTPAIR_DOWN : GGML_KPERF_INKLING_HOTPAIR_GATE)) {
                     inkling_hotpair_j32<<<dim3(args.nrows_x/c.I, args.ntj),dim3(32,4),bytes,stream>>>(
                         args.x, args.y, args.ids_dst, args.tile_spec, args.dst, args.stride_row_x, args.stride_channel_x,
                         args.ncols_y, args.nrows_dst, args.nrows_x, args.ncols_x/ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk);
@@ -661,10 +660,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (amd_wmma_available(cc)) {
-        // GGML_QWEN35_Q6K_MMQ=1: Q6_K takes MMQ at any batch size on gfx1103 (other numbers than dequantization + hipBLAS).
+        // qwen35.q6k_mmq (lossy, on with GGML_QWEN35_Q6K_MMQ=1): Q6_K takes MMQ at any batch size on gfx1103 (other numbers than dequantization + hipBLAS).
         if (type == GGML_TYPE_Q6_K && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103) {
-            static const bool q6k_mmq = [] { const char * s = getenv("GGML_QWEN35_Q6K_MMQ"); return s && strcmp(s, "1") == 0; }();
-            if (q6k_mmq) {
+            if (ggml_kperf_on(GGML_KPERF_QWEN35_Q6K_MMQ)) {
                 return true;
             }
         }

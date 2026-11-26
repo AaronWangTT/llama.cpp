@@ -566,7 +566,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
 #if defined(GGML_USE_HIP)
     if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap) {
         const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
-        static const bool fagqa = [] { const char * s = getenv("GGML_INKLING_FAGQA"); return s && strcmp(s, "1") == 0; }();
+        const bool fagqa = ggml_kperf_on(GGML_KPERF_INKLING_FAGQA);
         // The sliding-window KV of 2 slots has 2304 cells and the used part can go down to 1024.
         if (fagqa && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && dst->src[4] && !dst->src[5] && mask &&
             q->ne[1] == 1 && q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 &&
@@ -585,7 +585,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     }
     if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0 && !use_logit_softcap) {
         const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
-        static const bool fagqa = [] { const char * s = getenv("GGML_INKLING_FAGQA"); return s && strcmp(s, "1") == 0; }();
+        const bool fagqa = ggml_kperf_on(GGML_KPERF_INKLING_FAGQA);
         // Same conditions as for F16 K and V.
         if (fagqa && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && dst->src[4] && !dst->src[5] && mask &&
             q->ne[1] == 1 && q->ne[2] == 24 && k->ne[2] == 8 && v->ne[2] == 8 &&

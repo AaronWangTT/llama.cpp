@@ -31,7 +31,7 @@ static __global__ void inkling_situ_one(const float * packed, float * dst,
 }
 
 static int inkling_situ_dispatch(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool launch) {
-    static const bool enabled = inkling_clip_switch("GGML_INKLING_SITU");
+    static const bool enabled = ggml_kperf_on(GGML_KPERF_INKLING_SITU);
     if (!enabled || i + 8 >= graph->n_nodes || (launch && !ctx.stream_context().concurrent_events.empty())) { return 0; }
     auto ** n = graph->nodes + i;
     auto * gate = n[0]->src[0];

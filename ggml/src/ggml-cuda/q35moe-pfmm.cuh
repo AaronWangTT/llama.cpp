@@ -2,13 +2,12 @@
 
 #include "inkling-pfmm.cuh"
 
-// GGML_Q35MOE_PFMM=1: F32 products of a full prefill ubatch of qwen35moe (router, beta, alpha) with the kernel of inkling-pfmm.cuh.
+// qwen35moe.pfmm: F32 products of a full prefill ubatch of qwen35moe (router, beta, alpha) with the kernel of inkling-pfmm.cuh.
 // rocBLAS takes the same Tensile kernel for these sizes (MT32x32x8, StaggerU 32, stride 256 B), so the results have the same bits.
 constexpr int q35moe_pfmm_n_tokens = 512;
 
 static bool q35moe_pfmm_enabled() {
-    static const bool enabled = [] { const char * p = getenv("GGML_Q35MOE_PFMM"); return p && strcmp(p, "1") == 0; }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_PFMM);
 }
 
 // the F32 weights of the architecture, [2048, rows]: router with 256 rows, beta and alpha with 32 rows
@@ -38,7 +37,7 @@ static bool q35moe_pfmm_supported(int device, const ggml_tensor * w, const ggml_
             return false;
         }
     }
-    return inkling_pfmm_stock_sgemm("GGML_Q35MOE_PFMM");
+    return inkling_pfmm_stock_sgemm("qwen35moe.pfmm");
 }
 
 static void q35moe_pfmm_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {

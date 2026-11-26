@@ -7,7 +7,7 @@
 #error "Compile this private kernel for gfx1103 only"
 #endif
 
-// GGML_Q35MOE_GDNPF=1: gated delta net of a prompt batch of qwen35moe (heads of 128, scalar gate, one state slot).
+// qwen35moe.gdnpf: gated delta net of a prompt batch of qwen35moe (heads of 128, scalar gate, one state slot).
 // The kernel is gated_delta_net_cuda<128, false, true, 4>, statement by statement, so the results have the same bits.
 // That instance stores the state in the token loop. It loads the values of a token before it needs them, the instance
 // without snapshots waits for two loads in the middle of a token. The lane exchange of the two sums is a DPP move here.
@@ -157,7 +157,7 @@ static void q35moe_gdnpf_launch(
     static bool logged_use = false;
     if (!logged_use) {
         logged_use = true;
-        GGML_LOG_INFO("%s: GGML_Q35MOE_GDNPF is used, heads = %lld, tokens = %lld, sequences = %lld\n", __func__,
+        GGML_LOG_INFO("%s: qwen35moe.gdnpf is used, heads = %lld, tokens = %lld, sequences = %lld\n", __func__,
             (long long) H, (long long) n_tokens, (long long) n_seqs);
     }
 

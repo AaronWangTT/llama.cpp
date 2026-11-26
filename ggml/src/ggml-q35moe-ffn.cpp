@@ -1,4 +1,5 @@
 #include "ggml-q35moe-ffn.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cmath>
@@ -13,11 +14,6 @@ constexpr int n_expert = ggml_q35moe_n_expert;
 constexpr int n_used   = ggml_q35moe_n_used;
 
 static_assert(GGML_Q35MOE_FFN1_N_SRC == GGML_MAX_SRC, "the op fills every source of a node");
-
-bool env_on(const char * name) {
-    const char * p = std::getenv(name);
-    return p && std::strcmp(p, "1") == 0;
-}
 
 bool f32_vec(const ggml_tensor * x) {
     return x && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] == n_embd && ggml_nelements(x) == n_embd;
@@ -203,8 +199,7 @@ ggml_tensor * ffn_node(ggml_context * ctx, ggml_tensor * x, ggml_tensor * res, g
 } // namespace
 
 bool ggml_q35moe_ffn1_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_FFN1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_FFN1);
 }
 
 ggml_tensor * ggml_q35moe_try_ffn1(ggml_context * ctx, ggml_tensor * x, ggml_tensor * res, ggml_tensor ** w) {
@@ -220,8 +215,7 @@ bool ggml_q35moe_is_ffn1(const ggml_tensor * op) {
 }
 
 bool ggml_q35moe_ffnm_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_FFNM");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_FFNM);
 }
 
 ggml_tensor * ggml_q35moe_try_ffnm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * res, ggml_tensor ** w) {
@@ -237,6 +231,5 @@ bool ggml_q35moe_is_ffnm(const ggml_tensor * op) {
 }
 
 bool ggml_q35moe_exponce_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_EXPONCE");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_EXPONCE);
 }

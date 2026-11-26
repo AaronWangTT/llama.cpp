@@ -1,0 +1,99 @@
+#pragma once
+
+#include "ggml.h"
+
+#include <stddef.h>
+
+// Private fast paths of the native gfx1103 HIP build: one table for all of them.
+// A bit-exact entry is on by default. A lossy entry is off by default, its legacy variable set to 1 turns it on (per model, in models.ini).
+// Each path keeps its own guards (device, architecture, shapes); an entry that is on only allows the path.
+//   GGML_KPERF_OFF=all | none | <list>     turn entries off for A/B runs
+//   GGML_KPERF_TRACE=all | <list>          log lines when a path runs (for fixtures)
+// <list>: names, families or legacy variables, separated by ',' or spaces, case is ignored. An unknown name aborts.
+// Turning off an entry also turns off the entries that need it.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// X(id, name, exact, needs, legacy variable, description); an entry that needs another one comes after it
+#define GGML_KPERF_LIST(X) \
+    X(HIP_MOE_NCOLS32,       "hip.moe_ncols32",       true,  "",                    "GGML_CUDA_MMQ_MOE_NCOLS",      "MUL_MAT_ID on MMQ: tile width chosen for 32 columns per expert") \
+    X(INKLING_GATHER,        "inkling.gather",        true,  "",                    "GGML_INKLING_GATHER",          "relative bias GET_ROWS/RESHAPE/PERMUTE/CONT in one kernel") \
+    X(INKLING_MASKEPI,       "inkling.maskepi",       true,  "",                    "GGML_INKLING_MASKEPI",         "bias gather and raw mask in F32, one rounding into the F16 mask") \
+    X(INKLING_RAWMASK,       "inkling.rawmask",       true,  "",                    "GGML_INKLING_RAWMASK",         "prefill mask from the original projection") \
+    X(INKLING_PFMASK,        "inkling.pfmask",        true,  "inkling.rawmask",     "GGML_INKLING_PFMASK",          "prefill mask tile flags for the full-attention layers") \
+    X(INKLING_ROWCLIP,       "inkling.rowclip",       true,  "",                    "GGML_INKLING_ROWCLIP",         "one-token Q/R/K row clip chain") \
+    X(INKLING_SITU,          "inkling.situ",          true,  "",                    "GGML_INKLING_SITU",            "expert SITU activation on the packed gate/up") \
+    X(INKLING_CTRL_TAIL,     "inkling.ctrl_tail",     true,  "",                    "GGML_INKLING_CTRL_TAIL",       "TANH/MUL/ADD tails of the loop controllers") \
+    X(INKLING_GATE_TAIL16,   "inkling.gate_tail16",   true,  "hip.moe_ncols32",     "GGML_INKLING_GATE_TAIL16",     "expert gate/up: partial 32-column tiles with the 16-column body") \
+    X(INKLING_DOWN_TAIL16,   "inkling.down_tail16",   true,  "hip.moe_ncols32",     "GGML_INKLING_DOWN_TAIL16",     "expert down: partial 32-column tiles with the 16-column body") \
+    X(INKLING_HOTPAIR_GATE,  "inkling.hotpair_gate",  true,  "inkling.gate_tail16", "GGML_INKLING_HOTPAIR_GATE",    "expert gate/up: two full tiles share one weight unpack") \
+    X(INKLING_HOTPAIR_DOWN,  "inkling.hotpair_down",  true,  "inkling.down_tail16", "GGML_INKLING_HOTPAIR_DOWN",    "expert down: two full tiles share one weight unpack") \
+    X(INKLING_CONCAT4,       "inkling.concat4",       true,  "",                    "GGML_INKLING_CONCAT4",         "prefill depth mix: 4 states in one pack") \
+    X(INKLING_DEPTHMIX_RAW,  "inkling.depthmix_raw",  true,  "",                    "GGML_INKLING_DEPTHMIX_RAW_V2", "prefill depth mix without the transpose") \
+    X(INKLING_VIEWCOL,       "inkling.viewcol",       true,  "",                    "GGML_INKLING_VIEWCOL",         "columns of the mixed states as views") \
+    X(INKLING_CONV1,         "inkling.conv1",         true,  "",                    "GGML_INKLING_CONV1",           "one-token short conv, residual and state in one op") \
+    X(INKLING_BIAS1,         "inkling.bias1",         true,  "",                    "GGML_INKLING_BIAS1",           "one-token relative bias table in one op") \
+    X(INKLING_MVSTACK,       "inkling.mvstack",       true,  "",                    "GGML_INKLING_MVSTACK",         "one-token Q8_0 products of one input in one op") \
+    X(INKLING_CTRL1,         "inkling.ctrl1",         true,  "",                    "GGML_INKLING_CTRL1",           "one-token loop controller in one op") \
+    X(INKLING_MIX1,          "inkling.mix1",          true,  "",                    "GGML_INKLING_MIX1",            "one-token depth mix in one op") \
+    X(INKLING_FAGQA,         "inkling.fagqa",         true,  "",                    "GGML_INKLING_FAGQA",           "decode attention, one block takes the 3 query heads of a KV head") \
+    X(INKLING_PPSKIP,        "inkling.ppskip",        true,  "",                    "GGML_INKLING_PPSKIP",          "prefill attention skips fully masked prefix tiles (finite K/V)") \
+    X(INKLING_PFATTN,        "inkling.pfattn",        true,  "",                    "GGML_INKLING_PFATTN",          "prefill attention kernel for 256 queries") \
+    X(INKLING_PFZERO,        "inkling.pfzero",        false, "inkling.pfattn",      "GGML_INKLING_PFZERO",          "prefill attention skips V rows of weight +0 (exact only for finite K/Q/V)") \
+    X(INKLING_PFMM,          "inkling.pfmm",          true,  "",                    "GGML_INKLING_PFMM",            "prefill router/controller float products") \
+    X(QWEN35_MVSHARE,        "qwen35.mvshare",        true,  "",                    "GGML_QWEN35_MVSHARE",          "one-token products that share one input") \
+    X(QWEN35_PREP1,          "qwen35.prep1",          true,  "",                    "GGML_QWEN35_PREP1",            "one-token conv, SiLU, norm, beta and gate in one op") \
+    X(QWEN35_GDN1,           "qwen35.gdn1",           true,  "",                    "GGML_QWEN35_GDN1",             "one-token delta net in one op") \
+    X(QWEN35_POST1,          "qwen35.post1",          true,  "",                    "GGML_QWEN35_POST1",            "one-token gated norm in one op") \
+    X(QWEN35_CONVPF,         "qwen35.convpf",         true,  "",                    "GGML_QWEN35_CONVPF",           "prefill conv without the concat tensor") \
+    X(QWEN35_FAGQA,          "qwen35.fagqa",          true,  "",                    "GGML_QWEN35_FAGQA",            "one-token attention, D256, 4 query heads per KV head") \
+    X(QWEN35_PFATTN,         "qwen35.pfattn",         true,  "",                    "GGML_QWEN35_PFATTN",           "prefill attention, D256, 4 query heads per KV head") \
+    X(QWEN35_Q6K_MMQ,        "qwen35.q6k_mmq",        false, "",                    "GGML_QWEN35_Q6K_MMQ",          "Q6_K takes MMQ at any batch size (other rounding than dequantization + hipBLAS)") \
+    X(QWEN35MOE_MVSHARE,     "qwen35moe.mvshare",     true,  "",                    "GGML_Q35MOE_MVSHARE",          "one-token products that share one input") \
+    X(QWEN35MOE_BA1,         "qwen35moe.ba1",         true,  "",                    "GGML_Q35MOE_BA1",              "one-token F32 beta/alpha products in one launch") \
+    X(QWEN35MOE_PREP1,       "qwen35moe.prep1",       true,  "",                    "GGML_Q35MOE_PREP1",            "one-token conv, SiLU, norm, beta and gate in one op") \
+    X(QWEN35MOE_GDN1,        "qwen35moe.gdn1",        true,  "",                    "GGML_Q35MOE_GDN1",             "one-token delta net in one op") \
+    X(QWEN35MOE_POST1,       "qwen35moe.post1",       true,  "",                    "GGML_Q35MOE_POST1",            "one-token gated norm in one op") \
+    X(QWEN35MOE_RS1,         "qwen35moe.rs1",         true,  "",                    "GGML_Q35MOE_RS1",              "the one-token ops also with rollback snapshots") \
+    X(QWEN35MOE_PREPN,       "qwen35moe.prepn",       true,  "",                    "GGML_Q35MOE_PREPN",            "prep op for 2 to 5 tokens with snapshots") \
+    X(QWEN35MOE_GDNN,        "qwen35moe.gdnn",        true,  "",                    "GGML_Q35MOE_GDNN",             "delta net op for 2 to 5 tokens with snapshots") \
+    X(QWEN35MOE_POSTN,       "qwen35moe.postn",       true,  "",                    "GGML_Q35MOE_POSTN",            "gated norm op for 2 to 5 tokens") \
+    X(QWEN35MOE_CONVPF,      "qwen35moe.convpf",      true,  "",                    "GGML_Q35MOE_CONVPF",           "prefill conv without the concat tensor") \
+    X(QWEN35MOE_CONVPFRS,    "qwen35moe.convpfrs",    true,  "qwen35moe.convpf",    "GGML_Q35MOE_CONVPFRS",         "prefill conv also with rollback snapshots") \
+    X(QWEN35MOE_GDNPF,       "qwen35moe.gdnpf",       true,  "",                    "GGML_Q35MOE_GDNPF",            "delta net prompt kernel") \
+    X(QWEN35MOE_FFN1,        "qwen35moe.ffn1",        true,  "",                    "GGML_Q35MOE_FFN1",             "one-token MoE feed-forward in one op") \
+    X(QWEN35MOE_FFNM,        "qwen35moe.ffnm",        true,  "",                    "GGML_Q35MOE_FFNM",             "MoE feed-forward of 2 to 4 tokens in one op") \
+    X(QWEN35MOE_EXPONCE,     "qwen35moe.exponce",     true,  "qwen35moe.ffnm",      "GGML_Q35MOE_EXPONCE",          "inside ffnm: the rows of an expert are read once per batch") \
+    X(QWEN35MOE_FAGQA,       "qwen35moe.fagqa",       true,  "",                    "GGML_Q35MOE_FAGQA",            "one-token attention, D256, 8 query heads per KV head") \
+    X(QWEN35MOE_FAGQA4,      "qwen35moe.fagqa4",      true,  "",                    "GGML_Q35MOE_FAGQA4",           "attention of 2 to 4 tokens, D256, 8 query heads per KV head") \
+    X(QWEN35MOE_PFATTN,      "qwen35moe.pfattn",      true,  "",                    "GGML_Q35MOE_PFATTN",           "prefill attention, D256, 8 query heads per KV head") \
+    X(QWEN35MOE_EXPTAIL,     "qwen35moe.exptail",     true,  "",                    "GGML_Q35MOE_EXPTAIL",          "expert products on MMQ, 16 to 64 columns per tile") \
+    X(QWEN35MOE_QSHARE,      "qwen35moe.qshare",      true,  "",                    "GGML_Q35MOE_QSHARE",           "MMQ products of one input share one Q8_1 copy") \
+    X(QWEN35MOE_PFMM,        "qwen35moe.pfmm",        true,  "",                    "GGML_Q35MOE_PFMM",             "F32 router/beta/alpha products of 512 tokens") \
+    X(QWEN35MOE_PFMMN,       "qwen35moe.pfmmn",       true,  "",                    "GGML_Q35MOE_PFMMN",            "F32 router/beta/alpha products of 128 to 2048 tokens") \
+    X(QWEN35MOE_MTPSTORE,    "qwen35moe.mtpstore",    true,  "",                    "GGML_Q35MOE_MTPSTORE",         "MTP graphs without outputs only store K and V")
+
+enum ggml_kperf {
+#define GGML_KPERF_ENUM(id, name, exact, needs, legacy, desc) GGML_KPERF_##id,
+    GGML_KPERF_LIST(GGML_KPERF_ENUM)
+#undef GGML_KPERF_ENUM
+    GGML_KPERF_COUNT,
+};
+
+// true if the path of the entry may run; the environment is read at the first call
+GGML_API bool ggml_kperf_on(enum ggml_kperf k);
+// true if GGML_KPERF_TRACE names the entry
+GGML_API bool ggml_kperf_trace(enum ggml_kperf k);
+GGML_API const char * ggml_kperf_name(enum ggml_kperf k);
+
+// the HIP backend calls this when it has a gfx1103 device with warp size 32 (for the log only)
+GGML_API void ggml_kperf_set_device_ok(bool ok);
+
+// one line for a model architecture: the entries of its family that are on, the ones turned off, the lossy ones on
+// returns the length as snprintf does
+GGML_API size_t ggml_kperf_describe(const char * arch, char * buf, size_t size);
+
+#ifdef __cplusplus
+}
+#endif

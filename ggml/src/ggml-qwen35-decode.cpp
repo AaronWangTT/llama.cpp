@@ -1,4 +1,5 @@
 #include "ggml-qwen35-decode.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cmath>
@@ -9,11 +10,6 @@
 namespace {
 constexpr int head_dim = ggml_qwen35_head_dim;
 constexpr int n_conv   = ggml_qwen35_n_conv;
-
-bool env_on(const char * name) {
-    const char * p = std::getenv(name);
-    return p && std::strcmp(p, "1") == 0;
-}
 
 bool f32_block(const ggml_tensor * x, int64_t n) {
     return x && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == n;
@@ -499,8 +495,7 @@ void gdnn_cpu(ggml_tensor * dst, int ith, int, void *) {
 } // namespace
 
 bool ggml_qwen35_mvshare_enabled() {
-    static const bool enabled = env_on("GGML_QWEN35_MVSHARE");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35_MVSHARE);
 }
 
 ggml_tensor * ggml_qwen35_try_mvshare(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x) {
@@ -528,8 +523,7 @@ bool ggml_qwen35_is_mvshare(const ggml_tensor * op) {
 }
 
 bool ggml_qwen35_prep1_enabled() {
-    static const bool enabled = env_on("GGML_QWEN35_PREP1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35_PREP1);
 }
 
 ggml_tensor * ggml_qwen35_try_prep1(ggml_context * ctx, ggml_tensor * qkv, ggml_tensor * beta, ggml_tensor * alpha,
@@ -556,8 +550,7 @@ bool ggml_qwen35_is_prep1(const ggml_tensor * op) {
 }
 
 bool ggml_qwen35_gdn1_enabled() {
-    static const bool enabled = env_on("GGML_QWEN35_GDN1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35_GDN1);
 }
 
 ggml_tensor * ggml_qwen35_try_gdn1(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
@@ -576,8 +569,7 @@ bool ggml_qwen35_is_gdn1(const ggml_tensor * op) {
 }
 
 bool ggml_qwen35_post1_enabled() {
-    static const bool enabled = env_on("GGML_QWEN35_POST1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35_POST1);
 }
 
 ggml_tensor * ggml_qwen35_try_post1(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * z, float eps) {
@@ -596,28 +588,23 @@ bool ggml_qwen35_is_post1(const ggml_tensor * op) {
 }
 
 bool ggml_q35moe_mvshare_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_MVSHARE");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_MVSHARE);
 }
 
 bool ggml_q35moe_prep1_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_PREP1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_PREP1);
 }
 
 bool ggml_q35moe_gdn1_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_GDN1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_GDN1);
 }
 
 bool ggml_q35moe_post1_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_POST1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_POST1);
 }
 
 bool ggml_q35moe_ba1_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_BA1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_BA1);
 }
 
 ggml_tensor * ggml_q35moe_try_mvf(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x) {
@@ -645,13 +632,11 @@ bool ggml_q35moe_is_mvf(const ggml_tensor * op) {
 }
 
 bool ggml_q35moe_rs1_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_RS1");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_RS1);
 }
 
 bool ggml_q35moe_prepn_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_PREPN");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_PREPN);
 }
 
 ggml_tensor * ggml_q35moe_try_prepn(ggml_context * ctx, ggml_tensor * qkv, ggml_tensor * beta, ggml_tensor * alpha,
@@ -679,8 +664,7 @@ bool ggml_q35moe_is_prepn(const ggml_tensor * op) {
 }
 
 bool ggml_q35moe_gdnn_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_GDNN");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_GDNN);
 }
 
 ggml_tensor * ggml_q35moe_try_gdnn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
@@ -702,13 +686,11 @@ bool ggml_q35moe_is_gdnn(const ggml_tensor * op) {
 }
 
 bool ggml_q35moe_postn_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_POSTN");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_POSTN);
 }
 
 bool ggml_q35moe_gdnpf_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_GDNPF");
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_GDNPF);
 }
 
 // the shape that the kernel replays: one slot, heads of 128, scalar gate, more than one token

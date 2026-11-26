@@ -27,8 +27,7 @@ static __global__ void inkling_maskepi_24(const uint32_t * __restrict__ table, c
 }
 
 static bool inkling_maskepi_match(ggml_cgraph * g, int i) {
-    static const bool enable=[] { const char * e=getenv("GGML_INKLING_MASKEPI"); return e && strcmp(e,"1")==0; }();
-    if (!enable || i+6>=g->n_nodes || !inkling_gather_layout(g,i,1)) { return false; }
+    if (!ggml_kperf_on(GGML_KPERF_INKLING_MASKEPI) || i+6>=g->n_nodes || !inkling_gather_layout(g,i,1)) { return false; }
     const auto * bias=g->nodes[i+3]; const auto * cast=g->nodes[i+4];
     const auto * add=g->nodes[i+5]; const auto * out=g->nodes[i+6];
     const auto * raw=cast->src[0];

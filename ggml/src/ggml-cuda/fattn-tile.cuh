@@ -1313,7 +1313,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = ggml_cuda_fattn_tile_get_kernel<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>(dst);
             if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1 && !use_logit_softcap) {
                 const auto * k = dst->src[1], * mask = dst->src[3];
-                static const bool enable = [] { const char * s = getenv("GGML_INKLING_PPSKIP"); return s && strcmp(s, "1") == 0; }();
+                const bool enable = ggml_kperf_on(GGML_KPERF_INKLING_PPSKIP);
                 static const bool trace = getenv("GGML_INKLING_PPSKIP_TRACE") != nullptr;
                 const bool shape = ggml_hip_inkling_pf_shape(dst, cc);
                 const bool skip = (enable || trace) && shape && k->ne[1] >= 2048 && k->ne[1] <= 4352 &&

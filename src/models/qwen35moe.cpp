@@ -2,6 +2,8 @@
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-kperf.h"
+
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
@@ -47,7 +49,7 @@ static ggml_backend_dev_t q35moe_rocm_dev(const llama_cparams & cparams, const l
     return nullptr;
 }
 
-// a switch that is set but can not act in this context goes to the log, once per switch and reason (both are string literals)
+// a kperf entry that is on but cannot act in this context goes to the log, once per entry and reason (both are string literals)
 static void q35moe_log_off(const char * switches, const char * why) {
     static std::mutex mutex;
     static std::vector<std::pair<const char *, const char *>> seen;
@@ -58,10 +60,10 @@ static void q35moe_log_off(const char * switches, const char * why) {
         }
     }
     seen.emplace_back(switches, why);
-    LLAMA_LOG_WARN("qwen35moe: no effect of %s: %s\n", switches, why);
+    LLAMA_LOG_INFO("qwen35moe: no effect of %s: %s\n", switches, why);
 }
 
-// GGML_Q35MOE_GDNPF=1: a ubatch of more than n_rs_seq + 1 tokens per sequence. The memory takes no rollback after it
+// qwen35moe.gdnpf: a ubatch of more than n_rs_seq + 1 tokens per sequence. The memory takes no rollback after it
 // (llama_memory_recurrent::find_slot() sets rs_max to 0), so the recurrent blocks write slot 0 only, and the delta net node is marked for its prompt kernel
 static bool q35moe_gdnpf(const llama_cparams & cparams, const llama_model & model, const llama_adapter_loras * loras,
         const int il, const int64_t n_seq_tokens) {
@@ -70,13 +72,13 @@ static bool q35moe_gdnpf(const llama_cparams & cparams, const llama_model & mode
     }
     const char * why = nullptr;
     if (!q35moe_rocm_dev(cparams, model, loras, il, false, &why)) {
-        q35moe_log_off("GGML_Q35MOE_GDNPF", why);
+        q35moe_log_off("qwen35moe.gdnpf", why);
         return false;
     }
     static std::atomic<bool> logged[2];
     const bool rs = cparams.n_rs_seq > 0;
     if (!logged[rs].exchange(true)) {
-        LLAMA_LOG_INFO("qwen35moe: GGML_Q35MOE_GDNPF: delta net prompt kernel for ubatches of more than %u tokens per sequence%s\n",
+        LLAMA_LOG_INFO("qwen35moe: qwen35moe.gdnpf: delta net prompt kernel for ubatches of more than %u tokens per sequence%s\n",
             cparams.n_rs_seq + 1, rs ? ", they write rollback slot 0 only" : "");
     }
     return true;
@@ -494,10 +496,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 #endif
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
-    // GGML_Q35MOE_CONVPF=1, many tokens of one sequence: one op reads the conv state and qkv_mixed, there is no concat tensor
+    // qwen35moe.convpf, many tokens of one sequence: one op reads the conv state and qkv_mixed, there is no concat tensor
     if (ggml_q35moe_convpf_enabled()) {
         // a reason that holds for the whole context goes to the log once; the shape of the batch does not
-        // GGML_Q35MOE_CONVPFRS=1: also with rollback snapshots, the store below then writes the windows of all slots
+        // qwen35moe.convpfrs: also with rollback snapshots, the store below then writes the windows of all slots
         const char * why = nullptr;
         const auto dev_pf = q35moe_rocm_dev(cparams, model, loras, il, !ggml_q35moe_convpfrs_enabled(), &why);
         if (dev_pf && (conv_kernel_size != ggml_qwen35_convpf_n_conv || qkv_mixed->ne[0] != conv_channels)) {
@@ -506,7 +508,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
         // slots that build_conv_state_store() writes; all their windows must lie in qkv_mixed
         const int64_t n_slots = gdnpf ? 1 : std::min<int64_t>(n_seq_tokens, (int64_t) cparams.n_rs_seq + 1);
         if (why) {
-            q35moe_log_off("GGML_Q35MOE_CONVPF", why);
+            q35moe_log_off("qwen35moe.convpf", why);
         } else if (n_seqs == 1 && n_seq_tokens >= ggml_qwen35_convpf_min_n_tokens && n_seq_tokens >= n_slots + conv_kernel_size - 1) {
             ggml_context_ptr probe{ggml_init({3*ggml_tensor_overhead(), nullptr, true})};
             ggml_tensor * past = ggml_new_tensor_2d(probe.get(), GGML_TYPE_F32, conv_kernel_size - 1, conv_channels);
@@ -620,7 +622,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 // build_layer_attn_linear() for one token of one sequence on a single ROCm device, with the ops of ggml-qwen35-decode.h
-// each op has its own GGML_Q35MOE_* switch; a part whose op is off or not usable gets the stock nodes
+// each op has its own kperf entry qwen35moe.<op>; a part whose op is off or not usable gets the stock nodes
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
@@ -633,7 +635,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
         return nullptr;
     }
     // a reason that holds for the whole context goes to the log once; the shape of the batch does not
-    // GGML_Q35MOE_RS1=1: also with rollback snapshots, one token reads the row that the memory names and writes slot 0
+    // qwen35moe.rs1: also with rollback snapshots, one token reads the row that the memory names and writes slot 0
     const char * why = nullptr;
     const auto dev = q35moe_rocm_dev(cparams, model, loras, il, !ggml_q35moe_rs1_enabled(), &why);
 
@@ -650,12 +652,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
         why = "the head size of the recurrent blocks";
     }
     if (why) {
-        q35moe_log_off("GGML_Q35MOE_MVSHARE/BA1/PREP1/GDN1/POST1", why);
+        q35moe_log_off("qwen35moe.mvshare, ba1, prep1, gdn1, post1", why);
         return nullptr;
     }
     // PREP1 and GDN1 write the state cache, the backend takes them only with the cache in its memory
     if (!cparams.offload_kqv && (ggml_q35moe_prep1_enabled() || ggml_q35moe_gdn1_enabled())) {
-        q35moe_log_off("GGML_Q35MOE_PREP1/GDN1", "the recurrent state is not in device memory (--no-kv-offload)");
+        q35moe_log_off("qwen35moe.prep1, gdn1", "the recurrent state is not in device memory (--no-kv-offload)");
     }
     if (ubatch.n_seq_tokens != 1 || ubatch.n_seqs != 1 || mctx_cur->get_n_rs() != 1) {
         return nullptr;
@@ -870,7 +872,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_one(
 
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
 // build_layer_attn_linear() for 2 to n_rs_seq + 1 tokens of one sequence in a context with rollback snapshots (a draft verification
-// batch) on a single ROCm device. GGML_Q35MOE_PREPN, GDNN and POSTN give one part each to an op of ggml-qwen35-decode.h,
+// batch) on a single ROCm device. qwen35moe.prepn, GDNN and POSTN give one part each to an op of ggml-qwen35-decode.h,
 // a part whose op is off or not usable gets the stock nodes
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_few(
         llm_graph_input_rs * inp,
@@ -903,12 +905,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_few(
         why = "the context keeps no rollback snapshots (n_rs_seq is 0)";
     }
     if (why) {
-        q35moe_log_off("GGML_Q35MOE_PREPN/GDNN/POSTN", why);
+        q35moe_log_off("qwen35moe.prepn, gdnn, postn", why);
         return nullptr;
     }
     // PREPN and GDNN write the state cache, the backend takes them only with the cache in its memory
     if (!cparams.offload_kqv && (ggml_q35moe_prepn_enabled() || ggml_q35moe_gdnn_enabled())) {
-        q35moe_log_off("GGML_Q35MOE_PREPN/GDNN", "the recurrent state is not in device memory (--no-kv-offload)");
+        q35moe_log_off("qwen35moe.prepn, gdnn", "the recurrent state is not in device memory (--no-kv-offload)");
     }
     // up to n_rs_seq + 1 tokens every token writes a slot and the stock delta net is the plain kernel
     // 2 to 5 tokens are checked against the stock graph (fixture, spec-ab.sh); the ops could take up to ggml_q35moe_few_max
@@ -1140,12 +1142,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 }
 
 // build_layer_ffn() plus the residual as a fused op of ggml-q35moe-ffn.h, nullptr if no op takes this layer
-// GGML_Q35MOE_FFN1 is the op for a graph of one token, GGML_Q35MOE_FFNM the op for a graph of 2 to ggml_q35moe_ffnm_max tokens
+// qwen35moe.ffn1 is the op for a graph of one token, qwen35moe.ffnm the op for a graph of 2 to ggml_q35moe_ffnm_max tokens
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cur, ggml_tensor * residual, const int il) {
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
-    if (ggml_q35moe_exponce_enabled() && !ggml_q35moe_ffnm_enabled()) {
-        q35moe_log_off("GGML_Q35MOE_EXPONCE", "it acts inside the op of GGML_Q35MOE_FFNM, which is not set");
-    }
     if (!ggml_q35moe_ffn1_enabled() && !ggml_q35moe_ffnm_enabled()) {
         return nullptr;
     }
@@ -1224,21 +1223,21 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cu
         if (first_why == nullptr) {
             LLAMA_LOG_INFO("qwen35moe: %s: %d of %d blocks take the op in a graph of %s\n", name, n_take, (int) n_layer, graph);
         } else {
-            LLAMA_LOG_WARN("qwen35moe: %s: %d of %d blocks take the op in a graph of %s, block %d does not: %s\n",
+            LLAMA_LOG_INFO("qwen35moe: %s: %d of %d blocks take the op in a graph of %s, block %d does not: %s\n",
                     name, n_take, (int) n_layer, graph, first, first_why);
         }
     };
 
-    // once per process and switch
+    // once per process and entry
     if (!model.no_alloc()) {
         if (ggml_q35moe_ffn1_enabled()) {
             static std::once_flag reported;
-            std::call_once(reported, [&] { report("GGML_Q35MOE_FFN1", "one token", 1, ggml_q35moe_try_ffn1); });
+            std::call_once(reported, [&] { report("qwen35moe.ffn1", "one token", 1, ggml_q35moe_try_ffn1); });
         }
         if (ggml_q35moe_ffnm_enabled()) {
             static std::once_flag reported;
             std::call_once(reported, [&] {
-                report(ggml_q35moe_exponce_enabled() ? "GGML_Q35MOE_FFNM with GGML_Q35MOE_EXPONCE" : "GGML_Q35MOE_FFNM", "2 to 4 tokens", 2, ggml_q35moe_try_ffnm);
+                report(ggml_q35moe_exponce_enabled() ? "qwen35moe.ffnm with qwen35moe.exponce" : "qwen35moe.ffnm", "2 to 4 tokens", 2, ggml_q35moe_try_ffnm);
             });
         }
     }
@@ -1270,15 +1269,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cu
 #endif
 }
 
-// GGML_Q35MOE_MTPSTORE=1: a graph of the MTP head without outputs only stores K and V
+// qwen35moe.mtpstore: a graph of the MTP head without outputs only stores K and V
 // such a graph is the catch-up after a target decode: nothing reads what the block computes for these tokens,
 // later graphs only need their K and V, and those do not depend on the attention or on the feed-forward
 static bool q35moe_mtpstore(const llama_cparams & cparams, const int64_t n_outputs) {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_Q35MOE_MTPSTORE");
-        return env != nullptr && env[0] == '1' && env[1] == '\0';
-    }();
-    if (!enabled || n_outputs != 0) {
+    if (!ggml_kperf_on(GGML_KPERF_QWEN35MOE_MTPSTORE) || n_outputs != 0) {
         return false;
     }
 
@@ -1293,9 +1288,9 @@ static bool q35moe_mtpstore(const llama_cparams & cparams, const int64_t n_outpu
     const char * state = why != nullptr ? why : "used";
     if (logged.exchange(state) != state) {
         if (why != nullptr) {
-            LLAMA_LOG_WARN("qwen35moe: no effect of GGML_Q35MOE_MTPSTORE: %s\n", why);
+            LLAMA_LOG_INFO("qwen35moe: no effect of qwen35moe.mtpstore: %s\n", why);
         } else {
-            LLAMA_LOG_INFO("qwen35moe: GGML_Q35MOE_MTPSTORE is used, MTP graphs without outputs only store K and V\n");
+            LLAMA_LOG_INFO("qwen35moe: qwen35moe.mtpstore is used, MTP graphs without outputs only store K and V\n");
         }
     }
 

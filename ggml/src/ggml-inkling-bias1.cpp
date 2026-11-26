@@ -1,4 +1,5 @@
 #include "ggml-inkling-bias1.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cmath>
@@ -43,11 +44,7 @@ void bias1_cpu(ggml_tensor * dst, int ith, int, void *) {
 } // namespace
 
 bool ggml_inkling_bias1_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_INKLING_BIAS1");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_BIAS1);
 }
 
 ggml_tensor * ggml_inkling_try_bias1(ggml_context * ctx, ggml_tensor * bias, ggml_tensor * rcur, ggml_tensor * sinks) {

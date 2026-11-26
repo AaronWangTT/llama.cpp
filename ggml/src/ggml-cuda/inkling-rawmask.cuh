@@ -103,8 +103,7 @@ static bool inkling_rawmask_layout(ggml_cgraph * g, int i) {
 // Full-attention layers only: a sliding window layer has no far tile.
 // The attention op must be the only reader of the mask (use count 2: a ggml_cast CPY also counts itself).
 static bool inkling_pfmask_ready(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int i) {
-    static const bool enable = [] { const char * p = getenv("GGML_INKLING_PFMASK"); return p && strcmp(p,"1")==0; }();
-    if (!enable) { return false; }
+    if (!ggml_kperf_on(GGML_KPERF_INKLING_PFMASK)) { return false; }
     auto ** n = g->nodes+i;
     const auto * ids=n[3]->src[1], * mask=n[7]->src[0], * out=n[9];
     // The scheduler copies the input, the name of the copy has the backend name in front.

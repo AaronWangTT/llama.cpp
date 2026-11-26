@@ -24,7 +24,7 @@ static __device__ __forceinline__ float inkling_mix1x_lanes(const float * v) {
     return ((a[0] + a[4]) + (a[2] + a[6])) + ((a[1] + a[5]) + (a[3] + a[7]));
 }
 
-// GGML_INKLING_MIX1=1, bit-exact against the stock chain. Each stage keeps the thread layout and the sum order of its stock kernel:
+// inkling.mix1, bit-exact against the stock chain. Each stage keeps the thread layout and the sum order of its stock kernel:
 // - norm: rms_norm_f32<1024, 1, true>
 // - scores: mul_mat_vec_f<float, float, nq, 256>
 // - softmax: soft_max_f32<true, 0, 0>

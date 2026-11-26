@@ -16,12 +16,11 @@ constexpr int inkling_pfmm_cols     = 128; // tokens per block
 constexpr int inkling_pfmm_depth    = 16;  // k per load
 
 static bool inkling_pfmm_enabled() {
-    static const bool enabled = [] { const char * p = getenv("GGML_INKLING_PFMM"); return p && strcmp(p, "1") == 0; }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_PFMM);
 }
 
 // The kernel replays the F32 SGEMM that rocBLAS takes by default. False if the environment gives the stock product another compute type or
-// another GEMM; this goes to the log once. name is the switch that asks.
+// another GEMM; this goes to the log once. name is the kperf entry that asks.
 static bool inkling_pfmm_stock_sgemm(const char * name) {
     const char * var = nullptr;
     for (const char * v : { "ROCBLAS_USE_HIPBLASLT", "ROCBLAS_TENSILE_LIBPATH", "ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH" }) {
@@ -45,7 +44,7 @@ static bool inkling_pfmm_stock_sgemm(const char * name) {
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_WARN("%s: %s is not used, %s is set\n", __func__, name, var);
+        GGML_LOG_INFO("%s: %s is not used, %s is set\n", __func__, name, var);
     }
     return false;
 }
@@ -179,7 +178,7 @@ static bool inkling_pfmm_supported(int device, const ggml_tensor * w, const ggml
             return false;
         }
     }
-    return inkling_pfmm_stock_sgemm("GGML_INKLING_PFMM");
+    return inkling_pfmm_stock_sgemm("inkling.pfmm");
 }
 
 static void inkling_pfmm_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {

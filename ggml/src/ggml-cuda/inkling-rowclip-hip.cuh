@@ -61,7 +61,7 @@ static bool inkling_clip_origin(const ggml_tensor * x, const ggml_tensor * out) 
 }
 
 static bool inkling_clip_dispatch(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int i) {
-    static const bool enabled = inkling_clip_switch("GGML_INKLING_ROWCLIP");
+    static const bool enabled = ggml_kperf_on(GGML_KPERF_INKLING_ROWCLIP);
     if (!enabled || g->nodes[i]->op != GGML_OP_SQR || i + 7 >= g->n_nodes ||
         !ctx.stream_context().concurrent_events.empty()) { return false; }
     const auto & dev = ggml_cuda_info().devices[ctx.device];

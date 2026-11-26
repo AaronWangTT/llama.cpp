@@ -6,14 +6,13 @@
 #error "Compile this private kernel for gfx1103 only"
 #endif
 
-// GGML_Q35MOE_EXPTAIL=1: expert products of qwen35moe (256 experts, 8 used) with K-quant weights.
+// qwen35moe.exptail: expert products of qwen35moe (256 experts, 8 used) with K-quant weights.
 // The tile specs are 64 columns wide. A tile takes the narrowest body that holds its valid columns, so the weights of an expert are
 // unpacked once for up to 64 columns and the products and the y loads follow the columns in steps of 16. Same results as mul_mat_q.
 constexpr int q35moe_exptail_width = 64;
 
 static bool q35moe_exptail_enabled() {
-    static const bool enabled = [] { const char * p = getenv("GGML_Q35MOE_EXPTAIL"); return p && strcmp(p, "1") == 0; }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_EXPTAIL);
 }
 
 template <ggml_type type, int W>

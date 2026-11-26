@@ -92,6 +92,7 @@
 #include "ggml-cuda/q35moe-pfmmn.cuh"
 #endif
 #include "ggml.h"
+#include "ggml-kperf.h"
 
 #include <algorithm>
 #include <array>
@@ -195,18 +196,12 @@ static bool ggml_cuda_fusion_disabled() {
 
 #ifdef GGML_USE_HIP
 static bool inkling_rawmask_enabled() {
-    static const bool enabled = [] {
-        const char * p = getenv("GGML_INKLING_RAWMASK");
-        return p && strcmp(p,"1")==0 && !ggml_cuda_env_flag("GGML_CUDA_GRAPH_OPT") && !ggml_cuda_fusion_disabled();
-    }();
+    static const bool enabled = ggml_kperf_on(GGML_KPERF_INKLING_RAWMASK) && !ggml_cuda_env_flag("GGML_CUDA_GRAPH_OPT") && !ggml_cuda_fusion_disabled();
     return enabled;
 }
 static bool inkling_control_enabled() {
     // Concurrent graph optimization can reorder sites between inspection and capture.
-    static const bool enabled = [] {
-        const char * p = getenv("GGML_INKLING_CTRL_TAIL");
-        return p && strcmp(p,"1") == 0 && !ggml_cuda_env_flag("GGML_CUDA_GRAPH_OPT") && !ggml_cuda_fusion_disabled();
-    }();
+    static const bool enabled = ggml_kperf_on(GGML_KPERF_INKLING_CTRL_TAIL) && !ggml_cuda_env_flag("GGML_CUDA_GRAPH_OPT") && !ggml_cuda_fusion_disabled();
     return enabled;
 }
 #endif
@@ -451,6 +446,15 @@ static ggml_cuda_device_info ggml_cuda_init() {
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;
     }
+
+#ifdef GGML_USE_HIP
+    // for the kperf log line only, the fast paths check the device themselves
+    for (int id = 0; id < info.device_count; ++id) {
+        if (info.devices[id].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && info.devices[id].warp_size == 32) {
+            ggml_kperf_set_device_ok(true);
+        }
+    }
+#endif // GGML_USE_HIP
 
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
@@ -976,7 +980,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(inkling_pf_aux));
     }
     if (qshare.n_kept > 0) {
-        GGML_LOG_INFO("%s: GGML_Q35MOE_QSHARE: %llu products quantized their input, %llu took the Q8_1 input of the product before\n",
+        GGML_LOG_INFO("%s: qwen35moe.qshare: %llu products quantized their input, %llu took the Q8_1 input of the product before\n",
             __func__, (unsigned long long) qshare.n_kept, (unsigned long long) qshare.n_taken);
     }
     for (const ggml_cuda_qshare::buffer & b : { qshare.q8, qshare.ids_src1, qshare.ids_dst, qshare.tile_spec }) {
@@ -3374,12 +3378,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 #ifdef GGML_USE_HIP
     // Parent graph uses are shared by split views, but are not in a tensor's properties.
     // A replay must still write newly observed intermediates; the reverse transition may fuse again.
-    static const bool situ = [] { const char * p = getenv("GGML_INKLING_SITU"); return p && strcmp(p,"1") == 0; }();
+    static const bool situ = ggml_kperf_on(GGML_KPERF_INKLING_SITU);
     // These shorter fusions still elide outputs when RAWMASK itself is disabled.
-    static const bool mask_replay = [] {
-        const auto enabled = [](const char * name) { const char * v = getenv(name); return v && strcmp(v, "1") == 0; };
-        return !ggml_cuda_fusion_disabled() && (enabled("GGML_INKLING_MASKEPI") || enabled("GGML_INKLING_GATHER"));
-    }();
+    static const bool mask_replay = !ggml_cuda_fusion_disabled() &&
+        (ggml_kperf_on(GGML_KPERF_INKLING_MASKEPI) || ggml_kperf_on(GGML_KPERF_INKLING_GATHER));
     if (mask_replay) {
         auto & sites = graph->inkling_mask_sites;
         if (cgraph->uid && cgraph->uid == graph->uid && (int)graph->node_props.size() == cgraph->n_nodes) {
@@ -5432,12 +5434,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 #ifdef GGML_USE_HIP
-// GGML_Q35MOE_QSHARE: start and end of a graph run, nothing is kept across it
+// qwen35moe.qshare: start and end of a graph run, nothing is kept across it
 static void ggml_cuda_qshare_reset(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const bool captured) {
     ggml_cuda_qshare & qs = ctx.qshare;
     static const bool log = [] { const char * p = getenv("GGML_Q35MOE_QSHARE_LOG"); return p && strcmp(p, "1") == 0; }();
     if (log && qs.n_kept_graph > 0) {
-        GGML_LOG_INFO("%s: GGML_Q35MOE_QSHARE: graph of %d nodes, %d products quantized their input, %d took the Q8_1 input of the product before\n",
+        GGML_LOG_INFO("%s: qwen35moe.qshare: graph of %d nodes, %d products quantized their input, %d took the Q8_1 input of the product before\n",
             __func__, cgraph->n_nodes, qs.n_kept_graph, qs.n_taken_graph);
     }
     qs.node          = nullptr;
@@ -5447,7 +5449,7 @@ static void ggml_cuda_qshare_reset(ggml_backend_cuda_context & ctx, const ggml_c
     qs.n_taken_graph = 0;
 }
 
-// GGML_Q35MOE_QSHARE: the nodes first..last were computed. Drops the kept Q8_1 input if one of them may have written into the
+// qwen35moe.qshare: the nodes first..last were computed. Drops the kept Q8_1 input if one of them may have written into the
 // memory of the kept src1 or ids. A product that is a node of its own writes its output only. Any other op may also write into
 // a source (a copy or an in-place op through its view, a fused or custom op into a state tensor), so its sources count as well.
 // A new product path that writes into one of its sources needs a change here, else the next product takes a stale copy.
@@ -5670,7 +5672,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
 #ifdef GGML_USE_HIP
-                // GGML_Q35MOE_QSHARE: only the product that is this node may keep or take a Q8_1 input
+                // qwen35moe.qshare: only the product that is this node may keep or take a Q8_1 input
                 cuda_ctx->qshare.node = node;
 #endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);

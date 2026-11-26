@@ -1,4 +1,5 @@
 #include "ggml-inkling-mix1.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cmath>
@@ -66,19 +67,11 @@ void mix1_cpu(ggml_tensor * dst, int ith, int, void *) {
 } // namespace
 
 bool ggml_inkling_mix1_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_INKLING_MIX1");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_MIX1);
 }
 
 bool ggml_inkling_viewcol_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_INKLING_VIEWCOL");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_VIEWCOL);
 }
 
 ggml_tensor * ggml_inkling_try_mix1(ggml_context * ctx, ggml_tensor ** states, int n_states, ggml_tensor * query) {

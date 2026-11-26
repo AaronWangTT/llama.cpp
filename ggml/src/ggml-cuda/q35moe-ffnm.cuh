@@ -1,14 +1,14 @@
 #pragma once
 #include "q35moe-ffn.cuh"
 
-// The feed-forward of 2 to ggml_q35moe_ffnm_max tokens in six launches (GGML_Q35MOE_FFNM). Every token gets the value that the stock kernels of a batch of that size give it:
+// The feed-forward of 2 to ggml_q35moe_ffnm_max tokens in six launches (qwen35moe.ffnm). Every token gets the value that the stock kernels of a batch of that size give it:
 //   router, gate of the shared expert   mul_mat_vec_f<float, float, n, 256>: the sum of a column does not depend on the other columns
 //   quantized vectors, top-k            quantize_q8_1, topk_moe_cuda<256, false>: one warp per block or row, as for one token
 //   routed experts                      mul_mat_vec_q_moe<type, 2, fusion>: one warp sums a row for a token as mul_mat_vec_q<type, 1> does
 //   shared expert                       mul_mat_vec_q<type, n, false> and the SWIGLU kernel: the same sums and the same product as the fused one-token form
 //   sum                                 moe_weighted_reduction_f32, MUL, ADD of three values, per token
 // The device functions are those of the one-token op.
-// GGML_Q35MOE_EXPONCE: tokens of the batch that selected the same expert share one warp, which loads the rows of the expert once. The sums of a token stay the same.
+// qwen35moe.exponce: tokens of the batch that selected the same expert share one warp, which loads the rows of the expert once. The sums of a token stay the same.
 
 constexpr int q35moe_ffnm_max  = ggml_q35moe_ffnm_max;
 constexpr int q35moe_ffnm_rows = 2; // rows of a routed expert per warp, as in mul_mat_vec_q_moe

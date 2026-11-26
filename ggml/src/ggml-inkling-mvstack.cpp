@@ -1,4 +1,5 @@
 #include "ggml-inkling-mvstack.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #define GGML_COMMON_DECL_CPP
@@ -74,11 +75,7 @@ void mvstack_cpu(ggml_tensor * dst, int ith, int, void *) {
 } // namespace
 
 bool ggml_inkling_mvstack_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_INKLING_MVSTACK");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_MVSTACK);
 }
 
 ggml_tensor * ggml_inkling_try_mvstack(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x) {

@@ -15,6 +15,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-kperf.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -1530,6 +1531,15 @@ private:
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+
+        // the private fast paths of this build that the model can take (ggml-kperf.h)
+        {
+            char arch[64] = "";
+            llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
+            char line[2048];
+            ggml_kperf_describe(arch, line, sizeof(line));
+            SRV_INF("kperf: %s\n", line);
+        }
 
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {

@@ -2,7 +2,7 @@
 
 // Include from mmq.cu after mmq.cuh and q35moe-exptail.cuh.
 
-// GGML_Q35MOE_QSHARE=1: MMQ products of qwen35moe that read the same input share one Q8_1 copy of it, and the gate and up products
+// qwen35moe.qshare: MMQ products of qwen35moe that read the same input share one Q8_1 copy of it, and the gate and up products
 // of the routed experts share their column lists. In a prompt graph: the joint projection and its gate, q / k / v of an attention
 // block, up and gate of the shared expert, up and gate of the routed experts.
 // The first product quantizes into buffers of the backend context (ggml_cuda_qshare in common.cuh). The next product of the same
@@ -12,8 +12,7 @@
 // a plain product and has that memory as its output or as a source (ggml_cuda_qshare_written in ggml-cuda.cu).
 
 static bool q35moe_qshare_enabled() {
-    static const bool enabled = [] { const char * p = getenv("GGML_Q35MOE_QSHARE"); return p && strcmp(p, "1") == 0; }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_QSHARE);
 }
 
 // the dense Q8_0 weights of the architecture that read the input of a block: [2048, n_out]
@@ -44,7 +43,7 @@ static bool q35moe_qshare_node(const ggml_backend_cuda_context & ctx, const ggml
         static bool logged = false;
         if (!logged) {
             logged = true;
-            GGML_LOG_WARN("%s: GGML_Q35MOE_QSHARE is not used: the device is not gfx1103\n", __func__);
+            GGML_LOG_INFO("%s: qwen35moe.qshare is not used: the device is not gfx1103\n", __func__);
         }
         return false;
     }
@@ -60,7 +59,7 @@ static bool q35moe_qshare_not_captured(const ggml_backend_cuda_context & ctx) {
         static bool logged = false;
         if (!logged) {
             logged = true;
-            GGML_LOG_WARN("%s: GGML_Q35MOE_QSHARE is not used in a graph that runs as a captured graph\n", __func__);
+            GGML_LOG_INFO("%s: qwen35moe.qshare is not used in a graph that runs as a captured graph\n", __func__);
         }
         return false;
     }
@@ -89,7 +88,7 @@ static bool q35moe_qshare_experts_wanted(const ggml_backend_cuda_context & ctx, 
         static bool logged = false;
         if (!logged && !q35moe_exptail_enabled()) {
             logged = true;
-            GGML_LOG_WARN("%s: GGML_Q35MOE_QSHARE is not used for the routed experts: it needs GGML_Q35MOE_EXPTAIL=1\n", __func__);
+            GGML_LOG_INFO("%s: qwen35moe.qshare is not used for the routed experts: it needs qwen35moe.exptail\n", __func__);
         }
         return false;
     }
@@ -134,7 +133,7 @@ static bool q35moe_qshare_take(ggml_backend_cuda_context & ctx, const ggml_tenso
         static bool logged = false;
         if (!logged) {
             logged = true;
-            GGML_LOG_INFO("%s: GGML_Q35MOE_QSHARE is used: a product takes the Q8_1 input of the product before it\n", __func__);
+            GGML_LOG_INFO("%s: qwen35moe.qshare is used: a product takes the Q8_1 input of the product before it\n", __func__);
         }
         qs.n_taken++;
         qs.n_taken_graph++;

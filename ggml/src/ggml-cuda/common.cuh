@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-kperf.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1350,7 +1351,7 @@ struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
 #ifdef GGML_USE_HIP
-// GGML_Q35MOE_QSHARE=1 (mmq.cu): the Q8_1 copy of src1 that an MMQ product made, and for routed experts the column lists,
+// qwen35moe.qshare (mmq.cu): the Q8_1 copy of src1 that an MMQ product made, and for routed experts the column lists,
 // kept for the next product of the same graph run that reads the same src1.
 // The graph loop drops the kept data at the start of a graph and when a node may have written into the memory of the kept src1 or ids.
 struct ggml_cuda_qshare {

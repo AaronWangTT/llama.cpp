@@ -3,7 +3,7 @@
 // include after mmf.cuh and mmvf.cuh
 #include "inkling-pfmm.cuh"
 
-// GGML_Q35MOE_PFMMN=1: F32 products of a prefill ubatch of qwen35moe (router, beta, alpha) for q35moe_pfmmn_min_tokens to q35moe_pfmmn_max_tokens tokens, not only the 512 of GGML_Q35MOE_PFMM.
+// qwen35moe.pfmmn: F32 products of a prefill ubatch of qwen35moe (router, beta, alpha) for q35moe_pfmmn_min_tokens to q35moe_pfmmn_max_tokens tokens, not only the 512 of qwen35moe.pfmm.
 // rocBLAS has one SGEMM kernel for gfx1103 (Tensile MT32x32x8, StaggerU 32 on the row tile), so a token column has the same bits whatever the token count.
 
 // the largest batch of the server; the fixture tests/q35moe-hip-pfmmn.cpp compares every token count up to it with SGEMM
@@ -12,8 +12,7 @@ constexpr int q35moe_pfmmn_max_tokens = 2048;
 constexpr int q35moe_pfmmn_min_tokens = 128;
 
 static bool q35moe_pfmmn_enabled() {
-    static const bool enabled = [] { const char * p = getenv("GGML_Q35MOE_PFMMN"); return p && strcmp(p, "1") == 0; }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_PFMMN);
 }
 
 // inkling_pfmm<float> with a token bound: the last block of 128 tokens may be partial. 256 threads, each owns 4 rows x 4 tokens.
@@ -143,7 +142,7 @@ static bool q35moe_pfmmn_supported(int device, const ggml_tensor * w, const ggml
             return false;
         }
     }
-    return inkling_pfmm_stock_sgemm("GGML_Q35MOE_PFMMN");
+    return inkling_pfmm_stock_sgemm("qwen35moe.pfmmn");
 }
 
 static void q35moe_pfmmn_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {

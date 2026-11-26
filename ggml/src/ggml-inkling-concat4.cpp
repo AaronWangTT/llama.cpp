@@ -1,4 +1,5 @@
 #include "ggml-inkling-concat4.h"
+#include "ggml-kperf.h"
 #include "ggml-impl.h"
 
 #include <cstdlib>
@@ -25,11 +26,7 @@ void concat4_cpu(ggml_tensor * dst, int ith, int nth, void *) {
 } // namespace
 
 bool ggml_inkling_concat4_enabled() {
-    static const bool enabled = [] {
-        const char * p = std::getenv("GGML_INKLING_CONCAT4");
-        return p && std::strcmp(p, "1") == 0;
-    }();
-    return enabled;
+    return ggml_kperf_on(GGML_KPERF_INKLING_CONCAT4);
 }
 
 ggml_tensor * ggml_inkling_try_concat4(ggml_context * ctx, ggml_tensor * oldest,

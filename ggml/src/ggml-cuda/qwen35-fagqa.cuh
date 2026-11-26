@@ -414,11 +414,10 @@ static __global__ void qwen35_fagqa_wmma(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(AMD_WMMA_256B_AVAILABLE)
 }
 
-// GGML_QWEN35_FAGQA=1 takes the one-token attention of qwen35 (head size 256, 4 query heads per KV head, K/V rows) on gfx1103.
-// mma_f16 says that the op goes to flash_attn_ext_f16 without the switch. The result has the same bits as with that kernel.
+// qwen35.fagqa takes the one-token attention of qwen35 (head size 256, 4 query heads per KV head, K/V rows) on gfx1103.
+// mma_f16 says that the op goes to flash_attn_ext_f16 otherwise. The result has the same bits as with that kernel.
 static bool ggml_cuda_flash_attn_ext_qwen35_fagqa(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool mma_f16) {
-    static const bool enable = [] { const char * s = getenv("GGML_QWEN35_FAGQA"); return s && strcmp(s, "1") == 0; }();
-    if (!enable) {
+    if (!ggml_kperf_on(GGML_KPERF_QWEN35_FAGQA)) {
         return false;
     }
 

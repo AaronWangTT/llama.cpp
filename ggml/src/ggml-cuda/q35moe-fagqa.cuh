@@ -642,11 +642,10 @@ static __global__ void q35moe_fagqa_wmma(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(AMD_WMMA_256B_AVAILABLE)
 }
 
-// GGML_Q35MOE_FAGQA=1 takes the one-token attention of qwen35moe (head size 256, 8 query heads per KV head, K/V rows, F16 or Q8_0 K and V) on gfx1103.
-// mma_f16 says that the op goes to flash_attn_ext_f16 without the switch. The result has the same bits as with that kernel, also for Q8_0 K and V.
+// qwen35moe.fagqa takes the one-token attention of qwen35moe (head size 256, 8 query heads per KV head, K/V rows, F16 or Q8_0 K and V) on gfx1103.
+// mma_f16 says that the op goes to flash_attn_ext_f16 otherwise. The result has the same bits as with that kernel, also for Q8_0 K and V.
 static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool mma_f16) {
-    static const bool enable = [] { const char * s = getenv("GGML_Q35MOE_FAGQA"); return s && strcmp(s, "1") == 0; }();
-    if (!enable) {
+    if (!ggml_kperf_on(GGML_KPERF_QWEN35MOE_FAGQA)) {
         return false;
     }
 
@@ -670,7 +669,7 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ct
     const auto stock = [&](const int reason, const char * why) {
         if (candidate && !logged[reason]) {
             logged[reason] = true;
-            GGML_LOG_WARN("%s: GGML_Q35MOE_FAGQA is not used: %s (sequences = %lld, K %s, V %s)\n",
+            GGML_LOG_INFO("%s: qwen35moe.fagqa is not used: %s (sequences = %lld, K %s, V %s)\n",
                 func, why, (long long) Q->ne[3], ggml_type_name(K->type), ggml_type_name(V->type));
         }
         return false;
@@ -758,7 +757,7 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa(ggml_backend_cuda_context & ct
     static bool logged_use = false;
     if (!logged_use) {
         logged_use = true;
-        GGML_LOG_INFO("%s: GGML_Q35MOE_FAGQA is used, K and V %s, kv = %lld, sequences = %lld, blocks = %d\n",
+        GGML_LOG_INFO("%s: qwen35moe.fagqa is used, K and V %s, kv = %lld, sequences = %lld, blocks = %d\n",
             __func__, ggml_type_name(K->type), (long long) n_kv, (long long) Q->ne[3], nblocks);
     }
 

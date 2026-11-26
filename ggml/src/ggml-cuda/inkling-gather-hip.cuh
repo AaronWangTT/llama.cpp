@@ -42,6 +42,5 @@ static bool inkling_gather_layout(ggml_cgraph * g, int i, int min_tokens) {
 }
 
 static bool inkling_gather_match(ggml_cgraph * g, int i) {
-    static const bool enable = [] { const char * e = getenv("GGML_INKLING_GATHER"); return e && strcmp(e, "1") == 0; }();
-    return enable && inkling_gather_layout(g, i, 2);
+    return ggml_kperf_on(GGML_KPERF_INKLING_GATHER) && inkling_gather_layout(g, i, 2);
 }

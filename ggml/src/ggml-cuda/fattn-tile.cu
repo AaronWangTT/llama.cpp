@@ -65,8 +65,8 @@ fattn_kernel_t ggml_hip_inkling_ppskip_kernel() {
 }
 
 int ggml_hip_inkling_pfattn_mode(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const int ** aux) {
-    static const bool fast = [] { const char * s = getenv("GGML_INKLING_PFATTN"); return s && strcmp(s, "1") == 0; }();
-    static const bool zero = [] { const char * s = getenv("GGML_INKLING_PFZERO"); return s && strcmp(s, "1") == 0; }();
+    const bool fast = ggml_kperf_on(GGML_KPERF_INKLING_PFATTN);
+    const bool zero = ggml_kperf_on(GGML_KPERF_INKLING_PFZERO);
     int pf = fast ? INKLING_PF_FAST : 0;
     // The zero skip is compiled with the fast kernel only. Its empty tile test loads the mask in pairs.
     if (fast && zero && (mask->nb[1] | mask->nb[2] | mask->nb[3] | uintptr_t(mask->data)) % 4 == 0) {
