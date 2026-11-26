@@ -1314,7 +1314,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1 && !use_logit_softcap) {
                 const auto * k = dst->src[1], * mask = dst->src[3];
                 const bool enable = ggml_kperf_on(GGML_KPERF_INKLING_PPSKIP);
-                static const bool trace = getenv("GGML_INKLING_PPSKIP_TRACE") != nullptr;
+                const bool trace = ggml_kperf_trace(GGML_KPERF_INKLING_PPSKIP);
                 const bool shape = ggml_hip_inkling_pf_shape(dst, cc);
                 const bool skip = (enable || trace) && shape && k->ne[1] >= 2048 && k->ne[1] <= 4352 &&
                     (mask->nb[1] | mask->nb[2] | mask->nb[3] | uintptr_t(mask->data)) % 4 == 0;

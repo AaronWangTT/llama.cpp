@@ -197,8 +197,7 @@ static void inkling_pfmm_launch(ggml_backend_cuda_context & ctx, const ggml_tens
         inkling_pfmm<float><<<grid, 256, 0, ctx.stream()>>>(static_cast<const float *>(w->data), xd, dd, n_k, n_rows, stagger - 1);
     }
     CUDA_CHECK(cudaGetLastError());
-    static const bool trace = [] { const char * p = getenv("GGML_INKLING_PFMM_TRACE"); return p && strcmp(p, "1") == 0; }();
-    if (trace) {
+    if (ggml_kperf_trace(GGML_KPERF_INKLING_PFMM)) {
         GGML_LOG_INFO("INKLING_PFMM_HIT %s %s k=%d rows=%d\n", w->name, ggml_type_name(w->type), n_k, n_rows);
     }
 }

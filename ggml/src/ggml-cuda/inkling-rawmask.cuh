@@ -149,8 +149,7 @@ static int inkling_rawmask_site(ggml_backend_cuda_context & ctx, ggml_cgraph * g
                     (half *)out->data,(int)ids->ne[0],(int)p->ne[0],(int)out->ne[1]);
         }
         CUDA_CHECK(cudaGetLastError());
-        static const bool trace = inkling_clip_switch("GGML_INKLING_RAWMASK_TRACE");
-        if (trace) { GGML_LOG_INFO("INKLING_RAWMASK_HIT %s K=%lld T=%lld flags=%d\n",out->name,(long long)ids->ne[0],(long long)ids->ne[1],int(flags)); }
+        if (ggml_kperf_trace(GGML_KPERF_INKLING_RAWMASK)) { GGML_LOG_INFO("INKLING_RAWMASK_HIT %s K=%lld T=%lld flags=%d\n",out->name,(long long)ids->ne[0],(long long)ids->ne[1],int(flags)); }
     }
     return flags ? 10 : 9;
 }

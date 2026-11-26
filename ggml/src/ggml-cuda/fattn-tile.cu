@@ -77,7 +77,7 @@ int ggml_hip_inkling_pfattn_mode(ggml_backend_cuda_context & ctx, const ggml_ten
         *aux = ctx.inkling_pf_aux;
         ctx.inkling_pf_mask = nullptr;
     }
-    static const bool trace = getenv("GGML_INKLING_PFATTN_TRACE") != nullptr;
+    const bool trace = ggml_kperf_trace(GGML_KPERF_INKLING_PFATTN);
     if (trace && pf) {
         GGML_LOG_INFO("INKLING_PFATTN_HIT %s K=%lld fast=%d flags=%d zero=%d\n", mask->name, (long long) mask->ne[0],
             int((pf & INKLING_PF_FAST) != 0), int((pf & INKLING_PF_FAR) != 0), int((pf & INKLING_PF_ZERO) != 0));

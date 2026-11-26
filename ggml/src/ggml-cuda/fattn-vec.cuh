@@ -577,8 +577,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             // One block per KV head and split. It takes the 3 query heads from one load of each K and V row.
             fattn_kernel = inkling_fagqa_vec<D, 3>;
             kv_heads_per_block = 1;
-            static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
-            if (trace_fagqa) {
+            if (ggml_kperf_trace(GGML_KPERF_INKLING_FAGQA)) {
                 GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
             }
         }
@@ -597,8 +596,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
             // One block per 4 KV heads and split. It takes the 3 query heads of each KV head from one load of each K and V row.
             fattn_kernel = inkling_fagqa_q8_vec<D, 3, 8, 4>;
             kv_heads_per_block = 4;
-            static const bool trace_fagqa = getenv("GGML_INKLING_FAGQA_TRACE") != nullptr;
-            if (trace_fagqa) {
+            if (ggml_kperf_trace(GGML_KPERF_INKLING_FAGQA)) {
                 GGML_LOG_INFO("INKLING_FAGQA_HIT %s kv=%lld s=%lld q8\n", mask->name, (long long) k->ne[1], (long long) q->ne[3]);
             }
         }

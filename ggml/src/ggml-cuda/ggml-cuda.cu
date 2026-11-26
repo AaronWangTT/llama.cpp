@@ -4584,8 +4584,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const auto * mask=cgraph->nodes[i+4]->src[0]; auto * out=cgraph->nodes[i+6];
         // CPY's src[1] points to itself. Check the three real read ranges, including input leaves.
         {
-            static const bool trace=getenv("GGML_INKLING_MASKEPI_TRACE")!=nullptr;
-            if (trace) GGML_LOG_INFO("INKLING_MASKEPI_HIT K=%lld Q=%lld S=%lld\n",(long long)ids->ne[0],(long long)out->ne[1],(long long)out->ne[3]);
+            if (ggml_kperf_trace(GGML_KPERF_INKLING_MASKEPI)) GGML_LOG_INFO("INKLING_MASKEPI_HIT K=%lld Q=%lld S=%lld\n",(long long)ids->ne[0],(long long)out->ne[1],(long long)out->ne[3]);
             inkling_maskepi_24<<<dim3((ids->ne[0]+31)/32,ids->ne[1]),128,0,cuda_ctx->stream()>>>(
                 (const uint32_t*)tab->data,(const int32_t*)ids->data,(const half*)mask->data,(half*)out->data,
                 (int)ids->ne[0],(int)tab->ne[1],(int)out->ne[1]);
@@ -4596,8 +4595,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int oi = i + 3;
         {
             const auto * tab = node->src[0]; const auto * ids = node->src[1]; auto * out = cgraph->nodes[oi];
-            static bool trace = getenv("GGML_INKLING_GATHER_TRACE") != nullptr;
-            if (trace) GGML_LOG_INFO("INKLING_GATHER_HIT K=%lld Q=%lld S=%lld\n", (long long)ids->ne[0], (long long)out->ne[1], (long long)out->ne[3]);
+            if (ggml_kperf_trace(GGML_KPERF_INKLING_GATHER)) GGML_LOG_INFO("INKLING_GATHER_HIT K=%lld Q=%lld S=%lld\n", (long long)ids->ne[0], (long long)out->ne[1], (long long)out->ne[3]);
             inkling_bias_gather_24<<<dim3((ids->ne[0]+31)/32,ids->ne[1]),128,0,cuda_ctx->stream()>>>(
                     (const uint32_t *)tab->data, (const int32_t *)ids->data, (uint32_t *)out->data,
                     (int)ids->ne[0], (int)tab->ne[1], (int)out->ne[1]);
@@ -5437,8 +5435,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 // qwen35moe.qshare: start and end of a graph run, nothing is kept across it
 static void ggml_cuda_qshare_reset(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const bool captured) {
     ggml_cuda_qshare & qs = ctx.qshare;
-    static const bool log = [] { const char * p = getenv("GGML_Q35MOE_QSHARE_LOG"); return p && strcmp(p, "1") == 0; }();
-    if (log && qs.n_kept_graph > 0) {
+    if (ggml_kperf_trace(GGML_KPERF_QWEN35MOE_QSHARE) && qs.n_kept_graph > 0) {
         GGML_LOG_INFO("%s: qwen35moe.qshare: graph of %d nodes, %d products quantized their input, %d took the Q8_1 input of the product before\n",
             __func__, cgraph->n_nodes, qs.n_kept_graph, qs.n_taken_graph);
     }

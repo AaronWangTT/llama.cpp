@@ -157,8 +157,7 @@ static void q35moe_pfmmn_launch(ggml_backend_cuda_context & ctx, const ggml_tens
         static_cast<float *>(dst->data), n_k, n_rows, n_tokens, stagger - 1);
     CUDA_CHECK(cudaGetLastError());
     // for the fixture: one line per product
-    static const bool trace = [] { const char * p = getenv("GGML_Q35MOE_PFMMN_TRACE"); return p && strcmp(p, "1") == 0; }();
-    if (trace) {
+    if (ggml_kperf_trace(GGML_KPERF_QWEN35MOE_PFMMN)) {
         GGML_LOG_INFO("Q35MOE_PFMMN_HIT %s rows=%d tokens=%d\n", w->name, n_rows, n_tokens);
     }
 }

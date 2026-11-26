@@ -512,9 +512,9 @@ void ggml_cuda_mul_mat_q(
 
 #if defined(GGML_USE_HIP) && defined(GGML_INKLING_TAIL16_EXPERIMENT)
     const bool tail16 = ggml_kperf_on(GGML_KPERF_INKLING_GATE_TAIL16);
-    static const bool trace = [] { const char * v = getenv("GGML_INKLING_GATE_TAIL16_TRACE"); return v && !strcmp(v,"1"); }();
+    const bool trace = ggml_kperf_trace(GGML_KPERF_INKLING_GATE_TAIL16);
     const bool down_tail = ggml_kperf_on(GGML_KPERF_INKLING_DOWN_TAIL16);
-    static const bool down_trace = [] { const char * v = getenv("GGML_INKLING_DOWN_TAIL16_TRACE"); return v && !strcmp(v,"1"); }();
+    const bool down_trace = ggml_kperf_trace(GGML_KPERF_INKLING_DOWN_TAIL16);
     const bool down = ne00 == 1152 && ne10 == 1152 && ne11 == 8;
     const bool active = down ? down_tail : tail16;
     const bool report = down ? down_trace : trace;

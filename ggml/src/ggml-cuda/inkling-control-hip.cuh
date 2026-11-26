@@ -94,8 +94,7 @@ static int inkling_control_site(ggml_backend_cuda_context & ctx, ggml_cgraph * g
         if (gain) { inkling_control_three<true><<<18*rows,128,0,ctx.stream()>>>(pv,xv,bv,y); }
         else { inkling_control_three<false><<<18*rows,128,0,ctx.stream()>>>(pv,xv,bv,y); }
         CUDA_CHECK(cudaGetLastError());
-        static const bool trace = inkling_clip_switch("GGML_INKLING_CTRL_TAIL_TRACE");
-        if (trace) { GGML_LOG_INFO("INKLING_CTRL_TAIL_HIT %s T=%d\n",p->src[0]->name,rows); }
+        if (ggml_kperf_trace(GGML_KPERF_INKLING_CTRL_TAIL)) { GGML_LOG_INFO("INKLING_CTRL_TAIL_HIT %s T=%d\n",p->src[0]->name,rows); }
     }
     return gain ? 2 : 1;
 }

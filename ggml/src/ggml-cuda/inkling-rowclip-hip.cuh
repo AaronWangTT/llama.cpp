@@ -24,11 +24,6 @@ static __global__ void inkling_clip_one(const float * x, float * y, int cols, fl
     }
 }
 
-static bool inkling_clip_switch(const char * key) {
-    const char * v = getenv(key);
-    return v && strcmp(v, "1") == 0;
-}
-
 // Require real Inkling weight provenance, not just a popular ggml shape or Kcur name.
 static bool inkling_clip_weight(const ggml_tensor * t, const char * suffix) {
     if (!t || t->op != GGML_OP_NONE || strncmp(t->name, "blk.", 4)) { return false; }
@@ -97,7 +92,6 @@ static bool inkling_clip_dispatch(ggml_backend_cuda_context & ctx, ggml_cgraph *
     inkling_clip_one<<<rows,threads,0,ctx.stream()>>>((const float *)x->data, (float *)n[7]->data,
                                                        cols, ggml_get_op_params_f32(n[4],0));
     CUDA_CHECK(cudaGetLastError());
-    static const bool trace = inkling_clip_switch("GGML_INKLING_ROWCLIP_TRACE");
-    if (trace) GGML_LOG_INFO("INKLING_ROWCLIP_HIT cols=%d rows=%d threads=%d\n",cols,rows,threads);
+    if (ggml_kperf_trace(GGML_KPERF_INKLING_ROWCLIP)) GGML_LOG_INFO("INKLING_ROWCLIP_HIT cols=%d rows=%d threads=%d\n",cols,rows,threads);
     return true;
 }

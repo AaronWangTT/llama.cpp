@@ -95,7 +95,6 @@ static int inkling_situ_dispatch(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     inkling_situ_one<<<9*8*(int)gate->ne[2],128,0,ctx.stream()>>>((const float *)pack->data,(float *)out->data,
         scales[0],scales[1],scales[2],scales[3],ggml_get_op_params_f32(n[0],1));
     CUDA_CHECK(cudaGetLastError());
-    static const bool trace = inkling_clip_switch("GGML_INKLING_SITU_TRACE");
-    if (trace) { GGML_LOG_INFO("INKLING_SITU_HIT %s T=%d\n",out->name,(int)gate->ne[2]); }
+    if (ggml_kperf_trace(GGML_KPERF_INKLING_SITU)) { GGML_LOG_INFO("INKLING_SITU_HIT %s T=%d\n",out->name,(int)gate->ne[2]); }
     return last;
 }
