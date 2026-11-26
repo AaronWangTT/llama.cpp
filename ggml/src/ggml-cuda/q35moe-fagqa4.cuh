@@ -840,7 +840,6 @@ static void ggml_cuda_flash_attn_ext_q35moe_fagqa4_launch(ggml_backend_cuda_cont
 // F16 or Q8_0 K and V) on gfx1103. These are the batches that verify the drafts of speculative decoding. One token is GGML_Q35MOE_FAGQA, 5 and more GGML_Q35MOE_PFATTN.
 // mma_f16 says that the op goes to flash_attn_ext_f16 without the switch. The result has the same bits as with that kernel, also for Q8_0 K and V:
 // that path makes F16 copies of the whole K and V first.
-// GGML_Q35MOE_FAGQA4_CHECK=1 with GGML_CUDA_DISABLE_GRAPHS=1 also runs that kernel and logs the number of values with other bits. This is slow, it is for tests.
 static bool ggml_cuda_flash_attn_ext_q35moe_fagqa4(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool mma_f16) {
     static const bool enable = [] { const char * s = getenv("GGML_Q35MOE_FAGQA4"); return s && strcmp(s, "1") == 0; }();
     if (!enable) {
@@ -916,72 +915,10 @@ static bool ggml_cuda_flash_attn_ext_q35moe_fagqa4(ggml_backend_cuda_context & c
         return stock(9, "the configuration of the WMMA kernel");
     }
 
-    cudaStream_t stream = ctx.stream();
-
-    // The check reads the result back. A stream that captures a graph cannot do this, so it needs GGML_CUDA_DISABLE_GRAPHS=1.
-    static const bool check = [] {
-        const char * s = getenv("GGML_Q35MOE_FAGQA4_CHECK");
-        if (!s || strcmp(s, "1") != 0) {
-            return false;
-        }
-        if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
-            GGML_LOG_WARN("GGML_Q35MOE_FAGQA4_CHECK=1 does nothing, it needs GGML_CUDA_DISABLE_GRAPHS=1\n");
-            return false;
-        }
-        return true;
-    }();
-    std::vector<float> out_ref;
-    if (check) {
-        ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
-        out_ref.resize(ggml_nelements(dst));
-        CUDA_CHECK(cudaMemcpyAsync(out_ref.data(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        // Every byte 0xff: a value that the new kernel does not write then has other bits than the reference.
-        CUDA_CHECK(cudaMemsetAsync(dst->data, 0xff, ggml_nbytes(dst), stream));
-    }
-
     if (ncols1 == 2) {
         ggml_cuda_flash_attn_ext_q35moe_fagqa4_launch<2>(ctx, dst, q8);
     } else {
         ggml_cuda_flash_attn_ext_q35moe_fagqa4_launch<4>(ctx, dst, q8);
-    }
-
-    if (check) {
-        std::vector<float> out(out_ref.size());
-        CUDA_CHECK(cudaMemcpyAsync(out.data(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        size_t n_diff = 0;
-        float  d_max  = 0.0f;
-        for (size_t i = 0; i < out.size(); ++i) {
-            if (memcmp(&out[i], &out_ref[i], sizeof(float)) != 0) {
-                n_diff++;
-                d_max = std::max(d_max, fabsf(out[i] - out_ref[i]));
-            }
-        }
-        // The totals go to stderr when the process ends, with the calls for 2, 3 and 4 tokens and for 1 to 8 sequences.
-        static struct check_stats {
-            long n_calls      = 0;
-            long n_calls_diff = 0;
-            long n_calls_tok[3] = {0};
-            long n_calls_seq[8] = {0};
-            ~check_stats() {
-                fprintf(stderr, "ggml_cuda_flash_attn_ext_q35moe_fagqa4: check done, %ld calls, %ld calls with differences, calls by tokens: %ld %ld %ld, by sequences:",
-                    n_calls, n_calls_diff, n_calls_tok[0], n_calls_tok[1], n_calls_tok[2]);
-                for (const long n : n_calls_seq) {
-                    fprintf(stderr, " %ld", n);
-                }
-                fprintf(stderr, "\n");
-            }
-        } stats;
-        stats.n_calls++;
-        stats.n_calls_diff += n_diff > 0;
-        stats.n_calls_tok[Q->ne[1] - 2]++;
-        stats.n_calls_seq[std::min<int64_t>(Q->ne[3], 8) - 1]++;
-        if (stats.n_calls <= 8 || (n_diff > 0 && stats.n_calls_diff <= 32)) {
-            GGML_LOG_INFO("%s: call %ld: %zu of %zu values differ (max %.3g), kv = %lld, tokens = %lld, sequences = %lld, heads = %lld, %s\n",
-                __func__, stats.n_calls, n_diff, out.size(), d_max, (long long) rows->ne[0], (long long) Q->ne[1], (long long) Q->ne[3],
-                (long long) K->ne[2], ggml_type_name(K->type));
-        }
     }
 
     return true;
