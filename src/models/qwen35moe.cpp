@@ -289,7 +289,7 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // MOE FFN layer; 1 to 4 tokens on a ROCm device can take the feed-forward and its residual as one op (5 tokens with GGML_Q35MOE_FFNM5)
+        // MOE FFN layer; 1 to 4 tokens on a ROCm device can take the feed-forward and its residual as one op
         cur = build_layer_ffn_one(attn_post_norm, ffn_residual, il);
         if (cur == nullptr) {
             cur = build_layer_ffn(attn_post_norm, il);
@@ -1140,14 +1140,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 }
 
 // build_layer_ffn() plus the residual as a fused op of ggml-q35moe-ffn.h, nullptr if no op takes this layer
-// GGML_Q35MOE_FFN1 is the op for a graph of one token, GGML_Q35MOE_FFNM the op for a graph of 2 to ggml_q35moe_ffnm_max tokens (GGML_Q35MOE_FFNM5: one more)
+// GGML_Q35MOE_FFN1 is the op for a graph of one token, GGML_Q35MOE_FFNM the op for a graph of 2 to ggml_q35moe_ffnm_max tokens
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cur, ggml_tensor * residual, const int il) {
 #ifdef GGML_INKLING_DEPTHMIX_GFX1103
     if (ggml_q35moe_exponce_enabled() && !ggml_q35moe_ffnm_enabled()) {
         q35moe_log_off("GGML_Q35MOE_EXPONCE", "it acts inside the op of GGML_Q35MOE_FFNM, which is not set");
-    }
-    if (ggml_q35moe_ffnm5_enabled() && !ggml_q35moe_ffnm_enabled()) {
-        q35moe_log_off("GGML_Q35MOE_FFNM5", "it extends the op of GGML_Q35MOE_FFNM, which is not set");
     }
     if (!ggml_q35moe_ffn1_enabled() && !ggml_q35moe_ffnm_enabled()) {
         return nullptr;
@@ -1241,20 +1238,18 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_one(ggml_tensor * cu
         if (ggml_q35moe_ffnm_enabled()) {
             static std::once_flag reported;
             std::call_once(reported, [&] {
-                const char * graph = ggml_q35moe_ffnm5_enabled() ? "2 to 5 tokens (5 tokens: not the stock result)" : "2 to 4 tokens";
-                report(ggml_q35moe_exponce_enabled() ? "GGML_Q35MOE_FFNM with GGML_Q35MOE_EXPONCE" : "GGML_Q35MOE_FFNM", graph, 2, ggml_q35moe_try_ffnm);
+                report(ggml_q35moe_exponce_enabled() ? "GGML_Q35MOE_FFNM with GGML_Q35MOE_EXPONCE" : "GGML_Q35MOE_FFNM", "2 to 4 tokens", 2, ggml_q35moe_try_ffnm);
             });
         }
     }
-    static_assert(ggml_q35moe_ffnm_max == 4 && ggml_q35moe_ffnm5_max == 5, "the log line names the largest graph");
+    static_assert(ggml_q35moe_ffnm_max == 4, "the log line names the largest graph");
 
     // An op is for graphs of its token count only: the last block of a larger graph with few output rows has a small input too.
     // An op there would change the topology between batches (one slot generates, another reads a prompt), and the scheduler then plans the memory again.
     try_op_t try_op = nullptr;
     if (ubatch.n_tokens == 1) {
         try_op = ggml_q35moe_ffn1_enabled() ? ggml_q35moe_try_ffn1 : nullptr;
-    } else if (ubatch.n_tokens <= (uint32_t) ggml_q35moe_ffnm5_max && cur->ne[1] == (int64_t) ubatch.n_tokens) {
-        // the op itself refuses the largest count without GGML_Q35MOE_FFNM5
+    } else if (ubatch.n_tokens <= (uint32_t) ggml_q35moe_ffnm_max && cur->ne[1] == (int64_t) ubatch.n_tokens) {
         try_op = ggml_q35moe_ffnm_enabled() ? ggml_q35moe_try_ffnm : nullptr;
     }
     if (try_op == nullptr) {

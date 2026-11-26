@@ -1,14 +1,11 @@
 // Fixture for the feed-forward ops of the qwen35moe blocks (ggml-q35moe-ffn.h): one token, and 2 to ggml_q35moe_ffnm_max tokens.
 // The fused op on ROCm0 must match the stock nodes of build_moe_ffn() and build_ffn() bit for bit, for every weight type with a kernel.
 // A token of a many-token op must also get the bits of the one-token op: its value does not depend on the other tokens.
-// With GGML_Q35MOE_FFNM5=1 the op also takes 5 tokens. The stock nodes of 5 tokens use matrix kernels for the routed experts,
-// which round in another way and quantize the input of a Q6_K product in blocks of 64 values instead of 32:
-// there only the bits of the one-token op are checked, and a loose bound against the stock nodes.
 // Both graphs run through the scheduler as in llama.cpp: only then the backend fuses the top-k chain of the stock nodes into
 // topk_moe_cuda, the form that the op replays (without the scheduler the chain runs node by node and rounds differently).
 // Cases with a zero router, a zero shared expert, zero routed experts and a zero input show which part differs.
 // The CPU callback must stay close to the stock nodes on CPU.
-//   GGML_Q35MOE_FFN1=1 GGML_Q35MOE_FFNM=1 [GGML_Q35MOE_EXPONCE=1] [GGML_Q35MOE_FFNM5=1] q35moe-hip-ffn ABS_LIBDIR
+//   GGML_Q35MOE_FFN1=1 GGML_Q35MOE_FFNM=1 [GGML_Q35MOE_EXPONCE=1] q35moe-hip-ffn ABS_LIBDIR
 #include "ggml-backend.h"
 #include "ggml-q35moe-ffn.h"
 
@@ -221,11 +218,10 @@ int main(int argc, char ** argv) {
 
     std::mt19937_64 rng(4096);
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    const int n_tok_max = ggml_q35moe_ffnm5_enabled() ? ggml_q35moe_ffnm5_max : ggml_q35moe_ffnm_max;
+    const int n_tok_max = ggml_q35moe_ffnm_max;
     long   n_diff    = 0;
     long   n_dep     = 0;
     double worst_cpu = 0.0;
-    double worst_mmq = 0.0;
     for (size_t s = 0; s < sizeof(sets)/sizeof(sets[0]); ++s) {
         const types & t = sets[s];
         const auto data = make_data(t, rng);
@@ -280,11 +276,7 @@ int main(int argc, char ** argv) {
                         std::printf(", first at %d: %a stock, %a fused", first, ref[first], out[first]);
                     }
                     std::printf("\n");
-                    if (n_tok <= ggml_q35moe_ffnm_max) {
-                        n_diff += diff;
-                    } else if (amax > 0.0) {
-                        worst_mmq = std::max(worst_mmq, dmax/amax);
-                    }
+                    n_diff += diff;
                     n_dep += dep;
 
                     // CPU: the callback against the stock nodes, which quantize the input of a product
@@ -315,13 +307,8 @@ int main(int argc, char ** argv) {
     }
     check(n_diff == 0, "the fused op is not bit-exact");
     check(n_dep == 0, "a token of the many-token op depends on the other tokens");
-    check(worst_mmq < 1e-2, "5 tokens: error against the stock nodes above 1e-2");
     check(worst_cpu < 5e-2, "cpu reference error above 5e-2");
-    std::printf("PASS bit-exact for 1 to %d tokens, worst cpu reference error %.2e", ggml_q35moe_ffnm_max, worst_cpu);
-    if (n_tok_max > ggml_q35moe_ffnm_max) {
-        std::printf(", %d tokens: bits of the one-token op, worst error against the stock nodes %.2e", n_tok_max, worst_mmq);
-    }
-    std::printf("\n");
+    std::printf("PASS bit-exact for 1 to %d tokens, worst cpu reference error %.2e\n", ggml_q35moe_ffnm_max, worst_cpu);
     ggml_backend_free(hip);
     ggml_backend_free(cpu);
     return 0;

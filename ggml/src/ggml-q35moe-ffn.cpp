@@ -54,11 +54,10 @@ bool ffn1_layout(const ggml_tensor * const * src) {
     return f32_vec(src[GGML_Q35MOE_FFN1_X]) && f32_vec(src[GGML_Q35MOE_FFN1_RES]) && weights_layout(src);
 }
 
-// n_embd values for each of 2 to ggml_q35moe_ffnm_max tokens, one more with GGML_Q35MOE_FFNM5
+// n_embd values for each of 2 to ggml_q35moe_ffnm_max tokens
 bool f32_cols(const ggml_tensor * x) {
-    const int64_t n_max = ggml_q35moe_ffnm5_enabled() ? ggml_q35moe_ffnm5_max : ggml_q35moe_ffnm_max;
     return x && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] == n_embd &&
-        x->ne[1] >= 2 && x->ne[1] <= n_max && x->ne[2] == 1 && x->ne[3] == 1;
+        x->ne[1] >= 2 && x->ne[1] <= ggml_q35moe_ffnm_max && x->ne[2] == 1 && x->ne[3] == 1;
 }
 
 bool ffnm_layout(const ggml_tensor * const * src) {
@@ -239,10 +238,5 @@ bool ggml_q35moe_is_ffnm(const ggml_tensor * op) {
 
 bool ggml_q35moe_exponce_enabled() {
     static const bool enabled = env_on("GGML_Q35MOE_EXPONCE");
-    return enabled;
-}
-
-bool ggml_q35moe_ffnm5_enabled() {
-    static const bool enabled = env_on("GGML_Q35MOE_FFNM5");
     return enabled;
 }

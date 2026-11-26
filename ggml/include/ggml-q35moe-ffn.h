@@ -20,10 +20,6 @@ GGML_API bool ggml_q35moe_is_ffnm(const ggml_tensor * op);
 
 // GGML_Q35MOE_EXPONCE=1, inside the many-token op: the rows of an expert are loaded once for all tokens of the batch that selected it. Same values.
 GGML_API bool ggml_q35moe_exponce_enabled();
-
-// GGML_Q35MOE_FFNM5=1: the many-token op also takes ggml_q35moe_ffnm5_max tokens. NOT the stock result of that batch size:
-// there the stock routed products are matrix kernels that round in another way. Every token gets the value that a smaller batch gives it.
-GGML_API bool ggml_q35moe_ffnm5_enabled();
 }
 
 // sources of the op
@@ -49,8 +45,6 @@ constexpr int ggml_q35moe_n_used   = 8;
 
 // most tokens of the many-token op: up to here the stock routed products of Q4_K, Q5_K and Q6_K weights are vector kernels on gfx1103
 constexpr int ggml_q35moe_ffnm_max  = 4;
-// most tokens with GGML_Q35MOE_FFNM5
-constexpr int ggml_q35moe_ffnm5_max = 5;
 
 // lower bound of the sum of the selected probabilities, the CLAMP node of build_moe_ffn
 constexpr float ggml_q35moe_sum_min = 6.103515625e-5f;

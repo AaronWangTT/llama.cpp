@@ -9,9 +9,8 @@
 //   sum                                 moe_weighted_reduction_f32, MUL, ADD of three values, per token
 // The device functions are those of the one-token op.
 // GGML_Q35MOE_EXPONCE: tokens of the batch that selected the same expert share one warp, which loads the rows of the expert once. The sums of a token stay the same.
-// GGML_Q35MOE_FFNM5: one token more. The stock routed products of that batch size are matrix kernels, so the result is not the stock result there.
 
-constexpr int q35moe_ffnm_max  = ggml_q35moe_ffnm5_max;
+constexpr int q35moe_ffnm_max  = ggml_q35moe_ffnm_max;
 constexpr int q35moe_ffnm_rows = 2; // rows of a routed expert per warp, as in mul_mat_vec_q_moe
 
 // The owner word of slot s = token*n_used + place: 0 if an earlier token selected the same expert.
@@ -213,7 +212,7 @@ static __global__ void q35moe_ffnm_exps_up(
     constexpr int rows           = q35moe_ffnm_rows;
     constexpr int blocks_per_row = q35moe_n_embd / ggml_cuda_type_traits<type>::qk;
     static_assert(2*q35moe_n_used == q35moe_n_ff / QK8_1, "two columns hold the blocks of a shared hidden vector");
-    static_assert(q35moe_ffnm_max == 5, "one case for each number of tokens that share an expert");
+    static_assert(q35moe_ffnm_max == 4, "one case for each number of tokens that share an expert");
 
     const int t = threadIdx.y;
     const int k = blockIdx.y;
@@ -234,7 +233,6 @@ static __global__ void q35moe_ffnm_exps_up(
         case 2: q35moe_ffnm_up_rows<type, 2>(vup, vgate, xq, kbx0, own, s, row0, h); break;
         case 3: q35moe_ffnm_up_rows<type, 3>(vup, vgate, xq, kbx0, own, s, row0, h); break;
         case 4: q35moe_ffnm_up_rows<type, 4>(vup, vgate, xq, kbx0, own, s, row0, h); break;
-        case 5: q35moe_ffnm_up_rows<type, 5>(vup, vgate, xq, kbx0, own, s, row0, h); break;
         default: break;
     }
 }
@@ -329,7 +327,6 @@ static __global__ void q35moe_ffnm_exps_down(
         case 2: q35moe_ffnm_down_rows<type, 2>(vdown, hq, kbx0, own, s, row0, d); break;
         case 3: q35moe_ffnm_down_rows<type, 3>(vdown, hq, kbx0, own, s, row0, d); break;
         case 4: q35moe_ffnm_down_rows<type, 4>(vdown, hq, kbx0, own, s, row0, d); break;
-        case 5: q35moe_ffnm_down_rows<type, 5>(vdown, hq, kbx0, own, s, row0, d); break;
         default: break;
     }
 }
@@ -383,12 +380,11 @@ static bool q35moe_ffnm_supported(int device, const ggml_tensor * op) {
 // calls f with the token count as a constant
 template <typename F>
 static void q35moe_ffnm_with_count(int n_tok, F && f) {
-    static_assert(q35moe_ffnm_max == 5, "one case for each token count");
+    static_assert(q35moe_ffnm_max == 4, "one case for each token count");
     switch (n_tok) {
         case 2:  f(std::integral_constant<int, 2>{}); break;
         case 3:  f(std::integral_constant<int, 3>{}); break;
         case 4:  f(std::integral_constant<int, 4>{}); break;
-        case 5:  f(std::integral_constant<int, 5>{}); break;
         default: GGML_ABORT("fatal error");
     }
 }
