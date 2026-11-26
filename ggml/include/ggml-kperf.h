@@ -58,6 +58,7 @@ extern "C" {
     X(QWEN35_CONVPF,         "qwen35.convpf",         true,  "",                    "GGML_QWEN35_CONVPF",           "prefill conv without the concat tensor") \
     X(QWEN35_FAGQA,          "qwen35.fagqa",          true,  "",                    "GGML_QWEN35_FAGQA",            "one-token attention, D256, 4 query heads per KV head") \
     X(QWEN35_PFATTN,         "qwen35.pfattn",         true,  "",                    "GGML_QWEN35_PFATTN",           "prefill attention, D256, 4 query heads per KV head") \
+    X(QWEN35_PFLOAD,         "qwen35.pfload",         true,  "qwen35.pfattn",       "",                             "inside pfattn: the row numbers of a warp in one 16-byte load, the second K half tile loaded before the QK products") \
     X(QWEN35_Q6K_MMQ,        "qwen35.q6k_mmq",        false, "",                    "GGML_QWEN35_Q6K_MMQ",          "Q6_K takes MMQ at any batch size (other rounding than dequantization + hipBLAS)") \
     X(QWEN35MOE_MVSHARE,     "qwen35moe.mvshare",     true,  "",                    "GGML_Q35MOE_MVSHARE",          "one-token products that share one input") \
     X(QWEN35MOE_BA1,         "qwen35moe.ba1",         true,  "",                    "GGML_Q35MOE_BA1",              "one-token F32 beta/alpha products in one launch") \
