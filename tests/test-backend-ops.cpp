@@ -13243,6 +13243,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // prefill attention of qwen35 (GQA 4) and qwen35moe (GQA 8), head size 256: K/V row lists with F16 and Q8_0 K/V, and GQA 8 without a row list
+    for (int64_t nb : {64, 512}) {
+        for (int64_t n_slices : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4096, 1024, nb, n_slices, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 4096, 1024, nb, n_slices));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 16384, 4096, nb, 4, GGML_TYPE_Q8_0, false, true));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 16384, 4096, nb, 4, GGML_TYPE_F16, false, true));
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(512, 32, 4, 32, 2));
 
