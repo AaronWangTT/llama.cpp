@@ -41,6 +41,7 @@ extern "C" {
     X(INKLING_PPSKIP,        "inkling.ppskip",        true,  "",                    "GGML_INKLING_PPSKIP",          "prefill attention skips fully masked prefix tiles (finite K/V)") \
     X(INKLING_PFATTN,        "inkling.pfattn",        true,  "",                    "GGML_INKLING_PFATTN",          "prefill attention kernel for 256 queries") \
     X(INKLING_PFMM,          "inkling.pfmm",          true,  "",                    "GGML_INKLING_PFMM",            "prefill router/controller float products") \
+    X(INKLING_BF16_F32ACC,   "inkling.bf16_f32acc",   false, "",                    "GGML_INKLING_BF16_F32ACC",     "BF16 weight with F32 accumulation takes the F32 kernels (MMVF, SGEMM); MMF and the BF16 GEMM round src1") \
     X(QWEN35_MVSHARE,        "qwen35.mvshare",        true,  "",                    "GGML_QWEN35_MVSHARE",          "one-token products that share one input") \
     X(QWEN35_PREP1,          "qwen35.prep1",          true,  "",                    "GGML_QWEN35_PREP1",            "one-token conv, SiLU, norm, beta and gate in one op") \
     X(QWEN35_GDN1,           "qwen35.gdn1",           true,  "",                    "GGML_QWEN35_GDN1",             "one-token delta net in one op") \

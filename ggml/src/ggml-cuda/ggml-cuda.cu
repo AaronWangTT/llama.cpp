@@ -2529,8 +2529,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         q35moe_pfmmn_launch(ctx, src0, src1, dst);
         return;
     }
-    // F32 accumulation of a BF16 weight takes the kernels of an F32 weight; MMF and the BF16 GEMM round src1
-    if (src0->type == GGML_TYPE_BF16 && ggml_prec_get_acc(dst) == GGML_PREC_F32 && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103) {
+    // inkling.bf16_f32acc: F32 accumulation of a BF16 weight takes the kernels of an F32 weight; MMF and the BF16 GEMM round src1
+    if (src0->type == GGML_TYPE_BF16 && ggml_prec_get_acc(dst) == GGML_PREC_F32 && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 &&
+            ggml_kperf_on(GGML_KPERF_INKLING_BF16_F32ACC)) {
         const size_t ts = ggml_type_size(src0->type);
         if (ne11 <= MMVF_MAX_BATCH_SIZE && ne00 % 2 == 0 && nb00 == ts && ggml_cuda_is_aligned(src0, 2*ts)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
