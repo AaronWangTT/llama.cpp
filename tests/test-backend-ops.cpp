@@ -13255,6 +13255,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         }
     }
+    // the same kernels with a last tile that has fewer queries than the tile (13 for GQA 8, 20 for GQA 4), and with one tile per head on a long list,
+    // so that the blocks split the list inside a tile (the fixup paths)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t n_slices : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4096, 1024, 13, n_slices, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 4096, 1024, 20, n_slices, type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 32768, 16384,  8, 1, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 32768, 16384, 16, 1, type_KV));
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(256,  5, 1,  8, 1));
     test_cases.emplace_back(new test_flash_attn_ext_kv_rows_mask(512, 32, 4, 32, 2));
