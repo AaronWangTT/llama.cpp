@@ -1,5 +1,6 @@
 #pragma once
 #include "q35moe-ffn.cuh"
+#include "ggml-kperf.h"
 
 // The feed-forward of 2 to ggml_q35moe_ffnm_max tokens in six launches (qwen35moe.ffnm). Every token gets the value that the stock kernels of a batch of that size give it:
 //   router, gate of the shared expert   mul_mat_vec_f<float, float, n, 256>: the sum of a column does not depend on the other columns
@@ -9,9 +10,13 @@
 //   sum                                 moe_weighted_reduction_f32, MUL, ADD of three values, per token
 // The device functions are those of the one-token op.
 // qwen35moe.exponce: tokens of the batch that selected the same expert share one warp, which loads the rows of the expert once. The sums of a token stay the same.
+// qwen35moe.ffnm_topk: the top-k block of launch 2 is the first block and has one warp per token; the shared expert rows run in blocks of 4 warps.
+// qwen35moe.ffnm_list: launch 2 also writes the list of the owner slots, and launches 3 and 5 have one warp per block for each list entry
+// (an expert of the batch) instead of 4 warps per block of which only the owners work; down takes 4 rows per warp. A sum keeps its lanes and order.
 
 constexpr int q35moe_ffnm_max  = ggml_q35moe_ffnm_max;
 constexpr int q35moe_ffnm_rows = 2; // rows of a routed expert per warp, as in mul_mat_vec_q_moe
+constexpr int q35moe_ffnm_list_rows_down = 4; // rows of down per warp with qwen35moe.ffnm_list
 
 // The owner word of slot s = token*n_used + place: 0 if an earlier token selected the same expert.
 // Else bits 0..2 are the number of tokens m that share the expert. Sharer 0 is the slot itself, bits 3 + 6*(j - 1) are the slot of sharer j.
@@ -25,7 +30,8 @@ static __device__ __forceinline__ int q35moe_ffnm_slot(const uint32_t own, const
 }
 
 // one warp makes the owner words, lane l those of the slots l, l + 32, ..; once: tokens share experts
-static __device__ __forceinline__ void q35moe_ffnm_owners(const int32_t * ids, int32_t * own, const int n_tok, const bool once) {
+// list (if not null): an entry (owner word, slot | expert << 8) for each owner slot in slot order, then entries with a zero word up to n_tok*n_used
+static __device__ __forceinline__ void q35moe_ffnm_owners(const int32_t * ids, int32_t * own, const int n_tok, const bool once, uint2 * list) {
     for (int s = threadIdx.x; s < n_tok*q35moe_n_used; s += q35moe_warp) {
         const int t = s / q35moe_n_used;
         const int e = ids[s];
@@ -43,6 +49,22 @@ static __device__ __forceinline__ void q35moe_ffnm_owners(const int32_t * ids, i
             }
         }
         own[s] = first ? word | m : 0;
+    }
+
+    if (list == nullptr) {
+        return;
+    }
+    static_assert(q35moe_ffnm_max*q35moe_n_used <= q35moe_warp, "one slot per lane");
+    const int      s     = threadIdx.x;
+    const bool     in    = s < n_tok*q35moe_n_used;
+    const uint32_t word  = in ? own[s] : 0;
+    const uint64_t mask  = __ballot_sync(0xFFFFFFFFULL, word != 0);
+    if (word != 0) {
+        list[__popcll(mask & ((1ull << s) - 1))] = make_uint2(word, s | ids[s] << 8);
+    }
+    // an owner of a later slot writes its entry further up, so every lane past the owners clears its own place
+    if (in && s >= __popcll(mask)) {
+        list[s] = make_uint2(0, 0);
     }
 }
 
@@ -114,24 +136,41 @@ static __global__ void q35moe_ffnm_router(
 }
 
 // launch 2: one warp per row of the shared expert gate/up for n_tok tokens, the last block is the top-k of every token and the owner words
-template <ggml_type type, int n_tok>
-__launch_bounds__(q35moe_warp, 1)
+// topk_first (qwen35moe.ffnm_topk): blocks of q35moe_ffnm_max warps, the first block makes the top-k with one warp per token
+template <ggml_type type, int n_tok, bool topk_first>
+__launch_bounds__(q35moe_warp * (topk_first ? q35moe_ffnm_max : 1), 1)
 static __global__ void q35moe_ffnm_shexp_up(
         const void * vup, const void * vgate, const block_q8_1 * xq, const float * logits,
-        float * h, int32_t * ids, float * weights, int32_t * own, const bool once) {
+        float * h, int32_t * ids, float * weights, int32_t * own, const bool once, uint2 * list) {
     constexpr int blocks_per_row = q35moe_n_embd / ggml_cuda_type_traits<type>::qk;
     constexpr int blocks_per_y   = q35moe_n_embd / QK8_1;
 
-    if (blockIdx.x == q35moe_n_ff) {
-#pragma unroll
-        for (int j = 0; j < n_tok; ++j) {
-            q35moe_topk(logits + j*q35moe_n_expert, ids + j*q35moe_n_used, weights + j*q35moe_n_used);
+    int row;
+    if constexpr (topk_first) {
+        static_assert(n_tok <= q35moe_ffnm_max, "one warp per token");
+        if (blockIdx.x == 0) {
+            const int j = threadIdx.y;
+            if (j < n_tok) {
+                q35moe_topk(logits + j*q35moe_n_expert, ids + j*q35moe_n_used, weights + j*q35moe_n_used);
+            }
+            __syncthreads();
+            if (j == 0) {
+                q35moe_ffnm_owners(ids, own, n_tok, once, list);
+            }
+            return;
         }
-        q35moe_ffnm_owners(ids, own, n_tok, once);
-        return;
+        row = (blockIdx.x - 1)*q35moe_ffnm_max + threadIdx.y;
+    } else {
+        if (blockIdx.x == q35moe_n_ff) {
+#pragma unroll
+            for (int j = 0; j < n_tok; ++j) {
+                q35moe_topk(logits + j*q35moe_n_expert, ids + j*q35moe_n_used, weights + j*q35moe_n_used);
+            }
+            q35moe_ffnm_owners(ids, own, n_tok, once, list);
+            return;
+        }
+        row = blockIdx.x;
     }
-
-    const int row = blockIdx.x;
 
     const void *       vx[2*n_tok];
     const block_q8_1 * vy[2*n_tok];
@@ -237,6 +276,39 @@ static __global__ void q35moe_ffnm_exps_up(
     }
 }
 
+// launch 3 with qwen35moe.ffnm_list, grid (n_ff/2 + 2, n_tok*n_used), one warp per block: the warp of list entry blockIdx.y makes two rows of its expert
+// for the tokens that share it, as in q35moe_ffnm_exps_up; the last two columns quantize the hidden vectors of the shared expert
+template <ggml_type type>
+__launch_bounds__(q35moe_warp, 1)
+static __global__ void q35moe_ffnm_exps_up_list(
+        const void * vup, const void * vgate, const block_q8_1 * xq, const uint2 * list, const float * h_shexp, block_q8_1 * hq_shexp, float * h) {
+    constexpr int rows           = q35moe_ffnm_rows;
+    constexpr int blocks_per_row = q35moe_n_embd / ggml_cuda_type_traits<type>::qk;
+    static_assert(q35moe_ffnm_max == 4, "one case for each number of tokens that share an expert");
+
+    const int i = blockIdx.y;
+
+    if (blockIdx.x >= q35moe_n_ff/rows) {
+        q35moe_quantize(h_shexp, hq_shexp, (i/q35moe_n_used)*(q35moe_n_ff/QK8_1) + (blockIdx.x - q35moe_n_ff/rows)*q35moe_n_used + i%q35moe_n_used);
+        return;
+    }
+
+    const uint2    e   = list[i];
+    const uint32_t own = e.x;
+    const int      s   = e.y & 0xff;
+
+    const int row0 = rows*blockIdx.x;
+    const int kbx0 = ((int) (e.y >> 8)*q35moe_n_ff + row0)*blocks_per_row;
+
+    switch (own & 7) {
+        case 1: q35moe_ffnm_up_rows<type, 1>(vup, vgate, xq, kbx0, own, s, row0, h); break;
+        case 2: q35moe_ffnm_up_rows<type, 2>(vup, vgate, xq, kbx0, own, s, row0, h); break;
+        case 3: q35moe_ffnm_up_rows<type, 3>(vup, vgate, xq, kbx0, own, s, row0, h); break;
+        case 4: q35moe_ffnm_up_rows<type, 4>(vup, vgate, xq, kbx0, own, s, row0, h); break;
+        default: break;
+    }
+}
+
 // launch 4: one warp per row of the shared expert down for n_tok tokens, the last blocks quantize the hidden vectors of the routed experts
 template <ggml_type type, int n_tok>
 __launch_bounds__(q35moe_warp, 1)
@@ -273,11 +345,10 @@ static __global__ void q35moe_ffnm_shexp_down(
     }
 }
 
-// rows row0 and row0 + 1 of the down of one expert for the m tokens of an owner word
-template <ggml_type type, int m>
+// rows row0 .. row0 + rows - 1 of the down of one expert for the m tokens of an owner word
+template <ggml_type type, int m, int rows = q35moe_ffnm_rows>
 static __device__ __forceinline__ void q35moe_ffnm_down_rows(
         const void * vdown, const block_q8_1 * hq, const int kbx0, const uint32_t own, const int s, const int row0, float * d) {
-    constexpr int rows           = q35moe_ffnm_rows;
     constexpr int blocks_per_row = q35moe_n_ff / ggml_cuda_type_traits<type>::qk;
     constexpr int blocks_per_y   = q35moe_n_ff / QK8_1;
 
@@ -327,6 +398,30 @@ static __global__ void q35moe_ffnm_exps_down(
         case 2: q35moe_ffnm_down_rows<type, 2>(vdown, hq, kbx0, own, s, row0, d); break;
         case 3: q35moe_ffnm_down_rows<type, 3>(vdown, hq, kbx0, own, s, row0, d); break;
         case 4: q35moe_ffnm_down_rows<type, 4>(vdown, hq, kbx0, own, s, row0, d); break;
+        default: break;
+    }
+}
+
+// launch 5 with qwen35moe.ffnm_list, grid (n_embd/4, n_tok*n_used), one warp per block: the warp of list entry blockIdx.y makes 4 rows of the down
+// of its expert for the tokens that share it
+template <ggml_type type>
+__launch_bounds__(q35moe_warp, 1)
+static __global__ void q35moe_ffnm_exps_down_list(const void * vdown, const block_q8_1 * hq, const uint2 * list, float * d) {
+    constexpr int rows           = q35moe_ffnm_list_rows_down;
+    constexpr int blocks_per_row = q35moe_n_ff / ggml_cuda_type_traits<type>::qk;
+
+    const uint2    e   = list[blockIdx.y];
+    const uint32_t own = e.x;
+    const int      s   = e.y & 0xff;
+
+    const int row0 = rows*blockIdx.x;
+    const int kbx0 = ((int) (e.y >> 8)*q35moe_n_embd + row0)*blocks_per_row;
+
+    switch (own & 7) {
+        case 1: q35moe_ffnm_down_rows<type, 1, rows>(vdown, hq, kbx0, own, s, row0, d); break;
+        case 2: q35moe_ffnm_down_rows<type, 2, rows>(vdown, hq, kbx0, own, s, row0, d); break;
+        case 3: q35moe_ffnm_down_rows<type, 3, rows>(vdown, hq, kbx0, own, s, row0, d); break;
+        case 4: q35moe_ffnm_down_rows<type, 4, rows>(vdown, hq, kbx0, own, s, row0, d); break;
         default: break;
     }
 }
@@ -394,6 +489,8 @@ static void q35moe_ffnm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op
 
     const int  n_tok = op->ne[1];
     const bool once  = ggml_q35moe_exponce_enabled();
+    const bool topk  = ggml_kperf_on(GGML_KPERF_QWEN35MOE_FFNM_TOPK);
+    const bool listw = ggml_kperf_on(GGML_KPERF_QWEN35MOE_FFNM_LIST);
 
     const float * x   = static_cast<const float *>(op->src[GGML_Q35MOE_FFN1_X]->data);
     const float * res = static_cast<const float *>(op->src[GGML_Q35MOE_FFN1_RES]->data);
@@ -409,10 +506,11 @@ static void q35moe_ffnm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op
     const void * w_gate_shexp = op->src[GGML_Q35MOE_FFN1_GATE_SHEXP]->data;
 
     // scratch, each part holds the tokens one after the other:
-    // router logits, gates, weights, ids and owner words of the selected experts, hidden vectors, outputs of the shared and the routed experts, quantized vectors
+    // router logits, gates, weights, ids and owner words of the selected experts, list of the owners (two words per slot),
+    // hidden vectors, outputs of the shared and the routed experts, quantized vectors
     constexpr int n_h      = q35moe_n_ff*q35moe_n_used;
     constexpr int n_d      = q35moe_n_embd*q35moe_n_used;
-    constexpr int n_floats = q35moe_n_expert + 4*q35moe_n_used + q35moe_n_ff + n_h + q35moe_n_embd + n_d;
+    constexpr int n_floats = q35moe_n_expert + 6*q35moe_n_used + q35moe_n_ff + n_h + q35moe_n_embd + n_d;
     constexpr int n_q8     = (q35moe_n_embd + q35moe_n_ff + n_h) / QK8_1;
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_tok*(n_floats + 9*n_q8));
 
@@ -421,7 +519,8 @@ static void q35moe_ffnm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op
     float *      weights  = gate + n_tok*q35moe_n_used;
     int32_t *    ids      = reinterpret_cast<int32_t *>(weights + n_tok*q35moe_n_used);
     int32_t *    own      = ids + n_tok*q35moe_n_used;
-    float *      h_shexp  = weights + 3*n_tok*q35moe_n_used;
+    uint2 *      list     = listw ? reinterpret_cast<uint2 *>(own + n_tok*q35moe_n_used) : nullptr;
+    float *      h_shexp  = weights + 5*n_tok*q35moe_n_used;
     float *      h_exps   = h_shexp + n_tok*q35moe_n_ff;
     float *      d_shexp  = h_exps + n_tok*n_h;
     float *      d_exps   = d_shexp + n_tok*q35moe_n_embd;
@@ -437,15 +536,25 @@ static void q35moe_ffnm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op
 
     q35moe_ffn_with_type(up_shexp->type, [&](auto t) {
         q35moe_ffnm_with_count(n_tok, [&](auto n) {
-            q35moe_ffnm_shexp_up<decltype(t)::value, decltype(n)::value><<<q35moe_n_ff + 1, q35moe_warp, 0, stream>>>(
-                up_shexp->data, w_gate_shexp, xq, logits, h_shexp, ids, weights, own, once);
+            if (topk) {
+                q35moe_ffnm_shexp_up<decltype(t)::value, decltype(n)::value, true><<<q35moe_n_ff/q35moe_ffnm_max + 1, dim3(q35moe_warp, q35moe_ffnm_max), 0, stream>>>(
+                    up_shexp->data, w_gate_shexp, xq, logits, h_shexp, ids, weights, own, once, list);
+            } else {
+                q35moe_ffnm_shexp_up<decltype(t)::value, decltype(n)::value, false><<<q35moe_n_ff + 1, q35moe_warp, 0, stream>>>(
+                    up_shexp->data, w_gate_shexp, xq, logits, h_shexp, ids, weights, own, once, list);
+            }
         });
     });
     CUDA_CHECK(cudaGetLastError());
 
     q35moe_ffn_with_type(up_exps->type, [&](auto t) {
-        q35moe_ffnm_exps_up<decltype(t)::value><<<dim3(q35moe_n_ff/q35moe_ffnm_rows + 2, q35moe_n_used), dim3(q35moe_warp, n_tok), 0, stream>>>(
-            up_exps->data, w_gate_exps, xq, ids, own, h_shexp, hq_shexp, h_exps);
+        if (listw) {
+            q35moe_ffnm_exps_up_list<decltype(t)::value><<<dim3(q35moe_n_ff/q35moe_ffnm_rows + 2, n_tok*q35moe_n_used), q35moe_warp, 0, stream>>>(
+                up_exps->data, w_gate_exps, xq, list, h_shexp, hq_shexp, h_exps);
+        } else {
+            q35moe_ffnm_exps_up<decltype(t)::value><<<dim3(q35moe_n_ff/q35moe_ffnm_rows + 2, q35moe_n_used), dim3(q35moe_warp, n_tok), 0, stream>>>(
+                up_exps->data, w_gate_exps, xq, ids, own, h_shexp, hq_shexp, h_exps);
+        }
     });
     CUDA_CHECK(cudaGetLastError());
 
@@ -458,12 +567,25 @@ static void q35moe_ffnm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * op
     CUDA_CHECK(cudaGetLastError());
 
     q35moe_ffn_with_type(down_exps->type, [&](auto t) {
-        q35moe_ffnm_exps_down<decltype(t)::value><<<dim3(q35moe_n_embd/q35moe_ffnm_rows, q35moe_n_used), dim3(q35moe_warp, n_tok), 0, stream>>>(
-            down_exps->data, hq_exps, ids, own, d_exps);
+        if (listw) {
+            q35moe_ffnm_exps_down_list<decltype(t)::value><<<dim3(q35moe_n_embd/q35moe_ffnm_list_rows_down, n_tok*q35moe_n_used), q35moe_warp, 0, stream>>>(
+                down_exps->data, hq_exps, list, d_exps);
+        } else {
+            q35moe_ffnm_exps_down<decltype(t)::value><<<dim3(q35moe_n_embd/q35moe_ffnm_rows, q35moe_n_used), dim3(q35moe_warp, n_tok), 0, stream>>>(
+                down_exps->data, hq_exps, ids, own, d_exps);
+        }
     });
     CUDA_CHECK(cudaGetLastError());
 
     q35moe_ffnm_sum<<<dim3(q35moe_n_embd/256, n_tok), 256, 0, stream>>>(
         d_exps, weights, d_shexp, gate, res, static_cast<float *>(op->data));
     CUDA_CHECK(cudaGetLastError());
+
+    // for the fixtures: one line per op
+    if (topk && ggml_kperf_trace(GGML_KPERF_QWEN35MOE_FFNM_TOPK)) {
+        GGML_LOG_INFO("Q35MOE_FFNM_TOPK_HIT tokens=%d\n", n_tok);
+    }
+    if (listw && ggml_kperf_trace(GGML_KPERF_QWEN35MOE_FFNM_LIST)) {
+        GGML_LOG_INFO("Q35MOE_FFNM_LIST_HIT tokens=%d %s %s\n", n_tok, ggml_type_name(up_exps->type), ggml_type_name(down_exps->type));
+    }
 }

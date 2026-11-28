@@ -4,8 +4,9 @@
 // Both graphs run through the scheduler as in llama.cpp: only then the backend fuses the top-k chain of the stock nodes into
 // topk_moe_cuda, the form that the op replays (without the scheduler the chain runs node by node and rounds differently).
 // Cases with a zero router, a zero shared expert, zero routed experts and a zero input show which part differs.
+// Repetitions with the same input in two tokens and in all tokens give experts that 2 to 4 tokens share (qwen35moe.exponce, qwen35moe.ffnm_list).
 // The CPU callback must stay close to the stock nodes on CPU.
-//   [GGML_KPERF_OFF=qwen35moe.exponce] q35moe-hip-ffn ABS_LIBDIR
+//   [GGML_KPERF_OFF=qwen35moe.exponce|qwen35moe.ffnm_topk|qwen35moe.ffnm_list] q35moe-hip-ffn ABS_LIBDIR
 #include "ggml-backend.h"
 #include "ggml-q35moe-ffn.h"
 
@@ -233,9 +234,9 @@ int main(int argc, char ** argv) {
                 ggml_backend_tensor_set(m.w[zero_w[cs]], zero.data(), 0, zero.size());
             }
             for (int n_tok = 1; n_tok <= n_tok_max; ++n_tok) {
-                for (int rep = 0; rep < 3; ++rep) {
+                for (int rep = 0; rep < 4; ++rep) {
                     std::vector<float> x(n_tok*N), res(n_tok*N);
-                    // the last repetition of a case has a zero input in its last token, the one before has the same input in its first two tokens
+                    // repetition 1 has the same input in its first two tokens, 2 a zero input in its last token, 3 the same input in all tokens
                     for (int j = 0; j < n_tok; ++j) {
                         const float amp = rep == 2 && j == n_tok - 1 ? 0.0f : 0.3f*std::exp(0.5f*nd(rng));
                         for (int i = 0; i < N; ++i) {
@@ -245,6 +246,9 @@ int main(int argc, char ** argv) {
                     }
                     if (rep == 1 && n_tok > 1) {
                         std::copy(x.begin(), x.begin() + N, x.begin() + N);
+                    }
+                    for (int j = 1; rep == 3 && j < n_tok; ++j) {
+                        std::copy(x.begin(), x.begin() + N, x.begin() + j*N);
                     }
 
                     const auto ref = run(m, false, x, res);

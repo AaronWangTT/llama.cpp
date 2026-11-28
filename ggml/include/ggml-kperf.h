@@ -79,6 +79,8 @@ extern "C" {
     X(QWEN35MOE_FFN1,        "qwen35moe.ffn1",        true,  "",                    "GGML_Q35MOE_FFN1",             "one-token MoE feed-forward in one op") \
     X(QWEN35MOE_FFNM,        "qwen35moe.ffnm",        true,  "",                    "GGML_Q35MOE_FFNM",             "MoE feed-forward of 2 to 4 tokens in one op") \
     X(QWEN35MOE_EXPONCE,     "qwen35moe.exponce",     true,  "qwen35moe.ffnm",      "GGML_Q35MOE_EXPONCE",          "inside ffnm: the rows of an expert are read once per batch") \
+    X(QWEN35MOE_FFNM_TOPK,   "qwen35moe.ffnm_topk",   true,  "qwen35moe.ffnm",      "",                             "inside ffnm: the top-k block runs first with one warp per token, the shared expert gate/up in blocks of 4 warps") \
+    X(QWEN35MOE_FFNM_LIST,   "qwen35moe.ffnm_list",   true,  "qwen35moe.ffnm",      "",                             "inside ffnm: the expert products take one warp per block for each expert of the batch from a list of the owners, 4 rows of down per warp") \
     X(QWEN35MOE_FAGQA,       "qwen35moe.fagqa",       true,  "",                    "GGML_Q35MOE_FAGQA",            "one-token attention, D256, 8 query heads per KV head") \
     X(QWEN35MOE_FAGQA4,      "qwen35moe.fagqa4",      true,  "",                    "GGML_Q35MOE_FAGQA4",           "attention of 2 to 4 tokens, D256, 8 query heads per KV head") \
     X(QWEN35MOE_PFATTN,      "qwen35moe.pfattn",      true,  "",                    "GGML_Q35MOE_PFATTN",           "prefill attention, D256, 8 query heads per KV head") \
