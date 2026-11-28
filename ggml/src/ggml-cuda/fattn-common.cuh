@@ -49,7 +49,25 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
     uintptr_t V;
     uintptr_t end;
+    bool      offset; // qwen35moe.pfoffset placed the copies
 };
+
+// qwen35moe.pfoffset: the F16 copies of quantized K/V of head size 256 with 8 query heads per KV head (the prefill attention of qwen35moe) start 128 bytes
+// past a 256-byte boundary. A K row is 512 bytes and the pfqk kernel loads K in stages of 256 bytes per row: from a 256-byte aligned copy these loads
+// fall on half of the memory channels, from the offset copy every load spans two. Only the place of the copy changes, the size reserves the worst case.
+static inline size_t ggml_cuda_flash_attn_ext_f16_offset(const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] > 0 && Q->ne[2] == 8*K->ne[2] && ggml_kperf_on(GGML_KPERF_QWEN35MOE_PFOFFSET)) {
+        return 128;
+    }
+#else
+    GGML_UNUSED(dst);
+#endif // defined(GGML_USE_HIP)
+    return 0;
+}
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
@@ -66,9 +84,17 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
+    const size_t offset = (need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16) ? ggml_cuda_flash_attn_ext_f16_offset(dst) : 0;
+    data.offset = offset != 0;
+
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
+        if (offset) {
+            data.K    = GGML_PAD(data.end, 256) + offset;
+            data.end += 256;
+        } else {
         data.K   = data.end;
+        }
         data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
     }
 
@@ -77,7 +103,12 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
             data.V = data.K;
         } else {
             data.end = GGML_PAD(data.end, 128);
+            if (offset) {
+                data.V    = GGML_PAD(data.end, 256) + offset;
+                data.end += 256;
+            } else {
             data.V   = data.end;
+            }
             data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
         }
     }
@@ -1077,6 +1108,11 @@ void launch_fattn(
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+
+    if (f16_extra.offset && ggml_kperf_trace(GGML_KPERF_QWEN35MOE_PFOFFSET)) {
+        GGML_LOG_INFO("Q35MOE_PFOFFSET_HIT %s q=%lld K=%#llx V=%#llx\n", KQV->name, (long long) Q->ne[1],
+            (unsigned long long) (f16_extra.K % 256), (unsigned long long) (f16_extra.V % 256));
+    }
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
