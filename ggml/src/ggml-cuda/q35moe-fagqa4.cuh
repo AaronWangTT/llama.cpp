@@ -737,8 +737,19 @@ static void ggml_cuda_flash_attn_ext_q35moe_fagqa4_launch(ggml_backend_cuda_cont
     constexpr int NB = 4;
     constexpr int SA = ncols1 == 2 ? 16 : 20;
     constexpr int SQ = ncols1 == 2 ? 128 : 132;
-    const q35moe_fagqa4_kernel_t kernel = q8 ? q35moe_fagqa4_wmma<ncols1, G, NB, SA, SQ, true> : q35moe_fagqa4_wmma<ncols1, G, NB, SA, SQ, false>;
+    q35moe_fagqa4_kernel_t kernel = q8 ? q35moe_fagqa4_wmma<ncols1, G, NB, SA, SQ, true> : q35moe_fagqa4_wmma<ncols1, G, NB, SA, SQ, false>;
     const int nwarps = nwarps_ref / G;
+
+    // qwen35moe.fagqa4_burst: 3 and 4 tokens with Q8_0 K and V, one burst of loads has 2 parts of the K row (NB 8), so a K/V tile waits 2 times for K instead of 4.
+    // F16 K and V, and lists of fewer than 16384 rows, stay at NB 4: there the larger burst is slower.
+    if constexpr (ncols1 == 4) {
+        if (q8 && rows->ne[0] >= 16384 && ggml_kperf_on(GGML_KPERF_QWEN35MOE_FAGQA4_BURST)) {
+            kernel = q35moe_fagqa4_wmma<ncols1, G, 2*NB, SA, SQ, true>;
+            if (ggml_kperf_trace(GGML_KPERF_QWEN35MOE_FAGQA4_BURST)) {
+                GGML_LOG_INFO("Q35MOE_FAGQA4_BURST_HIT kv=%lld tokens=%lld sequences=%lld\n", (long long) rows->ne[0], (long long) Q->ne[1], (long long) Q->ne[3]);
+            }
+        }
+    }
 
     const int64_t n_kv       = rows->ne[0];
     const int     ntiles_dst = K->ne[2]*Q->ne[3]; // One output tile is one KV head of one sequence.

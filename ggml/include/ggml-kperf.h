@@ -83,6 +83,7 @@ extern "C" {
     X(QWEN35MOE_FFNM_LIST,   "qwen35moe.ffnm_list",   true,  "qwen35moe.ffnm",      "",                             "inside ffnm: the expert products take one warp per block for each expert of the batch from a list of the owners, 4 rows of down per warp") \
     X(QWEN35MOE_FAGQA,       "qwen35moe.fagqa",       true,  "",                    "GGML_Q35MOE_FAGQA",            "one-token attention, D256, 8 query heads per KV head") \
     X(QWEN35MOE_FAGQA4,      "qwen35moe.fagqa4",      true,  "",                    "GGML_Q35MOE_FAGQA4",           "attention of 2 to 4 tokens, D256, 8 query heads per KV head") \
+    X(QWEN35MOE_FAGQA4_BURST, "qwen35moe.fagqa4_burst", true, "qwen35moe.fagqa4",   "",                             "inside fagqa4: 3 and 4 tokens with Q8_0 K/V and 16384 or more rows load 2 parts of the K row per burst, a K/V tile waits 2 times for K instead of 4") \
     X(QWEN35MOE_PFATTN,      "qwen35moe.pfattn",      true,  "",                    "GGML_Q35MOE_PFATTN",           "prefill attention, D256, 8 query heads per KV head") \
     X(QWEN35MOE_PFLOAD,      "qwen35moe.pfload",      true,  "qwen35moe.pfattn",    "",                             "inside pfattn: the row numbers of a warp in one 16-byte load, the second K half tile loaded before the QK products") \
     X(QWEN35MOE_PFQK,        "qwen35moe.pfqk",        true,  "qwen35moe.pfload",    "",                             "inside pfload: K in two stages of 128 elements, one Q fragment read for the QK products of both row slices of a warp") \
