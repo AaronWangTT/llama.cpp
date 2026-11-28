@@ -12070,6 +12070,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             {512, 1024, 2048}, {4096, 1024, 2048}, {2048, 1024, 4096}, {2048, 1024, 512}, {512, 600, 2048}, {256, 300, 4096}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mnk[0], mnk[1], mnk[2], {1, 1}, {1, 1}));
     }
+    // hip.mmq_dense_pipe on gfx1103: an odd number of K stages of 128 values, a last column tile of 1 column, a product without column groups
+    for (const auto & mnk : std::vector<std::array<int64_t, 3>>{{512, 129, 384}, {1024, 300, 640}, {128, 256, 128}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mnk[0], mnk[1], mnk[2], {1, 1}, {1, 1}));
+    }
 
 #if 0
     {
