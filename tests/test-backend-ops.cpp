@@ -13248,6 +13248,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // 3 and 4 tokens with Q8_0 K/V from a list of 16384 rows (the shortest one of qwen35moe.fagqa4_burst), slices that end early
+    for (int64_t nb : {3, 4}) {
+        for (int64_t n_slices : {1, 3}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 32768, 16384, nb, n_slices, GGML_TYPE_Q8_0, false, true));
+        }
+    }
 
     // prefill attention of qwen35 (GQA 4) and qwen35moe (GQA 8), head size 256: K/V row lists with F16 and Q8_0 K/V, and GQA 8 without a row list
     for (int64_t nb : {64, 512}) {
