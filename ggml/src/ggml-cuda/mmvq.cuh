@@ -16,6 +16,12 @@ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
 void ggml_cuda_mul_mat_vec_q_shared(ggml_backend_cuda_context & ctx,
     const ggml_tensor * const * w, int n_w, const ggml_tensor * src1, float * dst);
 
+// qwen35moe.mvsharen: n_w Q8_0 matrices times the same 2 to 5 F32 columns, src1 is quantized once and one launch takes the rows of all matrices.
+// dst holds the [ne01 of w[j], ncols] result of w[j] after that of w[j - 1]. Each row is the product of the one-warp block of mul_mat_vec_q.
+// n_w <= 4, Q8_0 only, gfx1103 (one warp and one row per block of mul_mat_vec_q for 2 to 5 columns).
+void ggml_cuda_mul_mat_vec_q_stack(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * const * w, int n_w, const ggml_tensor * src1, float * dst);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

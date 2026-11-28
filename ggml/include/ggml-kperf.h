@@ -66,13 +66,16 @@ extern "C" {
     X(QWEN35_PFBAR,          "qwen35.pfbar",          true,  "qwen35.pfqk",         "",                             "inside pfqk: the barriers of the K/V loop only order shared memory, the global loads of the next half tile stay in flight") \
     X(QWEN35_Q6K_MMQ,        "qwen35.q6k_mmq",        false, "",                    "GGML_QWEN35_Q6K_MMQ",          "Q6_K takes MMQ at any batch size (other rounding than dequantization + hipBLAS)") \
     X(QWEN35MOE_MVSHARE,     "qwen35moe.mvshare",     true,  "",                    "GGML_Q35MOE_MVSHARE",          "one-token products that share one input") \
+    X(QWEN35MOE_MVSHAREN,    "qwen35moe.mvsharen",    true,  "",                    "",                             "Q8_0 products of 2 to 5 tokens that share one input: one Q8_1 copy and one launch for the rows of all matrices") \
     X(QWEN35MOE_BA1,         "qwen35moe.ba1",         true,  "",                    "GGML_Q35MOE_BA1",              "one-token F32 beta/alpha products in one launch") \
+    X(QWEN35MOE_BAN,         "qwen35moe.ban",         true,  "",                    "",                             "F32 beta/alpha products of 2 to 5 tokens in one launch") \
     X(QWEN35MOE_PREP1,       "qwen35moe.prep1",       true,  "",                    "GGML_Q35MOE_PREP1",            "one-token conv, SiLU, norm, beta and gate in one op") \
     X(QWEN35MOE_GDN1,        "qwen35moe.gdn1",        true,  "",                    "GGML_Q35MOE_GDN1",             "one-token delta net in one op") \
     X(QWEN35MOE_POST1,       "qwen35moe.post1",       true,  "",                    "GGML_Q35MOE_POST1",            "one-token gated norm in one op") \
     X(QWEN35MOE_RS1,         "qwen35moe.rs1",         true,  "",                    "GGML_Q35MOE_RS1",              "the one-token ops also with rollback snapshots") \
     X(QWEN35MOE_PREPN,       "qwen35moe.prepn",       true,  "",                    "GGML_Q35MOE_PREPN",            "prep op for 2 to 5 tokens with snapshots") \
     X(QWEN35MOE_GDNN,        "qwen35moe.gdnn",        true,  "",                    "GGML_Q35MOE_GDNN",             "delta net op for 2 to 5 tokens with snapshots") \
+    X(QWEN35MOE_GDNN_PRE,    "qwen35moe.gdnn_pre",    true,  "qwen35moe.gdnn",      "",                             "inside gdnn: q, k, v, gate and beta of all tokens are loaded before the token loop, the loads of a token do not wait for the snapshot stores of the one before") \
     X(QWEN35MOE_POSTN,       "qwen35moe.postn",       true,  "",                    "GGML_Q35MOE_POSTN",            "gated norm op for 2 to 5 tokens") \
     X(QWEN35MOE_CONVPF,      "qwen35moe.convpf",      true,  "",                    "GGML_Q35MOE_CONVPF",           "prefill conv without the concat tensor") \
     X(QWEN35MOE_CONVPFRS,    "qwen35moe.convpfrs",    true,  "qwen35moe.convpf",    "GGML_Q35MOE_CONVPFRS",         "prefill conv also with rollback snapshots") \

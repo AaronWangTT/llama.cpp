@@ -2932,6 +2932,10 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * gate,
                             int   layer);
 
+        // qwen35moe.mvsharen: the Q8_0 products of a 2- to 5-token batch with the same input in one op; false (no node) when it is off or not usable.
+        // out[j] is the [rows of w[j], n_tokens] result of w[j]
+        bool build_mvsharen(ggml_tensor * const * w, const ggml_tensor * const * w_s, int n_w, ggml_tensor * cur, int il, ggml_tensor ** out);
+
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,

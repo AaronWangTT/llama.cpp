@@ -118,6 +118,102 @@ void mvshare_cpu(ggml_tensor * dst, int ith, int, void *) {
 }
 
 //
+// mvsharen
+//
+
+// number of stacked rows, 0 if the op can not take these tensors
+int64_t mvsharen_layout(const ggml_tensor * x, const ggml_tensor * const * w, int n_w) {
+    if (!x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_matrix(x) || x->ne[1] < 2 || x->ne[1] > ggml_q35moe_few_max ||
+            x->ne[0] > INT32_MAX || n_w < 2 || n_w > ggml_q35moe_mvsharen_max) {
+        return 0;
+    }
+    int64_t n_rows = 0;
+    for (int j = 0; j < n_w; ++j) {
+        const ggml_tensor * m = w[j];
+        if (!m || m->type != GGML_TYPE_Q8_0 || m->op != GGML_OP_NONE || m->view_src || !ggml_is_matrix(m) || !ggml_is_contiguous(m) ||
+                m->ne[0] != x->ne[0] || m->ne[0] % ggml_blck_size(m->type) != 0 || m->ne[1] > INT32_MAX) {
+            return 0;
+        }
+        n_rows += m->ne[1];
+    }
+    return n_rows*x->ne[1] <= INT32_MAX ? n_rows : 0;
+}
+
+// reference: float product with the dequantized rows, the block of matrix j holds its rows of all tokens
+void mvsharen_cpu(ggml_tensor * dst, int ith, int, void *) {
+    if (ith != 0) {
+        return;
+    }
+    const ggml_tensor * x_t = dst->src[0];
+    const int64_t       n   = x_t->ne[0];
+    float *             out = static_cast<float *>(dst->data);
+
+    std::vector<float> row(n);
+    for (int j = 1; j < GGML_MAX_SRC && dst->src[j]; ++j) {
+        const ggml_tensor * m = dst->src[j];
+        const auto * traits = ggml_get_type_traits(m->type);
+        for (int64_t t = 0; t < x_t->ne[1]; ++t) {
+            const float * x = reinterpret_cast<const float *>(static_cast<const char *>(x_t->data) + t*x_t->nb[1]);
+            for (int64_t r = 0; r < m->ne[1]; ++r) {
+                traits->to_float(static_cast<const char *>(m->data) + r*m->nb[1], row.data(), n);
+                float sum = 0.0f;
+                for (int64_t i = 0; i < n; ++i) {
+                    sum += row[i]*x[i];
+                }
+                *out++ = sum;
+            }
+        }
+    }
+}
+
+//
+// mvfn
+//
+
+// number of stacked rows, 0 if the op can not take these tensors
+int64_t mvfn_layout(const ggml_tensor * x, const ggml_tensor * const * w, int n_w) {
+    if (!x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_matrix(x) || x->ne[1] < 2 || x->ne[1] > ggml_q35moe_few_max ||
+            x->ne[0] % 2 != 0 || x->ne[0] > INT32_MAX || n_w < 2 || n_w > ggml_q35moe_mvf_max) {
+        return 0;
+    }
+    int64_t n_rows = 0;
+    for (int j = 0; j < n_w; ++j) {
+        const ggml_tensor * m = w[j];
+        if (!m || m->type != GGML_TYPE_F32 || m->op != GGML_OP_NONE || m->view_src || !ggml_is_matrix(m) || !ggml_is_contiguous(m) ||
+                m->ne[0] != x->ne[0] || m->ne[1] > INT32_MAX) {
+            return 0;
+        }
+        n_rows += m->ne[1];
+    }
+    return n_rows*x->ne[1] <= INT32_MAX ? n_rows : 0;
+}
+
+// reference, the block of matrix j holds its rows of all tokens
+void mvfn_cpu(ggml_tensor * dst, int ith, int, void *) {
+    if (ith != 0) {
+        return;
+    }
+    const ggml_tensor * x_t = dst->src[0];
+    const int64_t       n   = x_t->ne[0];
+    float *             out = static_cast<float *>(dst->data);
+
+    for (int j = 1; j < GGML_MAX_SRC && dst->src[j]; ++j) {
+        const ggml_tensor * m = dst->src[j];
+        for (int64_t t = 0; t < x_t->ne[1]; ++t) {
+            const float * x   = reinterpret_cast<const float *>(static_cast<const char *>(x_t->data) + t*x_t->nb[1]);
+            const float * row = static_cast<const float *>(m->data);
+            for (int64_t r = 0; r < m->ne[1]; ++r, row += n) {
+                float sum = 0.0f;
+                for (int64_t i = 0; i < n; ++i) {
+                    sum += row[i]*x[i];
+                }
+                *out++ = sum;
+            }
+        }
+    }
+}
+
+//
 // prep1
 //
 
@@ -603,6 +699,34 @@ bool ggml_q35moe_post1_enabled() {
     return ggml_kperf_on(GGML_KPERF_QWEN35MOE_POST1);
 }
 
+bool ggml_q35moe_mvsharen_enabled() {
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_MVSHAREN);
+}
+
+ggml_tensor * ggml_q35moe_try_mvsharen(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x) {
+    const int64_t n_rows = ggml_q35moe_mvsharen_enabled() ? mvsharen_layout(x, w, n_w) : 0;
+    if (n_rows == 0) {
+        return nullptr;
+    }
+    ggml_tensor * args[1 + ggml_q35moe_mvsharen_max] = { x };
+    for (int j = 0; j < n_w; ++j) {
+        args[j + 1] = w[j];
+    }
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, n_rows*x->ne[1], 1, 1, 1, args, n_w + 1, mvsharen_cpu, 1, nullptr);
+}
+
+bool ggml_q35moe_is_mvsharen(const ggml_tensor * op) {
+    int n_w = 0;
+    for (int j = 1; op && j < GGML_MAX_SRC && op->src[j]; ++j) {
+        n_w++;
+    }
+    if (!custom_op(op, mvsharen_cpu, n_w + 1) || op->ne[1] != 1 || op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+    const int64_t n_rows = mvsharen_layout(op->src[0], op->src + 1, n_w);
+    return n_rows > 0 && n_rows*op->src[0]->ne[1] == op->ne[0];
+}
+
 bool ggml_q35moe_ba1_enabled() {
     return ggml_kperf_on(GGML_KPERF_QWEN35MOE_BA1);
 }
@@ -629,6 +753,34 @@ bool ggml_q35moe_is_mvf(const ggml_tensor * op) {
     }
     const int64_t n_rows = mvf_layout(op->src[0], op->src + 1, n_w);
     return n_rows > 0 && n_rows == op->ne[0];
+}
+
+bool ggml_q35moe_ban_enabled() {
+    return ggml_kperf_on(GGML_KPERF_QWEN35MOE_BAN);
+}
+
+ggml_tensor * ggml_q35moe_try_mvfn(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x) {
+    const int64_t n_rows = ggml_q35moe_ban_enabled() ? mvfn_layout(x, w, n_w) : 0;
+    if (n_rows == 0) {
+        return nullptr;
+    }
+    ggml_tensor * args[1 + ggml_q35moe_mvf_max] = { x };
+    for (int j = 0; j < n_w; ++j) {
+        args[j + 1] = w[j];
+    }
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, n_rows*x->ne[1], 1, 1, 1, args, n_w + 1, mvfn_cpu, 1, nullptr);
+}
+
+bool ggml_q35moe_is_mvfn(const ggml_tensor * op) {
+    int n_w = 0;
+    for (int j = 1; op && j < GGML_MAX_SRC && op->src[j]; ++j) {
+        n_w++;
+    }
+    if (!custom_op(op, mvfn_cpu, n_w + 1) || op->ne[1] != 1 || op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+    const int64_t n_rows = mvfn_layout(op->src[0], op->src + 1, n_w);
+    return n_rows > 0 && n_rows*op->src[0]->ne[1] == op->ne[0];
 }
 
 bool ggml_q35moe_rs1_enabled() {

@@ -1638,6 +1638,130 @@ void ggml_cuda_mul_mat_vec_q_shared(
     }
 }
 
+struct mmvq_stack_args {
+    const void * w[4];
+    float      * dst[4];
+    int          row_begin[4]; // first stacked row of matrix j, INT32_MAX for an unused slot
+};
+
+// The rows of up to 4 Q8_0 matrices stacked; warp y of a block takes stacked row R*blockIdx.x + y. For its row a warp does what the
+// one-warp block of mul_mat_vec_q<GGML_TYPE_Q8_0, ncols_dst, false> does on gfx1103 (RDNA2 parameter table: one warp, one row per block):
+// the same lanes, k order and warp reduction.
+template <int ncols_dst, int R>
+__launch_bounds__(R*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_stack(
+        const mmvq_stack_args args, const void * vy_ptr, const uint32_t ncols_x, const uint32_t nrows_total, const uint32_t stride_row_x,
+        const uint32_t stride_col_y) {
+    constexpr ggml_type type = GGML_TYPE_Q8_0;
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+#if defined(__HIP_DEVICE_COMPILE__)
+    static_assert(get_device_table_id() == MMVQ_PARAMETERS_RDNA2, "the stack replays the one-warp blocks of gfx1103");
+    static_assert(calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_RDNA2) == 1 && calc_rows_per_block(type, ncols_dst, MMVQ_PARAMETERS_RDNA2, false, 1) == 1,
+        "one warp and one row per block");
+#endif
+
+    const int srow = R*blockIdx.x + threadIdx.y;
+    if (srow >= (int) nrows_total) {
+        return;
+    }
+    int j = 0;
+#pragma unroll
+    for (int i = 1; i < 4; i++) {
+        j += srow >= args.row_begin[i];
+    }
+    const int row0 = srow - args.row_begin[j];
+    const void * GGML_CUDA_RESTRICT vx = args.w[j];
+    const block_q8_1 * GGML_CUDA_RESTRICT y = (const block_q8_1 *) vy_ptr;
+    const int nrows_j = (j + 1 < 4 && args.row_begin[j + 1] != INT32_MAX ? args.row_begin[j + 1] : (int) nrows_total) - args.row_begin[j];
+    float * GGML_CUDA_RESTRICT dst = args.dst[j] + row0;
+
+    const int tid = threadIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    float tmp[ncols_dst] = {0.0f};
+    const int kbx_offset = row0*stride_row_x;
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+
+        // x block quant index when casting the quants to int
+        const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+        for (int jc = 0; jc < ncols_dst; ++jc) {
+            tmp[jc] += vec_dot_q8_0_q8_1(vx, &y[jc*stride_col_y + kby], kbx_offset + kbx, kqs);
+        }
+    }
+
+#pragma unroll
+    for (int jc = 0; jc < ncols_dst; ++jc) {
+        tmp[jc] = warp_reduce_sum<warp_size>(tmp[jc]);
+        if (threadIdx.x == 0) {
+            dst[jc*nrows_j] = tmp[jc];
+        }
+    }
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_q_stack_launch(const mmvq_stack_args & args, const void * vy, const int ncols_x, const int nrows_total,
+        const int stride_row_x, const int stride_col_y, cudaStream_t stream) {
+    constexpr int R = 1;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    mul_mat_vec_q_stack<ncols_dst, R><<<(nrows_total + R - 1)/R, dim3(warp_size, R, 1), 0, stream>>>(
+        args, vy, ncols_x, nrows_total, stride_row_x, stride_col_y);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mul_mat_vec_q_stack(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * const * w, const int n_w, const ggml_tensor * src1, float * dst) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1));
+    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(n_w >= 1 && n_w <= 4);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10        = src1->ne[0];
+    const int64_t ne11        = src1->ne[1];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    // the copy of ggml_cuda_mul_mat_vec_q
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        const int64_t s12 = src1->nb[2] / sizeof(float);
+        const int64_t s13 = src1->nb[3] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, 1, 1, stream);
+    }
+
+    mmvq_stack_args args;
+    int64_t nrows = 0;
+    for (int j = 0; j < 4; ++j) {
+        args.w[j]         = j < n_w ? w[j]->data : nullptr;
+        args.dst[j]       = j < n_w ? dst : nullptr;
+        args.row_begin[j] = j < n_w ? (int) nrows : INT32_MAX;
+        if (j < n_w) {
+            GGML_ASSERT(w[j]->type == GGML_TYPE_Q8_0 && w[j]->ne[0] == ne10 && ggml_is_contiguous(w[j]));
+            GGML_ASSERT(w[j]->nb[1] == w[0]->nb[1]);
+            nrows += w[j]->ne[1];
+            dst   += w[j]->ne[1]*ne11;
+        }
+    }
+    GGML_ASSERT(nrows <= INT32_MAX);
+
+    const int stride_row_x = w[0]->nb[1] / ggml_type_size(GGML_TYPE_Q8_0);
+    const int stride_col_y = ne10_padded / QK8_1;
+    switch (ne11) {
+        case 2: mul_mat_vec_q_stack_launch<2>(args, src1_q8_1.get(), ne10, nrows, stride_row_x, stride_col_y, stream); break;
+        case 3: mul_mat_vec_q_stack_launch<3>(args, src1_q8_1.get(), ne10, nrows, stride_row_x, stride_col_y, stream); break;
+        case 4: mul_mat_vec_q_stack_launch<4>(args, src1_q8_1.get(), ne10, nrows, stride_row_x, stride_col_y, stream); break;
+        case 5: mul_mat_vec_q_stack_launch<5>(args, src1_q8_1.get(), ne10, nrows, stride_row_x, stride_col_y, stream); break;
+        default: GGML_ABORT("mul_mat_vec_q_stack: 2 to 5 columns");
+    }
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

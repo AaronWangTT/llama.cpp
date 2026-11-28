@@ -5,6 +5,7 @@
 //   qwen35.mvshare, prep1, gdn1, post1: the shapes of qwen3.5-4b. qwen35moe.mvshare, ba1, prep1, gdn1, post1: the shapes of qwen3.6-35b.
 //   qwen35moe.prepn, gdnn, postn in addition: state caches with rollback slots. One token (the one-token ops, as with qwen35moe.rs1) and
 //   2 to 5 tokens (the ops for a few tokens) against the stock graph that writes the snapshots, also when the state row is one of the rows that the batch writes.
+//   qwen35moe.mvsharen, ban: the Q8_0 and F32 products of 2 to 5 tokens with one input against one stock MUL_MAT per matrix.
 //   qwen35moe.convpf: the store of the conv state for many tokens, one copy per slot against the stock SET_ROWS store.
 //   qwen35moe.gdnpf: the delta net of a prompt batch, the node with the mark of the qwen35moe graph against the node without it,
 //   and the one-slot stores of such a batch against slot 0 of the stores with rollback slots.
@@ -806,13 +807,112 @@ static long run_gdnpf(ggml_backend_t hip, ggml_backend_t cpu, double & worst_cpu
     return n_diff;
 }
 
+// qwen35moe.mvsharen and qwen35moe.ban: the products of 2 to 5 tokens with one input, the fused ops against one stock MUL_MAT per matrix
+// (all bits, on the device; the CPU callbacks against the stock ops on the CPU). Q8_0 sets of the linear attention (qkv, z) and of the
+// attention (q with gate, k, v), F32 beta and alpha. Returns the number of values that differ
+static long run_products_few(ggml_backend_t hip, ggml_backend_t cpu) {
+    constexpr int N = 2048;
+    struct mset { const char * name; ggml_type type; int n_w; int rows[3]; bool fused_f32; };
+    const mset sets[] = {
+        { "qkv z",   GGML_TYPE_Q8_0, 2, { C, VAL, 0 },   false },
+        { "q k v",   GGML_TYPE_Q8_0, 3, { 8192, 512, 512 }, false },
+        { "beta alpha", GGML_TYPE_F32, 2, { H, H, 0 }, true },
+    };
+    std::mt19937 rng(8192);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    long n_diff = 0;
+    for (const mset & ms : sets) {
+        if (ms.fused_f32 ? !ggml_q35moe_ban_enabled() : !ggml_q35moe_mvsharen_enabled()) {
+            continue;
+        }
+        std::vector<std::vector<float>> wdata(ms.n_w);
+        for (int j = 0; j < ms.n_w; ++j) {
+            wdata[j].resize((size_t) N*ms.rows[j]);
+            for (auto & val : wdata[j]) { val = 0.05f*nd(rng); }
+        }
+        for (int n_t = 2; n_t <= ggml_q35moe_few_max; ++n_t) {
+            std::vector<float> x((size_t) N*n_t);
+            for (auto & val : x) { val = nd(rng); }
+            std::vector<float> res[2][2];
+            for (int dev = 0; dev < 2; ++dev) {
+                ggml_backend_t be = dev == 0 ? hip : cpu;
+                for (int fused = 0; fused < 2; ++fused) {
+                    ggml_context * cw = ggml_init({8*ggml_tensor_overhead(), nullptr, true});
+                    ggml_tensor * w[3] = {};
+                    for (int j = 0; j < ms.n_w; ++j) {
+                        w[j] = ggml_new_tensor_2d(cw, ms.type, N, ms.rows[j]);
+                    }
+                    ggml_backend_buffer_t bw = ggml_backend_alloc_ctx_tensors(cw, be);
+                    ggml_backend_buffer_set_usage(bw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    for (int j = 0; j < ms.n_w; ++j) {
+                        if (ms.type == GGML_TYPE_F32) {
+                            ggml_backend_tensor_set(w[j], wdata[j].data(), 0, ggml_nbytes(w[j]));
+                        } else {
+                            std::vector<uint8_t> q(ggml_nbytes(w[j]));
+                            ggml_quantize_chunk(ms.type, wdata[j].data(), q.data(), 0, ms.rows[j], N, nullptr);
+                            ggml_backend_tensor_set(w[j], q.data(), 0, q.size());
+                        }
+                    }
+                    ggml_context * c  = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+                    ggml_cgraph *  gf = ggml_new_graph(c);
+                    ggml_tensor * xt = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, n_t); ggml_set_input(xt);
+                    std::vector<ggml_tensor *> outs;
+                    if (fused) {
+                        ggml_tensor * op = ms.fused_f32 ? ggml_q35moe_try_mvfn(c, w, ms.n_w, xt) : ggml_q35moe_try_mvsharen(c, w, ms.n_w, xt);
+                        check(op && (ms.fused_f32 ? ggml_q35moe_is_mvfn(op) : ggml_q35moe_is_mvsharen(op)), "the fused product op");
+                        check(dev == 1 || ggml_backend_supports_op(be, op), "the backend must take the fused product op");
+                        outs.push_back(op);
+                    } else {
+                        for (int j = 0; j < ms.n_w; ++j) {
+                            outs.push_back(ggml_mul_mat(c, w[j], xt));
+                        }
+                    }
+                    for (ggml_tensor * t : outs) {
+                        ggml_set_output(t);
+                        ggml_build_forward_expand(gf, t);
+                    }
+                    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+                    check(ggml_gallocr_alloc_graph(ga, gf), "alloc");
+                    ggml_backend_tensor_set(xt, x.data(), 0, ggml_nbytes(xt));
+                    check(ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS, "compute");
+                    // both layouts are the [rows of w[j], n_t] blocks one after the other
+                    for (ggml_tensor * t : outs) {
+                        const size_t n0 = res[dev][fused].size();
+                        res[dev][fused].resize(n0 + ggml_nelements(t));
+                        ggml_backend_tensor_get(t, res[dev][fused].data() + n0, 0, ggml_nbytes(t));
+                    }
+                    ggml_gallocr_free(ga);
+                    ggml_free(c);
+                    ggml_backend_buffer_free(bw);
+                    ggml_free(cw);
+                }
+            }
+            long diff = 0;
+            double amax = 0.0, dmax = 0.0;
+            check(res[0][0].size() == res[0][1].size() && res[1][0].size() == res[0][0].size(), "product sizes");
+            for (size_t i = 0; i < res[0][0].size(); ++i) {
+                check(std::isfinite(res[0][0][i]) && std::isfinite(res[0][1][i]), "finite");
+                diff += std::memcmp(&res[0][0][i], &res[0][1][i], sizeof(float)) != 0;
+                amax = std::max(amax, (double) std::fabs(res[1][0][i]));
+                dmax = std::max(dmax, (double) std::fabs(res[1][0][i] - res[1][1][i]));
+            }
+            std::printf("products %s, %d tokens: %ld/%zu differ from the stock products; cpu callback max diff %.3e (max|ref| %.3f)\n",
+                    ms.name, n_t, diff, res[0][0].size(), dmax, amax);
+            // the stock CPU products quantize the input (Q8_0 weights), the callbacks take it as it is
+            check(dmax/amax < (ms.fused_f32 ? 1e-3 : 5e-2), "cpu reference of the fused products is off");
+            n_diff += diff;
+        }
+    }
+    return n_diff;
+}
+
 int main(int argc, char ** argv) {
     check(argc == 2, "usage: qwen35-hip-decode ABS_LIBDIR");
     const bool run_qwen35 = ggml_qwen35_mvshare_enabled() && ggml_qwen35_prep1_enabled() && ggml_qwen35_gdn1_enabled() && ggml_qwen35_post1_enabled();
     const bool run_moe    = ggml_q35moe_mvshare_enabled() && ggml_q35moe_ba1_enabled() && ggml_q35moe_prep1_enabled() && ggml_q35moe_gdn1_enabled() &&
         ggml_q35moe_post1_enabled();
     const bool run_pf    = ggml_q35moe_gdnpf_enabled();
-    check(run_qwen35 || run_moe || run_pf, "the qwen35 or qwen35moe entries are off (GGML_KPERF_OFF)");
+    check(run_qwen35 || run_moe || run_pf || ggml_q35moe_mvsharen_enabled() || ggml_q35moe_ban_enabled(), "the qwen35 or qwen35moe entries are off (GGML_KPERF_OFF)");
     const bool run_keep  = run_moe && ggml_q35moe_prepn_enabled() && ggml_q35moe_gdnn_enabled() && ggml_q35moe_postn_enabled();
     const bool run_store = ggml_q35moe_convpf_enabled();
     ggml_backend_load_all_from_path(argv[1]);
@@ -832,6 +932,10 @@ int main(int argc, char ** argv) {
     if (run_keep) {
         n_diff += run_shape_keep(SHAPE_MOE, hip, cpu, worst_cpu);
     }
+    const bool run_prod = ggml_q35moe_mvsharen_enabled() || ggml_q35moe_ban_enabled();
+    if (run_prod) {
+        n_diff += run_products_few(hip, cpu);
+    }
     if (run_store) {
         n_diff += run_store_keep(hip);
     }
@@ -840,8 +944,8 @@ int main(int argc, char ** argv) {
     }
     check(n_diff == 0, "a fused op is not bit-exact");
     check(worst_cpu < 1e-3, "cpu reference error above 1e-3");
-    std::printf("PASS bit-exact%s%s%s%s%s, worst cpu reference error %.2e\n", run_qwen35 ? " qwen35" : "", run_moe ? " qwen35moe" : "",
-            run_keep ? " qwen35moe-snapshots" : "", run_store ? " conv-store" : "", run_pf ? " delta-net-prompt" : "", worst_cpu);
+    std::printf("PASS bit-exact%s%s%s%s%s%s, worst cpu reference error %.2e\n", run_qwen35 ? " qwen35" : "", run_moe ? " qwen35moe" : "",
+            run_keep ? " qwen35moe-snapshots" : "", run_prod ? " products-few" : "", run_store ? " conv-store" : "", run_pf ? " delta-net-prompt" : "", worst_cpu);
     ggml_backend_free(hip);
     ggml_backend_free(cpu);
     return 0;

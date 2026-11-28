@@ -43,11 +43,24 @@ GGML_API bool ggml_q35moe_prep1_enabled();
 GGML_API bool ggml_q35moe_gdn1_enabled();
 GGML_API bool ggml_q35moe_post1_enabled();
 
+// qwen35moe.mvsharen: several Q8_0 matrices times the same n_tokens columns (2 to ggml_q35moe_few_max), the columns are quantized once and
+// one launch takes the rows of all matrices; every row is the product of the one-warp block of mul_mat_vec_q.
+// x: [n_cols, n_tokens] F32, w[i]: [n_cols, n_rows_i] Q8_0 weight leafs; result: [w[0]*x as [n_rows_0, n_tokens], w[1]*x, ...], F32
+GGML_API bool ggml_q35moe_mvsharen_enabled();
+GGML_API ggml_tensor * ggml_q35moe_try_mvsharen(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x);
+GGML_API bool ggml_q35moe_is_mvsharen(const ggml_tensor * op);
+
 // qwen35moe.ba1: several F32 matrices times the same vector in one launch (the beta and alpha products of qwen35moe).
 // x: n_cols F32, w[i]: [n_cols, n_rows_i] F32 weight leafs; result: [w[0]*x, w[1]*x, ...], sum of n_rows_i F32
 GGML_API bool ggml_q35moe_ba1_enabled();
 GGML_API ggml_tensor * ggml_q35moe_try_mvf(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x);
 GGML_API bool ggml_q35moe_is_mvf(const ggml_tensor * op);
+
+// qwen35moe.ban: ggml_q35moe_try_mvf for 2 to ggml_q35moe_few_max columns. x: [n_cols, n_tokens] F32;
+// result: [w[0]*x as [n_rows_0, n_tokens], w[1]*x, ...] F32; every product is the one of mul_mat_vec_f<float, float, n_tokens, 256>
+GGML_API bool ggml_q35moe_ban_enabled();
+GGML_API ggml_tensor * ggml_q35moe_try_mvfn(ggml_context * ctx, ggml_tensor ** w, int n_w, ggml_tensor * x);
+GGML_API bool ggml_q35moe_is_mvfn(const ggml_tensor * op);
 
 // qwen35moe.rs1: the five one-token ops of qwen35moe also in a context that keeps rollback snapshots (n_rs_seq > 0).
 // The ops read the row that the memory names (a rollback slot or slot 0) and write slot 0, as the stock graph of one token does.
@@ -88,6 +101,7 @@ GGML_API bool ggml_q35moe_is_gdnpf(const ggml_tensor * gdn);
 
 constexpr int ggml_qwen35_mvshare_max = 8;
 constexpr int ggml_q35moe_mvf_max     = 4;
+constexpr int ggml_q35moe_mvsharen_max = 4;
 // most tokens of a batch that PREPN and GDNN have a kernel for (checked against the stock graph); the dense products of such a batch are vector kernels
 constexpr int ggml_q35moe_few_max     = 5;
 // the kernels replay the stock kernels of these sizes only

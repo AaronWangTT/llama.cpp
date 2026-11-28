@@ -330,11 +330,59 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
     res->t_logits = cur;
 }
 
+bool llama_model_qwen35moe::graph::build_mvsharen(ggml_tensor * const * w, const ggml_tensor * const * w_s, int n_w, ggml_tensor * cur, int il,
+        ggml_tensor ** out) {
+    if (!ggml_q35moe_mvsharen_enabled() || cur->ne[1] < 2 || cur->ne[1] > ggml_q35moe_few_max) {
+        return false;
+    }
+    const char * why = nullptr;
+    const auto dev = q35moe_rocm_dev(cparams, model, loras, il, false, &why);
+    if (!dev) {
+        q35moe_log_off("qwen35moe.mvsharen", why);
+        return false;
+    }
+    // weights that build_lora_mm() gives to one plain MUL_MAT
+    for (int j = 0; j < n_w; ++j) {
+        if (!w[j] || w_s[j] || (hdmd && hdmd->rot.count(w[j])) || (prec_policy && (prec_policy->prec_src1.count(w[j]) || prec_policy->prec_acc.count(w[j])))) {
+            return false;
+        }
+    }
+    ggml_tensor * ws[ggml_q35moe_mvsharen_max] = {};
+    std::copy(w, w + n_w, ws);
+    ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+    ggml_tensor * candidate = ggml_q35moe_try_mvsharen(probe.get(), ws, n_w, cur);
+    if (!candidate || !ggml_backend_dev_supports_op(dev, candidate)) {
+        return false;
+    }
+    ggml_tensor * shared = ggml_q35moe_try_mvsharen(ctx0, ws, n_w, cur);
+    cb(shared, "mvsharen", il);
+    const int64_t n_t = cur->ne[1];
+    size_t offs = 0;
+    for (int j = 0; j < n_w; ++j) {
+        const int64_t n_rows = w[j]->ne[1];
+        out[j] = ggml_view_2d(ctx0, shared, n_rows, n_t, n_rows*sizeof(float), offs);
+        offs += n_rows*n_t*sizeof(float);
+    }
+    return true;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    {
+        ggml_tensor * const w[]   = { model.layers[il].wqkv,   model.layers[il].wqkv_gate };
+        ggml_tensor * const w_s[] = { model.layers[il].wqkv_s, model.layers[il].wqkv_gate_s };
+        ggml_tensor * out[2] = {};
+        if (build_mvsharen(w, w_s, 2, input, il, out)) {
+            ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx0, out[0], out[0]->ne[0], n_seq_tokens, n_seqs);
+            cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+            cb(out[1], "z", il);
+            return { qkv_mixed, out[1] };
+        }
+    }
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -368,11 +416,30 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-            n_embd_head * 2, n_head,
-            n_embd_head,     n_head_kv,
-            n_embd_head,     n_head_kv,
-            il, false);
+    ggml_tensor * Qcur_full = nullptr;
+    ggml_tensor * Kcur      = nullptr;
+    ggml_tensor * Vcur      = nullptr;
+    {
+        const auto & layer = model.layers[il];
+        ggml_tensor * const w[]   = { layer.wq,   layer.wk,   layer.wv };
+        ggml_tensor * const w_s[] = { layer.wq_s, layer.wk_s, layer.wv_s };
+        ggml_tensor * out[3] = {};
+        // the separate Q/K/V path of build_qkv() without biases: three plain products
+        if (!layer.wqkv && !layer.wq_b && !layer.wk_b && !layer.wv_b && build_mvsharen(w, w_s, 3, cur, il, out)) {
+            Qcur_full = out[0];
+            Kcur      = out[1];
+            Vcur      = out[2];
+        } else {
+            auto qkv = build_qkv(layer, cur,
+                    n_embd_head * 2, n_head,
+                    n_embd_head,     n_head_kv,
+                    n_embd_head,     n_head_kv,
+                    il, false);
+            Qcur_full = qkv.q;
+            Kcur      = qkv.k;
+            Vcur      = qkv.v;
+        }
+    }
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
@@ -940,12 +1007,31 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear_few(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(layer.ssm_beta, cur, layer.ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_t, 1);
+    ggml_tensor * beta  = nullptr;
+    ggml_tensor * alpha = nullptr;
+    // qwen35moe.ban: the two F32 products of cur in one launch
+    const bool ba_plain = !layer.ssm_beta_s && !layer.ssm_alpha_s && layer.ssm_beta && layer.ssm_alpha &&
+        (!hdmd || (!hdmd->rot.count(layer.ssm_beta) && !hdmd->rot.count(layer.ssm_alpha))) &&
+        (!prec_policy || (!prec_policy->prec_src1.count(layer.ssm_beta) && !prec_policy->prec_src1.count(layer.ssm_alpha) &&
+                          !prec_policy->prec_acc.count(layer.ssm_beta) && !prec_policy->prec_acc.count(layer.ssm_alpha))) &&
+        layer.ssm_beta->ne[1] == num_v_heads && layer.ssm_alpha->ne[1] == num_v_heads;
+    if (ggml_q35moe_ban_enabled() && ba_plain) {
+        ggml_tensor * w[] = { layer.ssm_beta, layer.ssm_alpha };
+        ggml_context_ptr probe{ggml_init({2*ggml_tensor_overhead(), nullptr, true})};
+        if (usable(ggml_q35moe_try_mvfn(probe.get(), w, 2, cur))) {
+            ggml_tensor * ba = ggml_q35moe_try_mvfn(ctx0, w, 2, cur);
+            cb(ba, "beta_alpha", il);
+            beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_t, 1, fs, num_v_heads*fs, num_v_heads*n_t*fs, 0);
+            alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_t, 1, num_v_heads*fs, num_v_heads*n_t*fs, num_v_heads*n_t*fs);
+        }
+    }
+    if (!beta) {
+        beta = build_lora_mm(layer.ssm_beta, cur, layer.ssm_beta_s);
+        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_t, 1);
+        alpha = build_lora_mm(layer.ssm_alpha, cur, layer.ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_t, 1);
+    }
     cb(beta, "beta", il);
-
-    ggml_tensor * alpha = build_lora_mm(layer.ssm_alpha, cur, layer.ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_t, 1);
     cb(alpha, "alpha", il);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);

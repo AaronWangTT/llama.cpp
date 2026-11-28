@@ -2957,6 +2957,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 inkling_ctrl1_launch(ctx, dst);
             } else if (qwen35_mvshare_supported(ctx.device, dst)) {
                 qwen35_mvshare_launch(ctx, dst);
+            } else if (q35moe_mvsharen_supported(ctx.device, dst)) {
+                q35moe_mvsharen_launch(ctx, dst);
             } else if (qwen35_prep1_supported(ctx.device, dst)) {
                 qwen35_prep1_launch(ctx, dst);
             } else if (qwen35_gdn1_supported(ctx.device, dst)) {
@@ -2969,6 +2971,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 q35moe_gdnn_launch(ctx, dst);
             } else if (q35moe_mvf_supported(ctx.device, dst)) {
                 q35moe_mvf_launch(ctx, dst);
+            } else if (q35moe_mvfn_supported(ctx.device, dst)) {
+                q35moe_mvfn_launch(ctx, dst);
             } else if (qwen35_convpf_supported(ctx.device, dst)) {
                 qwen35_convpf_launch(ctx, dst);
             } else if (q35moe_ffn1_supported(ctx.device, dst)) {
@@ -6826,10 +6830,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return inkling_concat4_supported(dev_ctx->device, op) || inkling_mix1_supported(dev_ctx->device, op) ||
                 inkling_conv1_supported(dev_ctx->device, op) || inkling_bias1_supported(dev_ctx->device, op) ||
                 inkling_mvstack_supported(dev_ctx->device, op) || inkling_ctrl1_supported(dev_ctx->device, op) ||
-                qwen35_mvshare_supported(dev_ctx->device, op) || qwen35_prep1_supported(dev_ctx->device, op) ||
+                qwen35_mvshare_supported(dev_ctx->device, op) || q35moe_mvsharen_supported(dev_ctx->device, op) || qwen35_prep1_supported(dev_ctx->device, op) ||
                 qwen35_gdn1_supported(dev_ctx->device, op) || qwen35_post1_supported(dev_ctx->device, op) ||
                 q35moe_prepn_supported(dev_ctx->device, op) || q35moe_gdnn_supported(dev_ctx->device, op) ||
-                q35moe_mvf_supported(dev_ctx->device, op) ||
+                q35moe_mvfn_supported(dev_ctx->device, op) || q35moe_mvf_supported(dev_ctx->device, op) ||
                 qwen35_convpf_supported(dev_ctx->device, op) || q35moe_ffn1_supported(dev_ctx->device, op) ||
                 q35moe_ffnm_supported(dev_ctx->device, op);
 #endif
