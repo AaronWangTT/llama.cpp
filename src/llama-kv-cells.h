@@ -450,8 +450,9 @@ public:
     // get the lists of the cells that contain any of the sequences of each slice, in cell order
     // one list of max `n_per_seq` for each slice, padded with -1
     // the cells of slice s at a position below slices[s].p_min are skipped
+    // full_words: a word of 64 cells that all belong to the slice is written as one run (the same list)
     LLAMA_ATTRIBUTE_NOINLINE
-    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq) const {
+    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq, bool full_words = false) const {
         assert(slices.size() >= 1);
 
         const int64_t n_slices = (int64_t) slices.size();
@@ -471,6 +472,16 @@ public:
                     if (w < bits.size()) {
                         word |= bits[w];
                     }
+                }
+
+                // the cells of a sequence are never empty, so their positions are >= 0
+                if (full_words && word == ~0ull && pm < 0) {
+                    GGML_ASSERT(dst + 64 <= end);
+                    for (int32_t k = 0; k < 64; ++k) {
+                        dst[k] = 64*w + k;
+                    }
+                    dst += 64;
+                    continue;
                 }
 
                 for (uint64_t b = word; b != 0; b &= b - 1) {

@@ -1888,6 +1888,82 @@ skip:
     }
 }
 
+// causal KQ mask over cell rows, no SWA or ALiBi, and the rows of each slice are the cells of the one sequence of its tokens:
+// every listed cell has the sequence of the token, so the position alone decides (and the 2D position at equal positions), as in set_input_attn_mask_impl()
+template<typename T, bool is_2d>
+static void set_input_attn_mask_rows(const llama_kv_cells & cells, const llama_ubatch & ubatch, const int32_t * rows_all,
+        int64_t n_kv, int64_t n_slices, bool block_uniform, T * data) {
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+
+    const int64_t n_tps = ubatch.n_tokens/n_slices;
+
+    // shared mask rows: every query of a sequence uses the row of its first token
+    uint32_t seq_first[LLAMA_MAX_SEQ];
+    std::fill(seq_first, seq_first + LLAMA_MAX_SEQ, ubatch.n_tokens);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        seq_first[ubatch.seq_id[i][0]] = std::min(seq_first[ubatch.seq_id[i][0]], i);
+    }
+
+    auto get_iq = [&](int64_t i) -> int64_t {
+        return block_uniform ? seq_first[ubatch.seq_id[i][0]] : i;
+    };
+
+    std::vector<uint32_t> idxs;
+
+    for (int64_t s = 0; s < n_slices; ++s) {
+        const int32_t * rows = rows_all + s*n_kv;
+
+        llama_pos p1_min = std::numeric_limits<llama_pos>::max();
+        for (int64_t i = s*n_tps; i < (s + 1)*n_tps; ++i) {
+            p1_min = std::min(p1_min, ubatch.pos[get_iq(i)]);
+        }
+
+        // the rows of the slice differ only in the columns of the cells at p1_min or later
+        idxs.clear();
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i  = s*n_tps + ii;
+            const int64_t iq = get_iq(i);
+
+            const llama_pos p1 = ubatch.pos[iq];
+
+            // for M-RoPE
+            const llama_pos p1_x = is_2d ? ubatch.pos[iq + ubatch.n_tokens*2] : 0;
+            const llama_pos p1_y = is_2d ? ubatch.pos[iq + ubatch.n_tokens]   : 0;
+
+            auto drop = [&](int32_t j, llama_pos p0) {
+                return p0 > p1 || (is_2d && p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y));
+            };
+
+            T * dst = data + n_kv*i;
+
+            if (ii == 0) {
+                for (int64_t c = 0; c < n_kv; ++c) {
+                    const int32_t j = rows[c];
+                    if (j < 0) {
+                        dst[c] = mask_drop;
+                        continue;
+                    }
+
+                    const llama_pos p0 = cells.pos_get(j);
+                    if (p0 >= p1_min) {
+                        idxs.push_back(c);
+                    }
+
+                    dst[c] = drop(j, p0) ? mask_drop : mask_keep;
+                }
+            } else {
+                std::copy(dst - n_kv*ii, dst - n_kv*ii + n_kv, dst);
+
+                for (const uint32_t c : idxs) {
+                    dst[c] = drop(rows[c], cells.pos_get(rows[c])) ? mask_drop : mask_keep;
+                }
+            }
+        }
+    }
+}
+
 template<typename T, bool causal, bool swa, bool is_2d>
 static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * data) {
     const bool alibi = args.hparams.use_alibi;
@@ -1928,6 +2004,9 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
 }
 
 void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    // each slice lists the cells of the one sequence of its tokens (all cells of it, no SWA)
+    bool rows_one_seq = false;
+
     // fill the cell rows of each slice
     if (attn_mask.rows && attn_mask.rows->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(attn_mask.rows->buffer));
@@ -1939,7 +2018,23 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         const auto & cells = v_cells[0];
         int32_t * data = (int32_t *) attn_mask.rows->data;
 
-        cells.get_seq_cells(get_kv_rows_slices(*ubatch, n_slices, n_swa, swa_type), data, n_rows);
+        const auto slices = get_kv_rows_slices(*ubatch, n_slices, n_swa, swa_type);
+
+        const bool fast = ggml_kperf_on(GGML_KPERF_HOST_MASK_ROWS);
+
+        cells.get_seq_cells(slices, data, n_rows, fast);
+
+        if (fast) {
+            const int64_t n_tps = ubatch->n_tokens/n_slices;
+
+            rows_one_seq = true;
+            for (int64_t s = 0; s < n_slices && rows_one_seq; ++s) {
+                rows_one_seq = slices[s].seq_ids.size() == 1 && slices[s].p_min < 0;
+                for (int64_t i = s*n_tps; i < (s + 1)*n_tps && rows_one_seq; ++i) {
+                    rows_one_seq = ubatch->seq_id[i][0] == slices[s].seq_ids[0];
+                }
+            }
+        }
     }
 
     // the mask is left unallocated when the graph only stores K/V without attending
@@ -1973,6 +2068,32 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         }
 
         //const int64_t t_start = ggml_time_us();
+
+        if (rows_one_seq && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi) {
+            if (ggml_kperf_trace(GGML_KPERF_HOST_MASK_ROWS)) {
+                LLAMA_LOG_INFO("HOST_MASK_ROWS_HIT n_tokens %u slices %lld n_kv %lld 2d %d\n", n_tokens, (long long) n_stream, (long long) n_kv, (int) ubatch->is_pos_2d());
+            }
+
+            const bool bu = attn_mask.block_uniform;
+
+            if (dst->type == GGML_TYPE_F16) {
+                auto * data = (ggml_fp16_t *) dst->data;
+                if (ubatch->is_pos_2d()) {
+                    set_input_attn_mask_rows<ggml_fp16_t, true> (v_cells[0], *ubatch, rows, n_kv, n_stream, bu, data);
+                } else {
+                    set_input_attn_mask_rows<ggml_fp16_t, false>(v_cells[0], *ubatch, rows, n_kv, n_stream, bu, data);
+                }
+            } else {
+                auto * data = (float *) dst->data;
+                if (ubatch->is_pos_2d()) {
+                    set_input_attn_mask_rows<float, true> (v_cells[0], *ubatch, rows, n_kv, n_stream, bu, data);
+                } else {
+                    set_input_attn_mask_rows<float, false>(v_cells[0], *ubatch, rows, n_kv, n_stream, bu, data);
+                }
+            }
+
+            return;
+        }
 
         const args_set_input_attn_mask args = {
             /*.hparams          =*/ hparams,

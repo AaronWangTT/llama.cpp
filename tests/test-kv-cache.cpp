@@ -1,6 +1,12 @@
+#include "llama-batch.h"
+#include "llama-graph.h"
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
+#include <array>
 #include <numeric>
 #include <random>
 #include <string>
@@ -86,10 +92,249 @@ static void test_seq_rm_pos() {
     }
 }
 
+// a ubatch of tokens {seq, second seq or -1, pos, y, x}, the fields that the cache reads; n_pos 4 gives M-RoPE positions (t, y, x, 0)
+struct test_ubatch {
+    std::vector<llama_token>    token;
+    std::vector<llama_pos>      pos;
+    std::vector<int32_t>        n_seq_id;
+    std::vector<llama_seq_id>   seq_data;
+    std::vector<llama_seq_id *> seq_id;
+    std::vector<llama_seq_id>   seq_unq;
+    std::vector<int32_t>        seq_idx;
+    std::vector<int8_t>         output;
+
+    llama_ubatch ub = {};
+
+    test_ubatch(const std::vector<std::array<int, 5>> & toks, uint32_t n_pos) {
+        const uint32_t n = toks.size();
+        token.assign(n, 1);
+        pos.assign(n*n_pos, 0);
+        n_seq_id.resize(n);
+        seq_data.assign(2*n, 0);
+        seq_id.resize(n);
+        output.assign(n, 1);
+        seq_idx.assign(LLAMA_MAX_SEQ, -1);
+        for (uint32_t i = 0; i < n; ++i) {
+            pos[i] = toks[i][2];
+            if (n_pos == 4) {
+                pos[i + n]   = toks[i][3];
+                pos[i + n*2] = toks[i][4];
+            }
+            seq_data[2*i]     = toks[i][0];
+            seq_data[2*i + 1] = toks[i][1];
+            n_seq_id[i]      = toks[i][1] >= 0 ? 2 : 1;
+            seq_id[i]        = &seq_data[2*i];
+            for (int k = 0; k < n_seq_id[i]; ++k) {
+                if (std::find(seq_unq.begin(), seq_unq.end(), seq_id[i][k]) == seq_unq.end()) {
+                    seq_unq.push_back(seq_id[i][k]);
+                }
+            }
+        }
+        std::sort(seq_unq.begin(), seq_unq.end());
+        for (size_t k = 0; k < seq_unq.size(); ++k) {
+            seq_idx[seq_unq[k]] = k;
+        }
+        ub.n_tokens     = n;
+        ub.n_seq_tokens = n;
+        ub.n_seqs       = 1;
+        ub.n_seqs_unq   = seq_unq.size();
+        ub.n_pos        = n_pos;
+        ub.token        = token.data();
+        ub.pos          = pos.data();
+        ub.n_seq_id     = n_seq_id.data();
+        ub.seq_id       = seq_id.data();
+        ub.seq_id_unq   = seq_unq.data();
+        ub.seq_idx      = seq_idx.data();
+        ub.output       = output.data();
+    }
+};
+
+// the K/V row lists and the causal KQ mask of decode ubatches (one sequence, runs of several, interleaved, a token of two sequences,
+// with M-RoPE: tokens at one position with different 2D positions) against their definition, on random cells with holes and shared cells
+static void test_attn_mask_rows(uint32_t n_pos) {
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+    init_model(*model, 1);
+
+    const int n_seq = 4;
+
+    std::mt19937 rng(4321 + n_pos);
+
+    llama_kv_cache kv(*model, true, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, 1024, n_seq, 0, LLAMA_SWA_TYPE_NONE,
+            nullptr, nullptr, nullptr, nullptr);
+
+    auto add = [&](const std::vector<std::array<int, 5>> & toks) {
+        test_ubatch u(toks, n_pos);
+        const auto sinfo = kv.find_slot(u.ub, false);
+        if (!sinfo.empty()) {
+            kv.apply_ubatch(sinfo, u.ub);
+        }
+        return !sinfo.empty();
+    };
+
+    auto next = [&](int s) { return std::max(kv.seq_pos_max(s) + 1, 0); };
+
+    // a text token has y = x = pos; a block of an image has one position and a grid of 2D positions, in a random order
+    auto text  = [&](int s, int s2, llama_pos p) { return std::array<int, 5>{ s, s2, p, p, p }; };
+    auto image = [&](std::vector<std::array<int, 5>> & t, int s, llama_pos p, int n) {
+        std::vector<int> k(n);
+        std::iota(k.begin(), k.end(), 0);
+        std::shuffle(k.begin(), k.end(), rng);
+        for (int i : k) {
+            t.push_back({ s, -1, p, p + i/3, p + i%3 });
+        }
+    };
+
+    int n_checked = 0;
+
+    for (int step = 0; step < 400; ++step) {
+        const int op = rng() % 10;
+        if (op < 3) {
+            const int s = rng() % n_seq;
+            const int n = 1 + rng() % 150;
+            std::vector<std::array<int, 5>> t;
+            if (n_pos == 4 && rng() % 3 == 0) {
+                image(t, s, next(s), 1 + n % 9);
+            } else {
+                for (int i = 0; i < n; ++i) {
+                    t.push_back(text(s, -1, next(s) + i));
+                }
+            }
+            add(t);
+        } else if (op < 5) {
+            kv.seq_rm(rng() % 5 - 1, rng() % 300, rng() % 2 ? -1 : (llama_pos) (300 + rng() % 100));
+        } else if (op < 6) {
+            const int a = rng() % n_seq;
+            const int b = rng() % n_seq;
+            if (a != b) {
+                kv.seq_rm(b, -1, -1);
+                kv.seq_cp(a, b, -1, -1);
+            }
+        } else {
+            std::vector<int> ss = { (int) (rng() % n_seq) };
+            const int kind = rng() % (n_pos == 4 ? 5 : 4);
+            if (kind > 0 && kind < 4) {
+                for (int s = 0; s < n_seq; ++s) {
+                    if (s != ss[0] && rng() % 2) {
+                        ss.push_back(s);
+                    }
+                }
+            }
+            const int n = 1 + rng() % 5;
+            std::vector<std::array<int, 5>> t;
+            if (kind == 4) {
+                image(t, ss[0], next(ss[0]), 2 + rng() % 6);
+            } else if (kind == 3 && ss.size() > 1) {
+                t.push_back(text(ss[0], ss[1], std::max(next(ss[0]), next(ss[1]))));
+            } else if (kind == 2) {
+                for (int i = 0; i < n; ++i) {
+                    for (int s : ss) {
+                        t.push_back(text(s, -1, next(s) + i));
+                    }
+                }
+            } else {
+                for (int s : ss) {
+                    for (int i = 0; i < n; ++i) {
+                        t.push_back(text(s, -1, next(s) + i));
+                    }
+                }
+            }
+            if (!add(t)) {
+                continue;
+            }
+
+            test_ubatch u(t, n_pos);
+            const llama_ubatch & ub = u.ub;
+
+            const auto & cells = kv.get_cells(0);
+
+            const uint32_t n_kv     = kv.get_n_kv_rows(ub);
+            const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ub);
+            const uint32_t n_tps    = ub.n_tokens/n_slices;
+
+            for (bool block_uniform : { false, true }) {
+                ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+                ggml_context_ptr ctx(ggml_init(ip));
+
+                llm_attn_mask m;
+                m.rows = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_kv, n_slices);
+                m.raw  = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, n_kv, n_tps, 1, n_slices);
+                m.n_kv = n_kv;
+                m.block_uniform = block_uniform;
+
+                ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+                ggml_backend_buffer_clear(buf.get(), 0x7e);
+
+                kv.set_input_attn_mask(m, &ub, true);
+
+                const int32_t     * rows = (const int32_t *) m.rows->data;
+                const ggml_fp16_t * mask = (const ggml_fp16_t *) m.raw->data;
+
+                for (uint32_t s = 0; s < n_slices; ++s) {
+                    std::vector<llama_seq_id> seqs = { ub.seq_id[s*n_tps][0] };
+                    if (n_slices == 1) {
+                        seqs.assign(ub.seq_id_unq, ub.seq_id_unq + ub.n_seqs_unq);
+                    }
+
+                    uint32_t c = 0;
+                    for (uint32_t j = 0; j < cells.size(); ++j) {
+                        bool in = false;
+                        for (llama_seq_id x : seqs) {
+                            in |= !cells.is_empty(j) && cells.seq_has(j, x);
+                        }
+                        if (in) {
+                            GGML_ASSERT(c < n_kv && rows[s*n_kv + c] == (int32_t) j);
+                            c++;
+                        }
+                    }
+                    for (; c < n_kv; ++c) {
+                        GGML_ASSERT(rows[s*n_kv + c] == -1);
+                    }
+
+                    for (uint32_t i = s*n_tps; i < (s + 1)*n_tps; ++i) {
+                        const llama_seq_id x = ub.seq_id[i][0];
+
+                        uint32_t iq = i;
+                        if (block_uniform) {
+                            for (iq = 0; ub.seq_id[iq][0] != x; ++iq) {
+                            }
+                        }
+
+                        const llama_pos p1 = ub.pos[iq];
+
+                        for (c = 0; c < n_kv; ++c) {
+                            const int32_t j = rows[s*n_kv + c];
+
+                            bool keep = j >= 0 && cells.seq_has(j, x) && cells.pos_get(j) <= p1;
+                            if (keep && n_pos == 4 && cells.pos_get(j) == p1) {
+                                keep = !cells.ext_get(j).is_2d_gt(ub.pos[iq + ub.n_tokens*2], ub.pos[iq + ub.n_tokens]);
+                            }
+
+                            GGML_ASSERT(ggml_fp16_to_fp32(mask[i*n_kv + c]) == (keep ? 0.0f : -INFINITY));
+                        }
+                    }
+                }
+
+                n_checked++;
+            }
+
+            if (rng() % 2) {
+                for (int s : ss) {
+                    kv.seq_rm(s, t[0][2], -1);
+                }
+            }
+        }
+    }
+
+    GGML_ASSERT(n_checked > 300);
+}
+
 int main() {
     test_seq_rm_pos();
 
     llama_backend_init();
+
+    test_attn_mask_rows(1);
+    test_attn_mask_rows(4);
 
     {
         std::string errors;
