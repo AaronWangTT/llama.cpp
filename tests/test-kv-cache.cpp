@@ -2,6 +2,7 @@
 #include "llama-model.h"
 
 #include <numeric>
+#include <random>
 #include <string>
 
 static void init_model(llama_model & model, uint32_t n_layer) {
@@ -15,7 +16,79 @@ static void init_model(llama_model & model, uint32_t n_layer) {
     model.layers.resize(n_layer);
 }
 
+// llama_kv_cells::seq_rm_pos() leaves the cells as the scan over all cells in llama_kv_cache::seq_rm() does
+static void test_seq_rm_pos() {
+    const uint32_t n_cells = 700;
+    const int      n_seq   = 4;
+
+    std::mt19937 rng(1234);
+
+    for (int it = 0; it < 300; ++it) {
+        llama_kv_cells a;
+        a.resize(n_cells);
+
+        // empty cells, cells without a sequence, shared cells and repeated positions
+        for (uint32_t i = 0; i < n_cells; ++i) {
+            if (rng() % 5 == 0) {
+                continue;
+            }
+            a.pos_set(i, rng() % 250);
+            for (int s = 0; s < n_seq; ++s) {
+                if (rng() % 3 == 0) {
+                    a.seq_add(i, s);
+                }
+            }
+        }
+
+        llama_kv_cells b = a;
+
+        for (int k = 0; k < 6; ++k) {
+            const llama_seq_id seq_id = rng() % n_seq;
+
+            llama_pos p0 = (llama_pos) (rng() % 270) - 10;
+            llama_pos p1 = rng() % 4 == 0 ? -1 : (llama_pos) (rng() % 270) - 10;
+
+            // as in llama_kv_cache::seq_rm()
+            p0 = std::max(p0, 0);
+            p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+
+            uint32_t head_a = n_cells;
+            for (uint32_t i = 0; i < n_cells; ++i) {
+                if (a.pos_in(i, p0, p1) && a.seq_has(i, seq_id) && a.seq_rm(i, seq_id) && head_a == n_cells) {
+                    head_a = i;
+                }
+            }
+
+            const uint32_t head_b = b.seq_rm_pos(seq_id, p0, p1);
+
+            GGML_ASSERT(head_a == head_b);
+            GGML_ASSERT(a.get_used() == b.get_used() && a.used_min() == b.used_min() && a.used_max_p1() == b.used_max_p1());
+
+            for (uint32_t i = 0; i < n_cells; ++i) {
+                GGML_ASSERT(a.is_empty(i) == b.is_empty(i));
+                if (!a.is_empty(i)) {
+                    GGML_ASSERT(a.pos_get(i) == b.pos_get(i) && a.seq_get_all(i) == b.seq_get_all(i));
+                }
+            }
+
+            for (int s = 0; s < n_seq; ++s) {
+                GGML_ASSERT(a.seq_pos_get(s) == b.seq_pos_get(s));
+
+                std::vector<llama_kv_rows_slice> slices(1);
+                slices[0].seq_ids = { s };
+
+                std::vector<int32_t> rows_a(n_cells), rows_b(n_cells);
+                a.get_seq_cells(slices, rows_a.data(), n_cells);
+                b.get_seq_cells(slices, rows_b.data(), n_cells);
+                GGML_ASSERT(rows_a == rows_b);
+            }
+        }
+    }
+}
+
 int main() {
+    test_seq_rm_pos();
+
     llama_backend_init();
 
     {

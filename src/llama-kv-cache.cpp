@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 
+#include "ggml-kperf.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -460,14 +461,21 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
+        if (ggml_kperf_on(GGML_KPERF_HOST_SEQRM_POS)) {
+            new_head = cells.seq_rm_pos(seq_id, p0, p1);
+            if (ggml_kperf_trace(GGML_KPERF_HOST_SEQRM_POS)) {
+                LLAMA_LOG_INFO("HOST_SEQRM_POS_HIT seq %d [%d, %d) cells %u\n", seq_id, p0, p1, cells.size());
             }
+        } else {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
                 }
             }
         }

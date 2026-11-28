@@ -88,7 +88,8 @@ extern "C" {
     X(QWEN35MOE_QSHARE,      "qwen35moe.qshare",      true,  "",                    "GGML_Q35MOE_QSHARE",           "MMQ products of one input share one Q8_1 copy") \
     X(QWEN35MOE_PFMMN,       "qwen35moe.pfmmn",       true,  "",                    "GGML_Q35MOE_PFMMN",            "F32 router/beta/alpha products of 128 to 2048 tokens") \
     X(QWEN35MOE_MTPSTORE,    "qwen35moe.mtpstore",    true,  "",                    "GGML_Q35MOE_MTPSTORE",         "MTP graphs without outputs only store K and V") \
-    X(HOST_LAZY_CLONE,       "host.lazy_clone",       true,  "",                    "",                             "server: a draft verification clones the sampler only when it can restore the checkpoint")
+    X(HOST_LAZY_CLONE,       "host.lazy_clone",       true,  "",                    "",                             "server: a draft verification clones the sampler only when it can restore the checkpoint") \
+    X(HOST_SEQRM_POS,        "host.seqrm_pos",        true,  "",                    "",                             "KV cache: seq_rm of one sequence finds its cells by position, not by a scan of all cells")
 
 enum ggml_kperf {
 #define GGML_KPERF_ENUM(id, name, exact, needs, legacy, desc) GGML_KPERF_##id,
