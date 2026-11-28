@@ -228,6 +228,37 @@ static int inkling_tail_layer(const char * name, const char * prefix, const char
 }
 #endif
 
+#include "mmq-dense-pipe.cuh"
+
+#if defined(GGML_USE_HIP)
+// hip.mmq_dense_pipe: the kernel of mmq-dense-pipe.cuh takes a dense Q8_0 product with 128-column tiles on gfx1103
+static bool mmq_dense_pipe_wanted(const ggml_tensor * src0, const ggml_tensor * src1, const int cc, const int J, const bool fallback,
+        const ggml_prec prec_src1, const bool fusion) {
+    return ggml_kperf_on(GGML_KPERF_HIP_MMQ_DENSE_PIPE) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && src0->type == GGML_TYPE_Q8_0 &&
+        !fallback && !fusion && prec_src1 == GGML_PREC_Q8 && J == mmq_dense_pipe_J && !ggml_cuda_mmq_get_stream_k(src0->type, J, fallback, cc, prec_src1) &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[0] % 128 == 0 && src0->ne[1] % 64 == 0;
+}
+
+static void mmq_dense_pipe_launch(const mmq_args & args, const int col_group, cudaStream_t stream) {
+    constexpr int nwr = 4;
+    constexpr int nwc = 2;
+    constexpr int I   = 16*nwr;
+    const int nti = args.nrows_x / I;
+    const int G   = col_group > 0 ? col_group : args.ntj;
+    const dim3 block_nums(G, nti, (args.ntj + G - 1) / G);
+    const dim3 block_dims(32, nwr*nwc, 1);
+    const size_t nbytes_stage = (I*mmq_dense_pipe_xs + mmq_dense_pipe_J*mmq_dense_pipe_ys) * sizeof(int);
+    // Up to 24 tiles (one round of 4 tiles per WGP) the latency of a stage is not hidden by other tiles: two buffers.
+    if (nti*args.ntj <= 24) {
+        mmq_dense_pipe<nwr, nwc, true, 4><<<block_nums, block_dims, 2*nbytes_stage, stream>>>(
+            args.x, args.y, args.dst, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst, args.ncols_x / QK8_0, args.ntj);
+    } else {
+        mmq_dense_pipe<nwr, nwc, false, 6><<<block_nums, block_dims, nbytes_stage, stream>>>(
+            args.x, args.y, args.dst, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst, args.ncols_x / QK8_0, args.ntj);
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 #if defined(GGML_USE_HIP)
 // hip.mmq_dense_order: column tiles per group for a dense Q8_0 product on gfx1103, 0 for the default order (see launch_mul_mat_q)
 static int mmq_dense_col_group(const ggml_tensor * src0, const ggml_tensor * src1, const int cc, const int J, const int64_t ntj,
@@ -434,6 +465,17 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ntj, J_best, fusion_device, col_group};
+#if defined(GGML_USE_HIP)
+        if (mmq_dense_pipe_wanted(src0, src1, cc, J_best, fallback, prec_src1, fusion != nullptr)) {
+            if (ggml_kperf_trace(GGML_KPERF_HIP_MMQ_DENSE_PIPE)) {
+                GGML_LOG_INFO("HIP_MMQ_DENSE_PIPE_HIT %s rows=%lld k=%lld cols=%lld group=%d tiles=%lld\n", dst->name,
+                    (long long) ne01, (long long) ne00, (long long) ne11, col_group, (long long) (ne01/64*ntj));
+            }
+            mmq_dense_pipe_launch(args, col_group, stream);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+#endif // defined(GGML_USE_HIP)
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
