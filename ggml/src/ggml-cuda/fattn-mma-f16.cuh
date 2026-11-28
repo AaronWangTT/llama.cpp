@@ -2223,6 +2223,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // Prefill kernel for head size 256 on gfx1103 (qwen35-pfattn.cuh), same results.
     // qwen35.pfattn: 4 query heads per KV head. qwen35moe.pfattn: 8 query heads per KV head. qwen35.pfload, qwen35moe.pfload: their variant with the faster loads.
     // qwen35.pfqk, qwen35moe.pfqk: their pfload variant with fewer shared memory reads in the QK products.
+    // qwen35.pfbar, qwen35moe.pfbar: their pfqk variant whose loop barriers only order shared memory.
     if constexpr (DKQ == 256 && DV == 256 && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8))) {
         constexpr ggml_kperf pf_switch = ncols2 == 4 ? GGML_KPERF_QWEN35_PFATTN : GGML_KPERF_QWEN35MOE_PFATTN;
         if (ggml_kperf_on(pf_switch) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1103 && logit_softcap == 0.0f && !use_sparse &&
@@ -2288,6 +2289,30 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                                 if (ggml_kperf_trace(qk_switch)) {
                                     GGML_LOG_INFO("%s_HIT %s kv=%lld q=%lld s=%lld\n", ncols2 == 4 ? "QWEN35_PFQK" : "Q35MOE_PFQK", KQV->name,
                                         (long long) kv_rows->ne[0], (long long) KQV->src[0]->ne[1], (long long) KQV->src[0]->ne[3]);
+                                }
+                                // qwen35.pfbar and qwen35moe.pfbar: the pfqk kernel with barriers that do not wait for the global loads of the next half tile
+                                constexpr ggml_kperf bar_switch = ncols2 == 4 ? GGML_KPERF_QWEN35_PFBAR : GGML_KPERF_QWEN35MOE_PFBAR;
+                                if (ggml_kperf_on(bar_switch)) {
+                                    const fattn_kernel_t bar_kernel = qwen35_pfattn_f16<DKQ, DV, ncols1, ncols2, true, true, true>;
+                                    static int bar_same_split[GGML_CUDA_MAX_DEVICES] = {0};
+                                    if (bar_same_split[id] == 0) {
+                                        int occupancy_ref = 0;
+                                        int occupancy_bar = 0;
+                                        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy_ref, fattn_kernel, nthreads, nbytes_shared_total));
+                                        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy_bar, bar_kernel,   nthreads, QWEN35_PF_NBYTES_SHARED));
+                                        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(bar_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, QWEN35_PF_NBYTES_SHARED));
+                                        bar_same_split[id] = occupancy_ref == occupancy_bar ? 1 : -1;
+                                        if (bar_same_split[id] < 0) {
+                                            GGML_LOG_WARN("%s: %s is not used, occupancy %d instead of %d\n", __func__, ggml_kperf_name(bar_switch), occupancy_bar, occupancy_ref);
+                                        }
+                                    }
+                                    if (bar_same_split[id] > 0) {
+                                        run_kernel = bar_kernel;
+                                        if (ggml_kperf_trace(bar_switch)) {
+                                            GGML_LOG_INFO("%s_HIT %s kv=%lld q=%lld s=%lld\n", ncols2 == 4 ? "QWEN35_PFBAR" : "Q35MOE_PFBAR", KQV->name,
+                                                (long long) kv_rows->ne[0], (long long) KQV->src[0]->ne[1], (long long) KQV->src[0]->ne[3]);
+                                        }
+                                    }
                                 }
                             }
                         }

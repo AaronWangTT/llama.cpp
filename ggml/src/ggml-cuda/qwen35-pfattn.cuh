@@ -93,6 +93,19 @@ static __device__ __forceinline__ void qwen35_pf_store_rows_t(half2 * const __re
     }
 }
 
+// Barrier of the K/V loop. With pfbar it only orders shared memory: __syncthreads() also waits for all global loads of the wave and invalidates the L0 cache
+// (workgroup scope in WGP mode), but the loop shares data only through shared memory, so the global loads of the next half tile stay in flight across it.
+template<bool pfbar>
+static __device__ __forceinline__ void qwen35_pf_sync() {
+    if constexpr (pfbar) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+    } else {
+        __syncthreads();
+    }
+}
+
 // pfqk: a K stage is the elements 0-127 or 128-255 of all 64 rows of a tile, 64 half2 per row and the padding.
 #define QWEN35_PF_STRIDE_KS (64 + 4)
 
@@ -124,7 +137,8 @@ static __device__ __forceinline__ void qwen35_pf_store_rows_ks(half2 * const __r
 // pfload (qwen35.pfload, qwen35moe.pfload): the row numbers come in 16-byte loads and the loads of the second K half tile stay before the QK products of the first one, the same results.
 // pfqk (qwen35.pfqk, qwen35moe.pfqk, needs pfload): K comes in two stages of 128 elements of all 64 rows instead of two half tiles, so that each Q fragment is read once for the
 // products of both row slices of a warp (rows r0 and nrows + r0). Each KQ_C[h] still sums its 16 k steps in the same order, the same results.
-template<int ncols1, int ncols2, bool needs_fixup, bool is_fixup, bool pfload, bool pfqk>
+// pfbar (qwen35.pfbar, qwen35moe.pfbar, needs pfqk): the barriers of the K/V loop only order shared memory (qwen35_pf_sync), the same operations on the same values.
+template<int ncols1, int ncols2, bool needs_fixup, bool is_fixup, bool pfload, bool pfqk, bool pfbar>
 static __device__ __forceinline__ void qwen35_pfattn_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -177,6 +191,7 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
     static_assert(stride_tile_Q == DKQ/2 + 4 && QWEN35_PF_STRIDE_VT == nrows + 4 && nrows*stride_tile_K <= (DV/2)*QWEN35_PF_STRIDE_VT, "bad tile strides");
     static_assert(!pfqk || (pfload && QWEN35_PF_STRIDE_KS == DKQ/4 + 4 && nbatch_fa*QWEN35_PF_STRIDE_KS <= (DV/2)*QWEN35_PF_STRIDE_VT),
         "pfqk: needs the pfload loads, and a K stage must fit into the K/V buffer");
+    static_assert(!pfbar || pfqk, "pfbar: needs the pfqk kernel");
 
     extern __shared__ half2 tile_Q[];
     half2 * tile_KV   = tile_Q + ncols * stride_tile_Q;
@@ -252,7 +267,7 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
                 qwen35_pf_store_rows_ks(tile_KV, R);
-                __syncthreads();
+                qwen35_pf_sync<pfbar>();
 
                 if (s == 0) {
                     qwen35_pf_load_rows_ks(R, K_h2, stride_K, idx, 1);
@@ -278,7 +293,7 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
                 }
 
                 if (s == 0) {
-                    __syncthreads();
+                    qwen35_pf_sync<pfbar>();
                 }
             }
         } else {
@@ -398,13 +413,13 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
             B[k] = get_half2(KQ_C[k]);
         }
 
-        __syncthreads();
+        qwen35_pf_sync<pfbar>();
 
         // Calculate VKQ tile:
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             qwen35_pf_store_rows_t(tile_KV, R);
-            __syncthreads();
+            qwen35_pf_sync<pfbar>();
 
             if (h == 0) {
                 qwen35_pf_load_rows<pfload>(R, V_h2, stride_V, idx[1]);
@@ -432,7 +447,7 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
                 mma(VKQ_C[i_VKQ_0/T_A_VKQ::I], A, B[h]);
             }
 
-            __syncthreads();
+            qwen35_pf_sync<pfbar>();
         }
     } while (++kb0 < kb0_stop);
 
@@ -602,8 +617,8 @@ static __device__ __forceinline__ void qwen35_pfattn_process_tile(
 }
 
 // Same work split over the blocks as flash_attn_ext_f16<256, 256, ncols1, ncols2, false, false, false>. The caller makes sure that there is a mask, no sinks and no logit softcap.
-// With pfload the caller makes sure that KV_rows is set, 16-byte aligned, and that ne11 is a multiple of 4. pfqk needs pfload.
-template<int DKQ, int DV, int ncols1, int ncols2, bool pfload = false, bool pfqk = false>
+// With pfload the caller makes sure that KV_rows is set, 16-byte aligned, and that ne11 is a multiple of 4. pfqk needs pfload, pfbar needs pfqk.
+template<int DKQ, int DV, int ncols1, int ncols2, bool pfload = false, bool pfqk = false, bool pfbar = false>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void qwen35_pfattn_f16(
         const char * Q_ptr,
@@ -688,12 +703,12 @@ static __global__ void qwen35_pfattn_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // The block is working on an entire tile.
-            qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup, pfload, pfqk>
+            qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup, pfload, pfqk, pfbar>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dst_meta, scale,
                  ne01, ne02, gqa_ratio, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // The block is missing the beginning of a tile.
-            qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup, pfload, pfqk>
+            qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup, pfload, pfqk, pfbar>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dst_meta, scale,
                  ne01, ne02, gqa_ratio, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
@@ -731,7 +746,7 @@ static __global__ void qwen35_pfattn_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup, pfload, pfqk>
+    qwen35_pfattn_process_tile<ncols1, ncols2, needs_fixup, is_fixup, pfload, pfqk, pfbar>
         (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dst_meta, scale,
          ne01, ne02, gqa_ratio, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else

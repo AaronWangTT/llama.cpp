@@ -63,6 +63,7 @@ extern "C" {
     X(QWEN35_PFATTN,         "qwen35.pfattn",         true,  "",                    "GGML_QWEN35_PFATTN",           "prefill attention, D256, 4 query heads per KV head") \
     X(QWEN35_PFLOAD,         "qwen35.pfload",         true,  "qwen35.pfattn",       "",                             "inside pfattn: the row numbers of a warp in one 16-byte load, the second K half tile loaded before the QK products") \
     X(QWEN35_PFQK,           "qwen35.pfqk",           true,  "qwen35.pfload",       "",                             "inside pfload: K in two stages of 128 elements, one Q fragment read for the QK products of both row slices of a warp") \
+    X(QWEN35_PFBAR,          "qwen35.pfbar",          true,  "qwen35.pfqk",         "",                             "inside pfqk: the barriers of the K/V loop only order shared memory, the global loads of the next half tile stay in flight") \
     X(QWEN35_Q6K_MMQ,        "qwen35.q6k_mmq",        false, "",                    "GGML_QWEN35_Q6K_MMQ",          "Q6_K takes MMQ at any batch size (other rounding than dequantization + hipBLAS)") \
     X(QWEN35MOE_MVSHARE,     "qwen35moe.mvshare",     true,  "",                    "GGML_Q35MOE_MVSHARE",          "one-token products that share one input") \
     X(QWEN35MOE_BA1,         "qwen35moe.ba1",         true,  "",                    "GGML_Q35MOE_BA1",              "one-token F32 beta/alpha products in one launch") \
@@ -88,6 +89,7 @@ extern "C" {
     X(QWEN35MOE_PFATTN,      "qwen35moe.pfattn",      true,  "",                    "GGML_Q35MOE_PFATTN",           "prefill attention, D256, 8 query heads per KV head") \
     X(QWEN35MOE_PFLOAD,      "qwen35moe.pfload",      true,  "qwen35moe.pfattn",    "",                             "inside pfattn: the row numbers of a warp in one 16-byte load, the second K half tile loaded before the QK products") \
     X(QWEN35MOE_PFQK,        "qwen35moe.pfqk",        true,  "qwen35moe.pfload",    "",                             "inside pfload: K in two stages of 128 elements, one Q fragment read for the QK products of both row slices of a warp") \
+    X(QWEN35MOE_PFBAR,       "qwen35moe.pfbar",       true,  "qwen35moe.pfqk",      "",                             "inside pfqk: the barriers of the K/V loop only order shared memory, the global loads of the next half tile stay in flight") \
     X(QWEN35MOE_EXPTAIL,     "qwen35moe.exptail",     true,  "",                    "GGML_Q35MOE_EXPTAIL",          "expert products on MMQ, 16 to 64 columns per tile") \
     X(QWEN35MOE_EXPTAIL_PIPE, "qwen35moe.exptail_pipe", true, "qwen35moe.exptail",  "",                             "inside exptail: 2 row tiles per block, the weights and activations of the next k step are loaded during the dot products of the current one, the barriers only wait for shared memory") \
     X(QWEN35MOE_QSHARE,      "qwen35moe.qshare",      true,  "",                    "GGML_Q35MOE_QSHARE",           "MMQ products of one input share one Q8_1 copy") \
