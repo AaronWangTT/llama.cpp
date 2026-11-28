@@ -228,6 +228,27 @@ static int inkling_tail_layer(const char * name, const char * prefix, const char
 }
 #endif
 
+#if defined(GGML_USE_HIP)
+// hip.mmq_dense_order: column tiles per group for a dense Q8_0 product on gfx1103, 0 for the default order (see launch_mul_mat_q)
+static int mmq_dense_col_group(const ggml_tensor * src0, const ggml_tensor * src1, const int cc, const int J, const int64_t ntj,
+        const bool fallback, const ggml_prec prec_src1, const bool fusion) {
+    if (!ggml_kperf_on(GGML_KPERF_HIP_MMQ_DENSE_ORDER) || cc != GGML_CUDA_CC_OFFSET_AMD + 0x1103 || src0->type != GGML_TYPE_Q8_0 ||
+            fallback || fusion || prec_src1 != GGML_PREC_Q8 || ggml_cuda_mmq_get_stream_k(src0->type, J, fallback, cc, prec_src1) ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return 0;
+    }
+    // The Q8_1 copy of src1 that a group reads must fit in about half of the 2 MiB L2: 4 column tiles of 128 x 2048 or 2 of 128 x 4096.
+    // No groups when the whole copy fits (shared expert down: 1024 x 512) or a group of 2 does not (K > 4096, not measured).
+    const int64_t tile_bytes  = J * (GGML_PAD(src0->ne[0], MATRIX_ROW_PADDING) / QK8_1_MMQ) * (int64_t) sizeof(block_q8_1_mmq);
+    const int64_t group_bytes = 1152 * 1024;
+    if (ntj * tile_bytes <= (1 << 20) || 2 * tile_bytes > group_bytes) {
+        return 0;
+    }
+    const int group = 4 * tile_bytes <= group_bytes ? 4 : 2;
+    return ntj > group ? group : 0;
+}
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -397,13 +418,22 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
+        int col_group = 0;
+#if defined(GGML_USE_HIP)
+        col_group = mmq_dense_col_group(src0, src1, cc, J_best, ntj, fallback, prec_src1, fusion != nullptr);
+        if (col_group > 0 && ggml_kperf_trace(GGML_KPERF_HIP_MMQ_DENSE_ORDER)) {
+            GGML_LOG_INFO("HIP_MMQ_DENSE_ORDER_HIT %s rows=%lld k=%lld cols=%lld J=%d group=%d\n", dst->name,
+                (long long) ne01, (long long) ne00, (long long) ne11, J_best, col_group);
+        }
+#endif // defined(GGML_USE_HIP)
+
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1_d, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ntj, J_best, fusion_device};
+            ntj, J_best, fusion_device, col_group};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }

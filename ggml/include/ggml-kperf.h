@@ -27,6 +27,7 @@ extern "C" {
 // X(id, name, exact, needs, legacy variable, description); an entry that needs another one comes after it; an entry added after the table has no legacy variable ("")
 #define GGML_KPERF_LIST(X) \
     X(HIP_MOE_NCOLS32,       "hip.moe_ncols32",       true,  "",                    "GGML_CUDA_MMQ_MOE_NCOLS",      "MUL_MAT_ID on MMQ: tile width chosen for 32 columns per expert") \
+    X(HIP_MMQ_DENSE_ORDER,   "hip.mmq_dense_order",   true,  "",                    "",                             "dense Q8_0 products on MMQ: the row tiles run for groups of 2 or 4 column tiles, the Q8_1 copy of a group stays in L2") \
     X(INKLING_GATHER,        "inkling.gather",        true,  "",                    "GGML_INKLING_GATHER",          "relative bias GET_ROWS/RESHAPE/PERMUTE/CONT in one kernel") \
     X(INKLING_MASKEPI,       "inkling.maskepi",       true,  "",                    "GGML_INKLING_MASKEPI",         "bias gather and raw mask in F32, one rounding into the F16 mask") \
     X(INKLING_RAWMASK,       "inkling.rawmask",       true,  "",                    "GGML_INKLING_RAWMASK",         "prefill mask from the original projection") \

@@ -1018,7 +1018,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
+// col_groups (HIP, dense, one channel and sample): blockIdx.z is a group of gridDim.x column tiles, see launch_mul_mat_q.
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool col_groups = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1076,13 +1077,16 @@ static __global__ void mul_mat_q(
         // The fused kernel writes the GLU of I/2 up rows and I/2 gate rows per tile.
         constexpr int I_dst = has_fusion ? I/2 : I;
 
-        const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
+        const uint2 tmp2 = fast_div_modulo(col_groups ? 0 : blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         int       zt = tmp2.y;
 #if defined(GGML_USE_HIP)
         // Row tiles innermost for MoE, see launch_mul_mat_q.
-        const int jt = ids_dst ? blockIdx.y : blockIdx.x;
+        const int jt = col_groups ? blockIdx.z*gridDim.x + blockIdx.x : ids_dst ? blockIdx.y : blockIdx.x;
         const int it = ids_dst ? blockIdx.x : blockIdx.y;
+        if (col_groups && jt >= int(ntj.z)) {
+            return;
+        }
 #else
         const int jt = blockIdx.x;
         const int it = blockIdx.y;
@@ -1458,6 +1462,7 @@ struct mmq_args {
     int64_t ntj;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
     ggml_cuda_mm_fusion_args_device fusion = {}; // gate != nullptr selects the fused gate/up/GLU path
+    int col_group = 0; // hip.mmq_dense_order: column tiles per group, 0 for the default order
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1513,6 +1518,24 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT((rows_innermost ? args.ntj : nti) <= 65535); // gridDim.y limit
+#if defined(GGML_USE_HIP)
+        // hip.mmq_dense_order: the row tiles run for one group of column tiles after the other, so the part of src1 that a group
+        // reads stays in L2. The default order reads all of src1 for each row tile. Each tile computes the same values.
+        if constexpr (type == GGML_TYPE_Q8_0 && !fallback && !has_fusion) {
+            if (args.col_group > 0) {
+                GGML_ASSERT(!args.ids_dst && ntzw == 1 && !config.stream_k);
+                const dim3 block_nums_groups(args.col_group, nti, (args.ntj + args.col_group - 1) / args.col_group);
+                mul_mat_q<type, J, fallback, prec_src1, false, true><<<block_nums_groups, block_dims, nbytes_shared, stream>>>
+                    (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, nullptr,
+                     args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
+                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     ntj_fd);
+                return;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, nullptr,
              args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
