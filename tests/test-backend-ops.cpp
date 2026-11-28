@@ -13271,6 +13271,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         }
     }
+    // a whole ubatch of 1024 queries on a list of 4096 rows: 64 K/V tiles per block and more blocks than fit on the GPU at once (qwen35moe.pfbar, qwen35.pfbar)
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 8192, 4096, 1024, 1, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 4, 4, 8192, 4096, 1024, 1));
     // the same kernels with a last tile that has fewer queries than the tile (13 for GQA 8, 20 for GQA 4), and with one tile per head on a long list,
     // so that the blocks split the list inside a tile (the fixup paths)
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
