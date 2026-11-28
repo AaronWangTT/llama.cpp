@@ -12065,6 +12065,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 6170, 13, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1000, 21, 4608, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
 
+    // dense Q8_0 products of the qwen35moe prompt ubatch (hip.mmq_dense_order on gfx1103: 2 or 4 column tiles per group, partial last groups, no groups when src1 is small)
+    for (const auto & mnk : std::vector<std::array<int64_t, 3>>{
+            {512, 1024, 2048}, {4096, 1024, 2048}, {2048, 1024, 4096}, {2048, 1024, 512}, {512, 600, 2048}, {256, 300, 4096}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mnk[0], mnk[1], mnk[2], {1, 1}, {1, 1}));
+    }
+
 #if 0
     {
         // Test paths in OpenCL
