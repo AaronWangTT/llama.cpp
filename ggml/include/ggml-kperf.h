@@ -74,6 +74,7 @@ extern "C" {
     X(QWEN35MOE_CONVPF,      "qwen35moe.convpf",      true,  "",                    "GGML_Q35MOE_CONVPF",           "prefill conv without the concat tensor") \
     X(QWEN35MOE_CONVPFRS,    "qwen35moe.convpfrs",    true,  "qwen35moe.convpf",    "GGML_Q35MOE_CONVPFRS",         "prefill conv also with rollback snapshots") \
     X(QWEN35MOE_GDNPF,       "qwen35moe.gdnpf",       true,  "",                    "GGML_Q35MOE_GDNPF",            "delta net prompt kernel") \
+    X(QWEN35MOE_GDNPF_ORDER, "qwen35moe.gdnpf_order", true,  "qwen35moe.gdnpf",     "",                             "inside gdnpf: the blocks of 4 q/k heads and their 8 value heads run together, the q and k rows stay in L2") \
     X(QWEN35MOE_FFN1,        "qwen35moe.ffn1",        true,  "",                    "GGML_Q35MOE_FFN1",             "one-token MoE feed-forward in one op") \
     X(QWEN35MOE_FFNM,        "qwen35moe.ffnm",        true,  "",                    "GGML_Q35MOE_FFNM",             "MoE feed-forward of 2 to 4 tokens in one op") \
     X(QWEN35MOE_EXPONCE,     "qwen35moe.exponce",     true,  "qwen35moe.ffnm",      "GGML_Q35MOE_EXPONCE",          "inside ffnm: the rows of an expert are read once per batch") \

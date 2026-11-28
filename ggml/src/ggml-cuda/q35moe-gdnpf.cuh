@@ -29,6 +29,9 @@ static __device__ __forceinline__ float q35moe_gdnpf_reduce8(float x) {
 constexpr int q35moe_gdnpf_S_v           = 128;
 constexpr int q35moe_gdnpf_cols_per_warp = 4; // gdn_cols_per_warp
 
+// qk_groups (qwen35moe.gdnpf_order): 4 warps per block, H = 2 x the q/k heads, grid (8, sequences, 8 column slices x H/8).
+// A group of 64 blocks takes 4 q/k heads and the 2 value heads of each: the 16 blocks that read the same q and k rows run together.
+template <bool qk_groups>
 __launch_bounds__(ggml_cuda_get_physical_warp_size() * 4, 2)
 static __global__ void q35moe_gdnpf(
         const float * q, const float * k, const float * v, const float * g, const float * beta,
@@ -39,8 +42,16 @@ static __global__ void q35moe_gdnpf(
         int64_t sb1, int64_t sb2, int64_t sb3,
         const uint3 neqk1_magic, const uint3 rq3_magic,
         float scale, int64_t state_slot_stride, int K) {
-    const uint32_t h_idx    = blockIdx.x;
+    uint32_t       h_idx    = blockIdx.x;
+    uint32_t       slice    = blockIdx.z;
     const uint32_t sequence = blockIdx.y;
+    if constexpr (qk_groups) {
+        constexpr uint32_t n_slices = q35moe_gdnpf_S_v / (q35moe_gdnpf_cols_per_warp * 4);
+        const uint32_t grp  = blockIdx.z / n_slices;
+        const uint32_t half = gridDim.x / 2;
+        slice = blockIdx.z % n_slices;
+        h_idx = grp * half + blockIdx.x % half + (blockIdx.x / half) * neqk1_magic.z;
+    }
 
     constexpr int S_v           = q35moe_gdnpf_S_v;
     constexpr int cols_per_warp = q35moe_gdnpf_cols_per_warp;
@@ -53,7 +64,7 @@ static __global__ void q35moe_gdnpf(
     const int lane        = threadIdx.x;
     const int col_in_warp = lane / lanes_per_col;
     const int lane_in_col = lane - col_in_warp * lanes_per_col;
-    const int col = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp + col_in_warp;
+    const int col = (slice * blockDim.y + threadIdx.y) * cols_per_warp + col_in_warp;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
@@ -161,8 +172,20 @@ static void q35moe_gdnpf_launch(
             (long long) H, (long long) n_tokens, (long long) n_seqs);
     }
 
+    // qwen35moe.gdnpf_order: value heads h and h + neqk1 read the same q and k rows; groups of 8 heads keep them in L2
+    const bool qk_groups = ggml_kperf_on(GGML_KPERF_QWEN35MOE_GDNPF_ORDER) && num_warps == 4 && H == 2 * neqk1 && neqk1 % 4 == 0;
+
     // one slot: the state after the last token
-    q35moe_gdnpf<<<grid_dims, block_dims, 0, stream>>>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
-        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, 0, 1);
+    if (qk_groups) {
+        if (ggml_kperf_trace(GGML_KPERF_QWEN35MOE_GDNPF_ORDER)) {
+            GGML_LOG_INFO("Q35MOE_GDNPF_ORDER_HIT heads=%lld tokens=%lld sequences=%lld\n", (long long) H, (long long) n_tokens, (long long) n_seqs);
+        }
+        const dim3 grid_groups(8, n_seqs, grid_dims.z * (H / 8));
+        q35moe_gdnpf<true><<<grid_groups, block_dims, 0, stream>>>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, 0, 1);
+    } else {
+        q35moe_gdnpf<false><<<grid_dims, block_dims, 0, stream>>>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, 0, 1);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
