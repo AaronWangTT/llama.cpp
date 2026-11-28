@@ -27,7 +27,7 @@ const entry entries[GGML_KPERF_COUNT] = {
 #undef GGML_KPERF_ENTRY
 };
 
-const char * const families[] = { "hip", "inkling", "qwen35", "qwen35moe" };
+const char * const families[] = { "hip", "host", "inkling", "qwen35", "qwen35moe" };
 
 // variables of the deleted switches and of the old trace lines, only counted for the log
 const char * const removed[] = {
@@ -213,7 +213,7 @@ size_t ggml_kperf_describe(const char * arch, char * buf, size_t size) {
             lossy += std::string(lossy.empty() ? "" : " ") + name;
         }
         const std::string f = family_of(name);
-        if (f != "hip" && f != family) {
+        if (f != "hip" && f != "host" && f != family) {
             continue;
         }
         if (s.on[k]) {

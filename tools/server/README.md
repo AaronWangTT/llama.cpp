@@ -429,13 +429,13 @@ If your host reaches the internet through a corporate proxy, export `HTTP_PROXY`
 
 ### Fast paths of the native gfx1103 HIP build (kperf)
 
-A HIP build for `gfx1103` only (`-DGPU_TARGETS=gfx1103 -DGGML_NATIVE=ON`) has private fast paths for some model architectures. They are listed in one table, `ggml/include/ggml-kperf.h`. The bit-exact paths are on by default. A lossy path is off by default; turn it on for one model with the `env` key of its preset section, for example `env = GGML_QWEN35_Q6K_MMQ=1`. Each model instance logs its state after `initializing`:
+A HIP build for `gfx1103` only (`-DGPU_TARGETS=gfx1103 -DGGML_NATIVE=ON`) has private fast paths for some model architectures. They are listed in one table, `ggml/include/ggml-kperf.h`. The entries of the `host` family are CPU code of libllama and the server and act in any build. The bit-exact paths are on by default. A lossy path is off by default; turn it on for one model with the `env` key of its preset section, for example `env = GGML_QWEN35_Q6K_MMQ=1`. Each model instance logs its state after `initializing`:
 
 ```
-srv  load_model: kperf: arch qwen35moe, gfx1103 yes, on 27: hip.moe_ncols32 hip.mmq_dense_order qwen35moe.mvshare ...; off: none; lossy on: none; legacy variables ignored: 0
+srv  load_model: kperf: arch qwen35moe, gfx1103 yes, on 28: hip.moe_ncols32 hip.mmq_dense_order qwen35moe.mvshare ...; off: none; lossy on: none; legacy variables ignored: 0
 ```
 
-- `GGML_KPERF_OFF=all | none | <list>`: turn paths off, for A/B runs. A list item is an entry name (`qwen35moe.fagqa4`), a family (`hip`, `inkling`, `qwen35`, `qwen35moe`) or the old variable of an entry; items are separated by `,` or spaces. `all` also turns off the lossy paths. An unknown name aborts the process.
+- `GGML_KPERF_OFF=all | none | <list>`: turn paths off, for A/B runs. A list item is an entry name (`qwen35moe.fagqa4`), a family (`hip`, `host`, `inkling`, `qwen35`, `qwen35moe`) or the old variable of an entry; items are separated by `,` or spaces. `all` also turns off the lossy paths. An unknown name aborts the process.
 - `GGML_KPERF_TRACE=all | <list>`: log a line when a path runs (the fixtures in `tests/` use it).
 - A service sets neither variable. The old variables of the bit-exact paths are not read; a set one is counted in "legacy variables ignored".
 

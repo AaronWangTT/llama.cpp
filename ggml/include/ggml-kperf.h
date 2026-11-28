@@ -10,6 +10,7 @@
 //   qwen3.5-4b:                                                      env = GPU_MAX_HW_QUEUES=1 GGML_QWEN35_Q6K_MMQ=1
 //   Inkling-2-Mini with BF16 router and controller weights (D5-BF16):  env = GGML_INKLING_BF16_F32ACC=1
 // Each path keeps its own guards (device, architecture, shapes); an entry that is on only allows the path.
+// The host family is CPU code of libllama and the server: it acts with any backend and for every architecture, as the hip family does for the HIP build.
 // Upstream variables that also keep paths off: GGML_CUDA_DISABLE_FUSION, GGML_CUDA_DISABLE_GRAPHS, GGML_CUDA_GRAPH_OPT (here any value but 0, upstream only 1), GGML_CUDA_ENABLE_UNIFIED_MEMORY, GGML_CUDA_CUBLAS_COMPUTE_TYPE, ROCBLAS_USE_HIPBLASLT, ROCBLAS_TENSILE_LIBPATH, ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH, LLAMA_KV_ROWS_DISABLE.
 // Fork changes with no entry are always on, also with GGML_KPERF_OFF=all:
 //   mmvq.cu: the RDNA2 parameter table and the gfx11-generic launch width for gfx1103
@@ -86,7 +87,8 @@ extern "C" {
     X(QWEN35MOE_EXPTAIL,     "qwen35moe.exptail",     true,  "",                    "GGML_Q35MOE_EXPTAIL",          "expert products on MMQ, 16 to 64 columns per tile") \
     X(QWEN35MOE_QSHARE,      "qwen35moe.qshare",      true,  "",                    "GGML_Q35MOE_QSHARE",           "MMQ products of one input share one Q8_1 copy") \
     X(QWEN35MOE_PFMMN,       "qwen35moe.pfmmn",       true,  "",                    "GGML_Q35MOE_PFMMN",            "F32 router/beta/alpha products of 128 to 2048 tokens") \
-    X(QWEN35MOE_MTPSTORE,    "qwen35moe.mtpstore",    true,  "",                    "GGML_Q35MOE_MTPSTORE",         "MTP graphs without outputs only store K and V")
+    X(QWEN35MOE_MTPSTORE,    "qwen35moe.mtpstore",    true,  "",                    "GGML_Q35MOE_MTPSTORE",         "MTP graphs without outputs only store K and V") \
+    X(HOST_LAZY_CLONE,       "host.lazy_clone",       true,  "",                    "",                             "server: a draft verification clones the sampler only when it can restore the checkpoint")
 
 enum ggml_kperf {
 #define GGML_KPERF_ENUM(id, name, exact, needs, legacy, desc) GGML_KPERF_##id,
